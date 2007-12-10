@@ -97,7 +97,7 @@ public:
 
     ~AutoPushJSContext();
 
-    nsresult ResultOfPush() { return mPushResult; };
+    nsresult ResultOfPush() { return mPushResult; }
 
 private:
     nsCOMPtr<nsIJSContextStack> mContextStack;
@@ -112,6 +112,8 @@ AutoPushJSContext::AutoPushJSContext(nsISupports* aSecuritySupports,
 {
     nsCOMPtr<nsIJSContextStack> contextStack =
         do_GetService("@mozilla.org/js/xpc/ContextStack;1");
+
+    JS_BeginRequest(cx);
 
     JSContext* currentCX;
     if(contextStack &&
@@ -195,6 +197,7 @@ AutoPushJSContext::~AutoPushJSContext()
     if (mFrame.script)
         mContext->fp = mFrame.down;
 
+    JS_EndRequest(mContext);
 }
 
 
@@ -204,25 +207,9 @@ AutoPushJSContext::~AutoPushJSContext()
 // Thes macro expands to the aggregated query interface scheme.
 
 NS_IMPL_AGGREGATED(nsCLiveconnect)
-
-NS_METHOD
-nsCLiveconnect::AggregatedQueryInterface(const nsIID& aIID, void** aInstancePtr)
-{
-	 NS_ENSURE_ARG_POINTER(aInstancePtr);
-
-    if (aIID.Equals(NS_GET_IID(nsISupports))) {
-      *aInstancePtr = GetInner();
-    }
-    else if (aIID.Equals(NS_GET_IID(nsILiveconnect))) {
-        *aInstancePtr = NS_STATIC_CAST(nsILiveconnect*, this);
-    }
-	 else	{
-		  *aInstancePtr = nsnull;
-		  return NS_NOINTERFACE;
-	 }
-	 NS_ADDREF((nsISupports*) *aInstancePtr);
-	 return NS_OK;
-}
+NS_INTERFACE_MAP_BEGIN_AGGREGATED(nsCLiveconnect)
+    NS_INTERFACE_MAP_ENTRY(nsILiveconnect)
+NS_INTERFACE_MAP_END
 
 
 

@@ -103,6 +103,11 @@ CSRCS		= \
 		prmjtime.c \
 		$(NULL)
 
+ifdef HAVE_DTRACE
+CSRCS 		+= \
+		jsdtracef.c
+endif
+
 EXPORTS		= \
 		jsautocfg.h \
 		jsautokw.h \
@@ -152,6 +157,13 @@ EXPORTS		= \
 		jsxml.h \
 		$(NULL)
 
+ifdef HAVE_DTRACE
+EXPORTS 	+= \
+		jsdtracef.h \
+		javascript-trace.h \
+		$(NULL)
+endif
+
 ifeq (,$(filter-out WINNT WINCE,$(OS_ARCH)))
 EXPORTS		+= jscpucfg.h
 endif
@@ -160,13 +172,19 @@ JS_SAFE_ARENA	= 1
 
 DASH_R		= -r
 
+ifneq (,$(filter OS2 WINCE WINNT,$(OS_ARCH)))
+SDK_LIBRARY = $(IMPORT_LIBRARY)
+else
+SDK_LIBRARY = $(SHARED_LIBRARY)
+endif
+
 include $(topsrcdir)/config/config.mk
 
 EXTRA_DSO_LDOPTS += $(NSPR_LIBS)
 
 # When using gcc the assembly is inlined in the C-file (see jslock.c)
 ifeq ($(OS_ARCH),SunOS)
-ifneq ($(OS_TEST),i86pc)
+ifneq (86,$(findstring 86,$(OS_TEST)))
 ifndef GNU_CC
 ASFILES		= lock_$(OS_ARCH).s
 endif
@@ -195,6 +213,13 @@ JSJAVA_CFLAGS	= \
 
 HOST_SIMPLE_PROGRAMS += host_jskwgen$(HOST_BIN_SUFFIX)
 GARBAGE += jsautokw.h host_jskwgen$(HOST_BIN_SUFFIX)
+
+ifdef HAVE_DTRACE
+ifneq ($(OS_ARCH),Darwin)
+DTRACE_PROBE_OBJ = $(LIBRARY_NAME)-dtrace.$(OBJ_SUFFIX)
+endif
+MOZILLA_DTRACE_SRC = $(srcdir)/javascript-trace.d
+endif
 
 include $(topsrcdir)/config/rules.mk
 
@@ -297,9 +322,9 @@ endif
 ifeq ($(OS_ARCH),IRIX)
 ifndef GNU_CC
 _COMPILE_CFLAGS  = $(patsubst -O%,-O1,$(COMPILE_CFLAGS))
-jsapi.o jsarena.o jsarray.o jsatom.o jsemit.o jsfun.o jsinterp.o jsregexp.o jsparse.o jsopcode.o jsscript.o: %.o: %.c Makefile.in
+jsapi.o jsxdrapi.o jsarena.o jsarray.o jsatom.o jsemit.o jsfun.o jsinterp.o jsregexp.o jsparse.o jsopcode.o jsscript.o: %.o: %.c Makefile.in
 	$(REPORT_BUILD)
-	@$(MAKE_DEPS_AUTO)
+	@$(MAKE_DEPS_AUTO_CC)
 	$(CC) -o $@ -c $(_COMPILE_CFLAGS) $<
 endif
 endif
@@ -309,11 +334,11 @@ endif
 ifeq ($(OS_ARCH),AIX)
 jsatom.o: jsatom.c Makefile.in
 	$(REPORT_BUILD)
-	@$(MAKE_DEPS_AUTO)
+	@$(MAKE_DEPS_AUTO_CC)
 	$(CC) -o $@ -c $(filter-out $(MOZ_OPTIMIZE_FLAGS), $(COMPILE_CFLAGS)) $<
 jsdtoa.o: jsdtoa.c Makefile.in
 	$(REPORT_BUILD)
-	@$(MAKE_DEPS_AUTO)
+	@$(MAKE_DEPS_AUTO_CC)
 	$(CC) -o $@ -c $(filter-out $(MOZ_OPTIMIZE_FLAGS), $(COMPILE_CFLAGS)) $<
 endif
 
@@ -386,3 +411,11 @@ host_jskwgen.$(OBJ_SUFFIX): jsconfig.h jskeyword.tbl
 
 jsautokw.h: host_jskwgen$(HOST_BIN_SUFFIX)
 	./host_jskwgen$(HOST_BIN_SUFFIX) $@
+
+ifdef HAVE_DTRACE
+javascript-trace.h: $(srcdir)/javascript-trace.d
+	dtrace -h -s $(srcdir)/javascript-trace.d -o javascript-trace.h.in
+	sed 's/if _DTRACE_VERSION/ifdef INCLUDE_MOZILLA_DTRACE/' \
+	    javascript-trace.h.in > javascript-trace.h
+endif
+
