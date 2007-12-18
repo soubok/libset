@@ -3,7 +3,7 @@
 {{{
 
 find . -type f ! -wholename "*[.]svn*" -delete
-cp <<new version>>/* .
+cp -R <<new version>>/* .
 svn status | grep "^[^M]"
 ...
 
