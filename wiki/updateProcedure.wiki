@@ -1,11 +1,12 @@
 #summary procedure I use to update a library
-
 {{{
-
 find . -type f ! -wholename "*[.]svn*" -delete
-cp -R <<new version>>/* .
-svn status | grep "^[^M]"
-...
 
-svn cp https://libset.googlecode.com/svn/trunk/XXX https://libset.googlecode.com/svn/trunk/YYY -m"- create YYY"
+cp -R NEW_VERSION/* .
+
+svn status | grep "^[^M]" #check ? and ! flags
+
+svn ci -m"- update LIBRARY to version VERSION"
+
+svn cp https://libset.googlecode.com/svn/trunk/CURRENT_VERSION https://libset.googlecode.com/svn/trunk/NEW_VERSION -m"- create NEW_VERSION"
 }}}
