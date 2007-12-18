@@ -1,0 +1,8 @@
+#summary procedure I use to update a library
+
+{{{
+
+find . -type f ! -wholename "*[.]svn*" -delete
+...
+
+}}}
