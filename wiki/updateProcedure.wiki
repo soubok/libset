@@ -7,4 +7,5 @@ cp <<new version>>/* .
 svn status | grep "^[^M]"
 ...
 
+svn cp https://libset.googlecode.com/svn/trunk/XXX https://libset.googlecode.com/svn/trunk/YYY -m"- create YYY"
 }}}
