@@ -14,7 +14,7 @@
 ** other files are for internal use by SQLite and should not be
 ** accessed by users of the library.
 **
-** $Id: main.c,v 1.407 2007/10/12 19:35:49 drh Exp $
+** $Id: main.c,v 1.409 2007/12/07 18:55:28 drh Exp $
 */
 #include "sqliteInt.h"
 #include <ctype.h>
@@ -766,7 +766,6 @@ int sqlite3BtreeFactory(
   }
   rc = sqlite3BtreeOpen(zFilename, (sqlite3 *)db, ppBtree, btFlags, vfsFlags);
   if( rc==SQLITE_OK ){
-    sqlite3BtreeSetBusyHandler(*ppBtree, (void*)&db->busyHandler);
     sqlite3BtreeSetCacheSize(*ppBtree, nCache);
   }
   return rc;
@@ -965,6 +964,7 @@ static int openDatabase(
   db->magic = SQLITE_MAGIC_BUSY;
   db->aDb = db->aDbStatic;
   db->autoCommit = 1;
+  db->nextAutovac = -1;
   db->flags |= SQLITE_ShortColNames
 #if SQLITE_DEFAULT_FILE_FORMAT<4
                  | SQLITE_LegacyFileFmt

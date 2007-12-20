@@ -11,7 +11,7 @@
 *************************************************************************
 ** Internal interface definitions for SQLite.
 **
-** @(#) $Id: sqliteInt.h,v 1.620 2007/11/27 02:38:01 drh Exp $
+** @(#) $Id: sqliteInt.h,v 1.626 2007/12/13 03:45:08 drh Exp $
 */
 #ifndef _SQLITEINT_H_
 #define _SQLITEINT_H_
@@ -363,6 +363,7 @@ typedef struct NameContext NameContext;
 typedef struct Parse Parse;
 typedef struct Select Select;
 typedef struct SrcList SrcList;
+typedef struct StrAccum StrAccum;
 typedef struct Table Table;
 typedef struct TableLock TableLock;
 typedef struct Token Token;
@@ -480,6 +481,7 @@ struct sqlite3 {
   u8 autoCommit;                /* The auto-commit flag. */
   u8 temp_store;                /* 1: file 2: memory 0: default */
   u8 mallocFailed;              /* True if we have seen a malloc failure */
+  char nextAutovac;             /* Autovac setting after VACUUM if >=0 */
   int nTable;                   /* Number of tables in the database */
   CollSeq *pDfltColl;           /* The default collating sequence (BINARY) */
   i64 lastRowid;                /* ROWID of most recent insert (see above) */
@@ -883,6 +885,7 @@ struct KeyInfo {
   sqlite3 *db;        /* The database connection */
   u8 enc;             /* Text encoding - one of the TEXT_Utf* values */
   u8 incrKey;         /* Increase 2nd key by epsilon before comparison */
+  u8 prefixIsEqual;   /* Treat a prefix as equal */
   int nField;         /* Number of entries in aColl[] */
   u8 *aSortOrder;     /* If defined an aSortOrder[i] is true, sort DESC */
   CollSeq *aColl[1];  /* Collating sequence for each term of the key */
@@ -1314,6 +1317,7 @@ struct Select {
   Expr *pHaving;         /* The HAVING clause */
   ExprList *pOrderBy;    /* The ORDER BY clause */
   Select *pPrior;        /* Prior select in a compound select statement */
+  Select *pNext;         /* Next select to the left in a compound */
   Select *pRightmost;    /* Right-most select in a compound select statement */
   Expr *pLimit;          /* LIMIT expression. NULL means not used. */
   Expr *pOffset;         /* OFFSET expression. NULL means not used. */
@@ -1574,6 +1578,20 @@ struct DbFixer {
 };
 
 /*
+** An objected used to accumulate the text of a string where we
+** do not necessarily know how big the string will be in the end.
+*/
+struct StrAccum {
+  char *zBase;     /* A base allocation.  Not from malloc. */
+  char *zText;     /* The string collected so far */
+  int  nChar;      /* Length of the string so far */
+  int  nAlloc;     /* Amount of space allocated in zText */
+  u8   mallocFailed;   /* Becomes true if any memory allocation fails */
+  u8   useMalloc;      /* True if zText is enlargable using realloc */
+  u8   tooBig;         /* Becomes true if string size exceeds limits */
+};
+
+/*
 ** A pointer to this structure is used to communicate information
 ** from sqlite3Init and OP_ParseSchema into the sqlite3InitCallback.
 */
@@ -1603,8 +1621,10 @@ typedef struct {
 #ifdef SQLITE_DEBUG
   int sqlite3Corrupt(void);
 # define SQLITE_CORRUPT_BKPT sqlite3Corrupt()
+# define DEBUGONLY(X)        X
 #else
 # define SQLITE_CORRUPT_BKPT SQLITE_CORRUPT
+# define DEBUGONLY(X)
 #endif
 
 /*
@@ -1628,6 +1648,8 @@ char *sqlite3MPrintf(sqlite3*,const char*, ...);
 char *sqlite3VMPrintf(sqlite3*,const char*, va_list);
 #if defined(SQLITE_TEST) || defined(SQLITE_DEBUG)
   void sqlite3DebugPrintf(const char*, ...);
+#endif
+#if defined(SQLITE_TEST)
   void *sqlite3TextToPtr(const char*);
 #endif
 void sqlite3SetString(char **, ...);
@@ -1876,8 +1898,11 @@ int sqlite3CreateFunc(sqlite3 *, const char *, int, int, void *,
   void (*)(sqlite3_context*,int,sqlite3_value **),
   void (*)(sqlite3_context*,int,sqlite3_value **), void (*)(sqlite3_context*));
 int sqlite3ApiExit(sqlite3 *db, int);
-void sqlite3AbortOtherActiveVdbes(sqlite3 *, Vdbe *);
 int sqlite3OpenTempDatabase(Parse *);
+
+void sqlite3StrAccumAppend(StrAccum*,const char*,int);
+char *sqlite3StrAccumFinish(StrAccum*);
+void sqlite3StrAccumReset(StrAccum*);
 
 
 /*
@@ -1951,6 +1976,11 @@ void sqlite3InvalidFunction(sqlite3_context*,int,sqlite3_value**);
 int sqlite3Reprepare(Vdbe*);
 void sqlite3ExprListCheckLength(Parse*, ExprList*, int, const char*);
 CollSeq *sqlite3BinaryCompareCollSeq(Parse *, Expr *, Expr *);
+
+#define IN_INDEX_ROWID           1
+#define IN_INDEX_EPH             2
+#define IN_INDEX_INDEX           3
+int sqlite3FindInIndex(Parse *, Expr *, int);
 
 #ifdef SQLITE_ENABLE_ATOMIC_WRITE
   int sqlite3JournalOpen(sqlite3_vfs *, const char *, sqlite3_file *, int, int);
