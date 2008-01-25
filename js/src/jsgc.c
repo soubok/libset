@@ -260,7 +260,7 @@ static JSBool js_gcUseMmap = JS_FALSE;
 
 #define ARENA_START_TO_INFO(arenaStart)                                       \
     (JS_ASSERT(((arenaStart) & (jsuword) GC_ARENA_MASK) == 0),                \
-     (JSGCArenaInfo *) ((arenaStart) + ARENA_INFO_OFFSET))
+     (JSGCArenaInfo *) ((arenaStart) + (jsuword) ARENA_INFO_OFFSET))
 
 #define ARENA_INFO_TO_START(arena)                                            \
     (JS_ASSERT(IS_ARENA_INFO_ADDRESS(arena)),                                 \
@@ -268,7 +268,7 @@ static JSBool js_gcUseMmap = JS_FALSE;
 
 #define ARENA_PAGE_TO_INFO(arenaPage)                                         \
     (JS_ASSERT(arenaPage != 0),                                               \
-     JS_ASSERT(((arenaPage) >> (JS_BITS_PER_WORD - GC_ARENA_SHIFT)) == 0),    \
+     JS_ASSERT(!((jsuword)(arenaPage) >> (JS_BITS_PER_WORD-GC_ARENA_SHIFT))), \
      ARENA_START_TO_INFO((arenaPage) << GC_ARENA_SHIFT))
 
 #define ARENA_INFO_TO_PAGE(arena)                                             \
@@ -1277,7 +1277,7 @@ static struct GCHist {
     JSGCThing   *freeList;
 } gchist[NGCHIST];
 
-unsigned gchpos;
+unsigned gchpos = 0;
 #endif
 
 void *
@@ -2469,7 +2469,7 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
     /* Reset malloc counter. */
     rt->gcMallocBytes = 0;
 
-#ifdef DEBUG_scopemeters
+#ifdef JS_DUMP_SCOPE_METERS
   { extern void js_DumpScopeMeters(JSRuntime *rt);
     js_DumpScopeMeters(rt);
   }
@@ -2553,12 +2553,9 @@ restart:
     /* Finalize watch points associated with unreachable objects. */
     js_SweepWatchPoints(cx);
 
-#ifdef DUMP_CALL_TABLE
-    /*
-     * Call js_DumpCallTable here so it can meter and then clear weak refs to
-     * GC-things that are about to be finalized.
-     */
-    js_DumpCallTable(cx);
+#ifdef DEBUG
+    /* Save the pre-sweep count of scope-mapped properties. */
+    rt->liveScopePropsPreSweep = rt->liveScopeProps;
 #endif
 
     /*
@@ -2600,40 +2597,46 @@ restart:
                     *flagp &= ~GCF_MARK;
                     allClear = JS_FALSE;
                     METER(++arenaList->stats.nthings);
-                } else if (!(flags & GCF_FINAL)) {
-                    /* Call the finalizer with GCF_FINAL ORed into flags. */
+                } else {
                     thing = FLAGP_TO_THING(flagp, thingSize);
-                    *flagp = (uint8)(flags | GCF_FINAL);
-                    type = flags & GCF_TYPEMASK;
-                    switch (type) {
-                      case GCX_OBJECT:
-                        js_FinalizeObject(cx, (JSObject *) thing);
-                        break;
-                      case GCX_DOUBLE:
-                        /* Do nothing. */
-                        break;
-                      case GCX_FUNCTION:
-                        js_FinalizeFunction(cx, (JSFunction *) thing);
-                        break;
+                    if (!(flags & GCF_FINAL)) {
+                        /*
+                         * Call the finalizer with GCF_FINAL ORed into flags.
+                         */
+                        *flagp = (uint8)(flags | GCF_FINAL);
+                        type = flags & GCF_TYPEMASK;
+                        switch (type) {
+                          case GCX_OBJECT:
+                            js_FinalizeObject(cx, (JSObject *) thing);
+                            break;
+                          case GCX_DOUBLE:
+                            /* Do nothing. */
+                            break;
+                          case GCX_FUNCTION:
+                            js_FinalizeFunction(cx, (JSFunction *) thing);
+                            break;
 #if JS_HAS_XML_SUPPORT
-                      case GCX_NAMESPACE:
-                        js_FinalizeXMLNamespace(cx, (JSXMLNamespace *) thing);
-                        break;
-                      case GCX_QNAME:
-                        js_FinalizeXMLQName(cx, (JSXMLQName *) thing);
-                        break;
-                      case GCX_XML:
-                        js_FinalizeXML(cx, (JSXML *) thing);
-                        break;
+                          case GCX_NAMESPACE:
+                            js_FinalizeXMLNamespace(cx,
+                                                    (JSXMLNamespace *) thing);
+                            break;
+                          case GCX_QNAME:
+                            js_FinalizeXMLQName(cx, (JSXMLQName *) thing);
+                            break;
+                          case GCX_XML:
+                            js_FinalizeXML(cx, (JSXML *) thing);
+                            break;
 #endif
-                      default:
-                        JS_ASSERT(type == GCX_STRING ||
-                                  type - GCX_EXTERNAL_STRING <
-                                  GCX_NTYPES - GCX_EXTERNAL_STRING);
-                        js_FinalizeStringRT(rt, (JSString *) thing,
-                                            (intN) (type - GCX_EXTERNAL_STRING),
-                                            cx);
-                        break;
+                          default:
+                            JS_ASSERT(type == GCX_STRING ||
+                                      type - GCX_EXTERNAL_STRING <
+                                      GCX_NTYPES - GCX_EXTERNAL_STRING);
+                            js_FinalizeStringRT(rt, (JSString *) thing,
+                                                (intN) (type -
+                                                        GCX_EXTERNAL_STRING),
+                                                cx);
+                            break;
+                        }
                     }
                     thing->flagp = flagp;
                     thing->next = freeList;
@@ -2700,6 +2703,23 @@ restart:
     printf("GC HEAP SIZE %lu\n", (unsigned long)rt->gcBytes);
   }
 #endif
+
+#ifdef JS_SCOPE_DEPTH_METER
+  { static FILE *fp;
+    if (!fp)
+        fp = fopen("/tmp/scopedepth.stats", "w");
+
+    if (fp) {
+        JS_DumpBasicStats(&rt->protoLookupDepthStats, "proto-lookup depth", fp);
+        JS_DumpBasicStats(&rt->scopeSearchDepthStats, "scope-search depth", fp);
+        JS_DumpBasicStats(&rt->hostenvScopeDepthStats, "hostenv scope depth", fp);
+        JS_DumpBasicStats(&rt->lexicalScopeDepthStats, "lexical scope depth", fp);
+
+        putc('\n', fp);
+        fflush(fp);
+    }
+  }
+#endif /* JS_SCOPE_DEPTH_METER */
 
     JS_LOCK_GC(rt);
 
