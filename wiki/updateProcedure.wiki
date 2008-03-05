@@ -4,6 +4,8 @@ find . -type f ! -wholename "*[.]svn*" -delete
 
 cp -R NEW_VERSION/* .
 
+... now find empty directories (these with only .svn) and "svn rm" them
+
 svn status | grep "^[^M]" #check ? and ! flags
 
 svn ci -m"- update LIBRARY to version VERSION"
