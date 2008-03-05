@@ -4,7 +4,9 @@ find . -type f ! -wholename "*[.]svn*" -delete
 
 cp -R NEW_VERSION/* .
 
-... now find empty directories (these with only .svn) and "svn rm" them
+now find empty directories (these with only .svn) and "svn rm" them :
+find . -type d -name '.svn' | while read i; do f=$(ls -la "$i/.." |grep -v '\.\.' |grep -v '\.$'|grep -v 'total' |wc -l); test $f -eq 1 && echo "$i/.."; done
+
 
 svn status | grep "^[^M]" #check ? and ! flags
 
