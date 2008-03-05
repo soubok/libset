@@ -29,6 +29,7 @@ transform is the identity.
 
 */
 
+#include <ode/ode.h>
 #include <ode/odemath.h>
 #include <ode/rotation.h>
 #include <ode/matrix.h>
@@ -37,8 +38,8 @@ transform is the identity.
 //****************************************************************************
 // externs
 
-extern "C" void dBodyAddTorque (dBodyID, dReal fx, dReal fy, dReal fz);
-extern "C" void dBodyAddForce (dBodyID, dReal fx, dReal fy, dReal fz);
+// extern "C" void dBodyAddTorque (dBodyID, dReal fx, dReal fy, dReal fz);
+// extern "C" void dBodyAddForce (dBodyID, dReal fx, dReal fy, dReal fz);
 
 //****************************************************************************
 // utility
@@ -534,7 +535,7 @@ int dxJointLimitMotor::addLimot (dxJoint *joint,
 	// a fudge factor.
 
 	dReal fm = fmax;
-	if (vel > 0) fm = -fm;
+	if ((vel > 0) || (vel==0 && limit==2)) fm = -fm;
 
 	// if we're powering away from the limit, apply the fudge factor
 	if ((limit==1 && vel > 0) || (limit==2 && vel < 0)) fm *= fudge_factor;
@@ -628,6 +629,8 @@ static void ballInit (dxJointBall *j)
 {
   dSetZero (j->anchor1,4);
   dSetZero (j->anchor2,4);
+  j->erp = j->world->global_erp;
+  j->cfm = j->world->global_cfm;
 }
 
 
@@ -640,22 +643,26 @@ static void ballGetInfo1 (dxJointBall *j, dxJoint::Info1 *info)
 
 static void ballGetInfo2 (dxJointBall *joint, dxJoint::Info2 *info)
 {
+  info->erp = joint->erp;
+  info->cfm[0] = joint->cfm;
+  info->cfm[1] = joint->cfm;
+  info->cfm[2] = joint->cfm;
   setBall (joint,info,joint->anchor1,joint->anchor2);
 }
 
 
-extern "C" void dJointSetBallAnchor (dxJointBall *joint,
-				     dReal x, dReal y, dReal z)
+void dJointSetBallAnchor (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointBall* joint = (dxJointBall*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dball_vtable,"joint is not a ball");
   setAnchors (joint,x,y,z,joint->anchor1,joint->anchor2);
 }
 
 
-extern "C" void dJointSetBallAnchor2 (dxJointBall *joint,
-				      dReal x, dReal y, dReal z)
+void dJointSetBallAnchor2 (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointBall* joint = (dxJointBall*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dball_vtable,"joint is not a ball");
   joint->anchor2[0] = x;
@@ -665,8 +672,9 @@ extern "C" void dJointSetBallAnchor2 (dxJointBall *joint,
 
 }
 
-extern "C" void dJointGetBallAnchor (dxJointBall *joint, dVector3 result)
+void dJointGetBallAnchor (dJointID j, dVector3 result)
 {
+  dxJointBall* joint = (dxJointBall*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__dball_vtable,"joint is not a ball");
@@ -677,8 +685,9 @@ extern "C" void dJointGetBallAnchor (dxJointBall *joint, dVector3 result)
 }
 
 
-extern "C" void dJointGetBallAnchor2 (dxJointBall *joint, dVector3 result)
+void dJointGetBallAnchor2 (dJointID j, dVector3 result)
 {
+  dxJointBall* joint = (dxJointBall*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__dball_vtable,"joint is not a ball");
@@ -686,6 +695,50 @@ extern "C" void dJointGetBallAnchor2 (dxJointBall *joint, dVector3 result)
     getAnchor (joint,result,joint->anchor1);
   else
     getAnchor2 (joint,result,joint->anchor2);
+}
+
+
+void dxJointBall::set (int num, dReal value)
+{
+  switch (num) {
+  case dParamCFM:
+    cfm = value;
+    break;
+  case dParamERP:
+    erp = value;
+    break;
+  }
+}
+ 
+
+dReal dxJointBall::get (int num)
+{
+  switch (num) {
+  case dParamCFM:
+    return cfm;
+  case dParamERP:
+    return erp;
+  default:
+	return 0;
+  }
+}
+
+
+void dJointSetBallParam (dJointID j, int parameter, dReal value)
+{
+  dxJointBall* joint = (dxJointBall*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dball_vtable,"joint is not a ball joint");
+  joint->set (parameter,value);
+}
+
+
+dReal dJointGetBallParam (dJointID j, int parameter)
+{
+  dxJointBall* joint = (dxJointBall*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dball_vtable,"joint is not a ball joint");
+  return joint->get (parameter);
 }
 
 
@@ -820,9 +873,9 @@ static void hingeComputeInitialRelativeRotation (dxJointHinge *joint)
 }
 
 
-extern "C" void dJointSetHingeAnchor (dxJointHinge *joint,
-				      dReal x, dReal y, dReal z)
+void dJointSetHingeAnchor (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a hinge");
   setAnchors (joint,x,y,z,joint->anchor1,joint->anchor2);
@@ -830,10 +883,9 @@ extern "C" void dJointSetHingeAnchor (dxJointHinge *joint,
 }
 
 
-extern "C" void dJointSetHingeAnchorDelta (dxJointHinge *joint,
-					   dReal x, dReal y, dReal z,
-					   dReal dx, dReal dy, dReal dz)
+void dJointSetHingeAnchorDelta (dJointID j, dReal x, dReal y, dReal z, dReal dx, dReal dy, dReal dz)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a hinge");
 
@@ -868,9 +920,9 @@ extern "C" void dJointSetHingeAnchorDelta (dxJointHinge *joint,
 
 
 
-extern "C" void dJointSetHingeAxis (dxJointHinge *joint,
-				    dReal x, dReal y, dReal z)
+void dJointSetHingeAxis (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a hinge");
   setAxes (joint,x,y,z,joint->axis1,joint->axis2);
@@ -878,8 +930,9 @@ extern "C" void dJointSetHingeAxis (dxJointHinge *joint,
 }
 
 
-extern "C" void dJointGetHingeAnchor (dxJointHinge *joint, dVector3 result)
+void dJointGetHingeAnchor (dJointID j, dVector3 result)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a hinge");
@@ -890,8 +943,9 @@ extern "C" void dJointGetHingeAnchor (dxJointHinge *joint, dVector3 result)
 }
 
 
-extern "C" void dJointGetHingeAnchor2 (dxJointHinge *joint, dVector3 result)
+void dJointGetHingeAnchor2 (dJointID j, dVector3 result)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a hinge");
@@ -902,8 +956,9 @@ extern "C" void dJointGetHingeAnchor2 (dxJointHinge *joint, dVector3 result)
 }
 
 
-extern "C" void dJointGetHingeAxis (dxJointHinge *joint, dVector3 result)
+void dJointGetHingeAxis (dJointID j, dVector3 result)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a hinge");
@@ -911,25 +966,27 @@ extern "C" void dJointGetHingeAxis (dxJointHinge *joint, dVector3 result)
 }
 
 
-extern "C" void dJointSetHingeParam (dxJointHinge *joint,
-				     int parameter, dReal value)
+void dJointSetHingeParam (dJointID j, int parameter, dReal value)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a hinge");
   joint->limot.set (parameter,value);
 }
 
 
-extern "C" dReal dJointGetHingeParam (dxJointHinge *joint, int parameter)
+dReal dJointGetHingeParam (dJointID j, int parameter)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a hinge");
   return joint->limot.get (parameter);
 }
 
 
-extern "C" dReal dJointGetHingeAngle (dxJointHinge *joint)
+dReal dJointGetHingeAngle (dJointID j)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dAASSERT(joint);
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a hinge");
   if (joint->node[0].body) {
@@ -944,8 +1001,9 @@ extern "C" dReal dJointGetHingeAngle (dxJointHinge *joint)
 }
 
 
-extern "C" dReal dJointGetHingeAngleRate (dxJointHinge *joint)
+dReal dJointGetHingeAngleRate (dJointID j)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dAASSERT(joint);
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a Hinge");
   if (joint->node[0].body) {
@@ -960,8 +1018,9 @@ extern "C" dReal dJointGetHingeAngleRate (dxJointHinge *joint)
 }
 
 
-extern "C" void dJointAddHingeTorque (dxJointHinge *joint, dReal torque)
+void dJointAddHingeTorque (dJointID j, dReal torque)
 {
+  dxJointHinge* joint = (dxJointHinge*)j;
   dVector3 axis;
   dAASSERT(joint);
   dUASSERT(joint->vtable == &__dhinge_vtable,"joint is not a Hinge");
@@ -1001,8 +1060,9 @@ static void sliderInit (dxJointSlider *j)
 }
 
 
-extern "C" dReal dJointGetSliderPosition (dxJointSlider *joint)
+dReal dJointGetSliderPosition (dJointID j)
 {
+  dxJointSlider* joint = (dxJointSlider*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dslider_vtable,"joint is not a slider");
 
@@ -1025,8 +1085,9 @@ extern "C" dReal dJointGetSliderPosition (dxJointSlider *joint)
 }
 
 
-extern "C" dReal dJointGetSliderPositionRate (dxJointSlider *joint)
+dReal dJointGetSliderPositionRate (dJointID j)
 {
+  dxJointSlider* joint = (dxJointSlider*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dslider_vtable,"joint is not a slider");
 
@@ -1143,9 +1204,9 @@ static void sliderGetInfo2 (dxJointSlider *joint, dxJoint::Info2 *info)
 }
 
 
-extern "C" void dJointSetSliderAxis (dxJointSlider *joint,
-				     dReal x, dReal y, dReal z)
+void dJointSetSliderAxis (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointSlider* joint = (dxJointSlider*)j;
   int i;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dslider_vtable,"joint is not a slider");
@@ -1169,15 +1230,14 @@ extern "C" void dJointSetSliderAxis (dxJointSlider *joint,
 }
 
 
-extern "C" void dJointSetSliderAxisDelta (dxJointSlider *joint,
-					  dReal x, dReal y, dReal z,
-					  dReal dx, dReal dy, dReal dz)
+void dJointSetSliderAxisDelta (dJointID j, dReal x, dReal y, dReal z, dReal dx, dReal dy, dReal dz)
 {
+  dxJointSlider* joint = (dxJointSlider*)j;
   int i;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dslider_vtable,"joint is not a slider");
   setAxes (joint,x,y,z,joint->axis1,0);
-  
+
   // compute initial relative rotation body1 -> body2, or env -> body1
   // also compute center of body1 w.r.t body 2
   if (joint->node[1].body) {
@@ -1202,8 +1262,9 @@ extern "C" void dJointSetSliderAxisDelta (dxJointSlider *joint,
 
 
 
-extern "C" void dJointGetSliderAxis (dxJointSlider *joint, dVector3 result)
+void dJointGetSliderAxis (dJointID j, dVector3 result)
 {
+  dxJointSlider* joint = (dxJointSlider*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__dslider_vtable,"joint is not a slider");
@@ -1211,25 +1272,27 @@ extern "C" void dJointGetSliderAxis (dxJointSlider *joint, dVector3 result)
 }
 
 
-extern "C" void dJointSetSliderParam (dxJointSlider *joint,
-				      int parameter, dReal value)
+void dJointSetSliderParam (dJointID j, int parameter, dReal value)
 {
+  dxJointSlider* joint = (dxJointSlider*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dslider_vtable,"joint is not a slider");
   joint->limot.set (parameter,value);
 }
 
 
-extern "C" dReal dJointGetSliderParam (dxJointSlider *joint, int parameter)
+dReal dJointGetSliderParam (dJointID j, int parameter)
 {
+  dxJointSlider* joint = (dxJointSlider*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dslider_vtable,"joint is not a slider");
   return joint->limot.get (parameter);
 }
 
 
-extern "C" void dJointAddSliderForce (dxJointSlider *joint, dReal force)
+void dJointAddSliderForce (dJointID j, dReal force)
 {
+  dxJointSlider* joint = (dxJointSlider*)j;
   dVector3 axis;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dslider_vtable,"joint is not a slider");
@@ -1316,7 +1379,7 @@ static void contactGetInfo1 (dxJointContact *j, dxJoint::Info1 *info)
 
 static void contactGetInfo2 (dxJointContact *j, dxJoint::Info2 *info)
 {
-  int i,s = info->rowskip;
+  int s = info->rowskip;
   int s2 = 2*s;
 
   // get normal, with sign adjusted for body1/body2 polarity
@@ -1335,7 +1398,9 @@ static void contactGetInfo2 (dxJointContact *j, dxJoint::Info2 *info)
 
   // c1,c2 = contact points with respect to body PORs
   dVector3 c1,c2;
-  for (i=0; i<3; i++) c1[i] = j->contact.geom.pos[i] - j->node[0].body->posr.pos[i];
+  c1[0] = j->contact.geom.pos[0] - j->node[0].body->posr.pos[0];
+  c1[1] = j->contact.geom.pos[1] - j->node[0].body->posr.pos[1];
+  c1[2] = j->contact.geom.pos[2] - j->node[0].body->posr.pos[2];
 
   // set jacobian for normal
   info->J1l[0] = normal[0];
@@ -1343,8 +1408,9 @@ static void contactGetInfo2 (dxJointContact *j, dxJoint::Info2 *info)
   info->J1l[2] = normal[2];
   dCROSS (info->J1a,=,c1,normal);
   if (j->node[1].body) {
-    for (i=0; i<3; i++) c2[i] = j->contact.geom.pos[i] -
-			  j->node[1].body->posr.pos[i];
+    c2[0] = j->contact.geom.pos[0] - j->node[1].body->posr.pos[0];
+    c2[1] = j->contact.geom.pos[1] - j->node[1].body->posr.pos[1];
+    c2[2] = j->contact.geom.pos[2] - j->node[1].body->posr.pos[2];
     info->J2l[0] = -normal[0];
     info->J2l[1] = -normal[1];
     info->J2l[2] = -normal[2];
@@ -1358,8 +1424,12 @@ static void contactGetInfo2 (dxJointContact *j, dxJoint::Info2 *info)
   dReal k = info->fps * erp;
   dReal depth = j->contact.geom.depth - j->world->contactp.min_depth;
   if (depth < 0) depth = 0;
-  dReal maxvel = j->world->contactp.max_vel;
-  if (k*depth > maxvel) info->c[0] = maxvel; else info->c[0] = k*depth;
+
+  const dReal maxvel = j->world->contactp.max_vel;
+  info->c[0] = k*depth;
+  if (info->c[0] > maxvel)
+    info->c[0] = maxvel;
+
   if (j->contact.surface.mode & dContactSoftCFM)
     info->cfm[0] = j->contact.surface.soft_cfm;
 
@@ -1621,9 +1691,9 @@ static void makeHinge2V1andV2 (dxJointHinge2 *joint)
 }
 
 
-extern "C" void dJointSetHinge2Anchor (dxJointHinge2 *joint,
-				       dReal x, dReal y, dReal z)
+void dJointSetHinge2Anchor (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
   setAnchors (joint,x,y,z,joint->anchor1,joint->anchor2);
@@ -1631,9 +1701,9 @@ extern "C" void dJointSetHinge2Anchor (dxJointHinge2 *joint,
 }
 
 
-extern "C" void dJointSetHinge2Axis1 (dxJointHinge2 *joint,
-				      dReal x, dReal y, dReal z)
+void dJointSetHinge2Axis1 (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
   if (joint->node[0].body) {
@@ -1654,9 +1724,9 @@ extern "C" void dJointSetHinge2Axis1 (dxJointHinge2 *joint,
 }
 
 
-extern "C" void dJointSetHinge2Axis2 (dxJointHinge2 *joint,
-				      dReal x, dReal y, dReal z)
+void dJointSetHinge2Axis2 (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
   if (joint->node[1].body) {
@@ -1677,9 +1747,9 @@ extern "C" void dJointSetHinge2Axis2 (dxJointHinge2 *joint,
 }
 
 
-extern "C" void dJointSetHinge2Param (dxJointHinge2 *joint,
-				      int parameter, dReal value)
+void dJointSetHinge2Param (dJointID j, int parameter, dReal value)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
   if ((parameter & 0xff00) == 0x100) {
@@ -1693,8 +1763,9 @@ extern "C" void dJointSetHinge2Param (dxJointHinge2 *joint,
 }
 
 
-extern "C" void dJointGetHinge2Anchor (dxJointHinge2 *joint, dVector3 result)
+void dJointGetHinge2Anchor (dJointID j, dVector3 result)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
@@ -1705,8 +1776,9 @@ extern "C" void dJointGetHinge2Anchor (dxJointHinge2 *joint, dVector3 result)
 }
 
 
-extern "C" void dJointGetHinge2Anchor2 (dxJointHinge2 *joint, dVector3 result)
+void dJointGetHinge2Anchor2 (dJointID j, dVector3 result)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
@@ -1717,8 +1789,9 @@ extern "C" void dJointGetHinge2Anchor2 (dxJointHinge2 *joint, dVector3 result)
 }
 
 
-extern "C" void dJointGetHinge2Axis1 (dxJointHinge2 *joint, dVector3 result)
+void dJointGetHinge2Axis1 (dJointID j, dVector3 result)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
@@ -1728,8 +1801,9 @@ extern "C" void dJointGetHinge2Axis1 (dxJointHinge2 *joint, dVector3 result)
 }
 
 
-extern "C" void dJointGetHinge2Axis2 (dxJointHinge2 *joint, dVector3 result)
+void dJointGetHinge2Axis2 (dJointID j, dVector3 result)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
@@ -1739,8 +1813,9 @@ extern "C" void dJointGetHinge2Axis2 (dxJointHinge2 *joint, dVector3 result)
 }
 
 
-extern "C" dReal dJointGetHinge2Param (dxJointHinge2 *joint, int parameter)
+dReal dJointGetHinge2Param (dJointID j, int parameter)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
   if ((parameter & 0xff00) == 0x100) {
@@ -1754,8 +1829,9 @@ extern "C" dReal dJointGetHinge2Param (dxJointHinge2 *joint, int parameter)
 }
 
 
-extern "C" dReal dJointGetHinge2Angle1 (dxJointHinge2 *joint)
+dReal dJointGetHinge2Angle1 (dJointID j)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
   if (joint->node[0].body) return measureHinge2Angle (joint);
@@ -1763,8 +1839,9 @@ extern "C" dReal dJointGetHinge2Angle1 (dxJointHinge2 *joint)
 }
 
 
-extern "C" dReal dJointGetHinge2Angle1Rate (dxJointHinge2 *joint)
+dReal dJointGetHinge2Angle1Rate (dJointID j)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
   if (joint->node[0].body) {
@@ -1778,8 +1855,9 @@ extern "C" dReal dJointGetHinge2Angle1Rate (dxJointHinge2 *joint)
 }
 
 
-extern "C" dReal dJointGetHinge2Angle2Rate (dxJointHinge2 *joint)
+dReal dJointGetHinge2Angle2Rate (dJointID j)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
   if (joint->node[0].body && joint->node[1].body) {
@@ -1793,8 +1871,9 @@ extern "C" dReal dJointGetHinge2Angle2Rate (dxJointHinge2 *joint)
 }
 
 
-extern "C" void dJointAddHinge2Torques (dxJointHinge2 *joint, dReal torque1, dReal torque2)
+void dJointAddHinge2Torques (dJointID j, dReal torque1, dReal torque2)
 {
+  dxJointHinge2* joint = (dxJointHinge2*)j;
   dVector3 axis1, axis2;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dhinge2_vtable,"joint is not a hinge2");
@@ -1856,6 +1935,100 @@ static void getUniversalAxes(dxJointUniversal *joint, dVector3 ax1, dVector3 ax2
   }
 }
 
+static void getUniversalAngles(dxJointUniversal *joint, dReal *angle1, dReal *angle2)
+{
+  if (joint->node[0].body)
+  {
+    // length 1 joint axis in global coordinates, from each body
+    dVector3 ax1, ax2;
+    dMatrix3 R;
+    dQuaternion qcross, qq, qrel;
+
+    getUniversalAxes (joint,ax1,ax2);
+
+    // It should be possible to get both angles without explicitly
+    // constructing the rotation matrix of the cross.  Basically,
+    // orientation of the cross about axis1 comes from body 2,
+    // about axis 2 comes from body 1, and the perpendicular
+    // axis can come from the two bodies somehow.  (We don't really
+    // want to assume it's 90 degrees, because in general the
+    // constraints won't be perfectly satisfied, or even very well
+    // satisfied.)
+    //
+    // However, we'd need a version of getHingeAngleFromRElativeQuat()
+    // that CAN handle when its relative quat is rotated along a direction
+    // other than the given axis.  What I have here works,
+    // although it's probably much slower than need be.
+
+    dRFrom2Axes (R, ax1[0], ax1[1], ax1[2], ax2[0], ax2[1], ax2[2]);
+
+    dRtoQ (R, qcross);
+
+
+    // This code is essentialy the same as getHingeAngle(), see the comments
+    // there for details.
+
+    // get qrel = relative rotation between node[0] and the cross
+    dQMultiply1 (qq, joint->node[0].body->q, qcross);
+    dQMultiply2 (qrel, qq, joint->qrel1);
+
+    *angle1 = getHingeAngleFromRelativeQuat(qrel, joint->axis1);
+
+    // This is equivalent to
+    // dRFrom2Axes(R, ax2[0], ax2[1], ax2[2], ax1[0], ax1[1], ax1[2]);
+    // You see that the R is constructed from the same 2 axis as for angle1
+    // but the first and second axis are swapped.
+    // So we can take the first R and rapply a rotation to it.
+    // The rotation is around the axis between the 2 axes (ax1 and ax2).
+    // We do a rotation of 180deg.
+
+    dQuaternion qcross2;
+    // Find the vector between ax1 and ax2 (i.e. in the middle)
+    // We need to turn around this vector by 180deg
+
+    // The 2 axes should be normalize so to find the vector between the 2.
+    // Add and devide by 2 then normalize or simply normalize
+    //    ax2
+    //    ^
+    //    |
+    //    |
+    ///   *------------> ax1
+    //    We want the vector a 45deg
+    //
+    // N.B. We don't need to normalize the ax1 and ax2 since there are
+    //      normalized when we set them.
+
+    // We set the quaternion q = [cos(theta), dir*sin(theta)] = [w, x, y, Z]
+    qrel[0] = 0;                // equivalent to cos(Pi/2)
+    qrel[1] = ax1[0] + ax2[0];  // equivalent to x*sin(Pi/2); since sin(Pi/2) = 1
+    qrel[2] = ax1[1] + ax2[1];
+    qrel[3] = ax1[2] + ax2[2];
+
+    dReal l = dRecip(sqrt(qrel[1]*qrel[1] + qrel[2]*qrel[2] + qrel[3]*qrel[3]));
+    qrel[1] *= l;
+    qrel[2] *= l;
+    qrel[3] *= l;
+
+    dQMultiply0 (qcross2, qrel, qcross);
+
+    if (joint->node[1].body) {
+      dQMultiply1 (qq, joint->node[1].body->q, qcross2);
+      dQMultiply2 (qrel, qq, joint->qrel2);
+    }
+    else {
+      // pretend joint->node[1].body->q is the identity
+      dQMultiply2 (qrel, qcross2, joint->qrel2);
+    }
+
+    *angle2 = - getHingeAngleFromRelativeQuat(qrel, joint->axis2);
+
+  }
+  else
+  {
+    *angle1 = 0;
+    *angle2 = 0;
+  }
+}
 
 static dReal getUniversalAngle1(dxJointUniversal *joint)
 {
@@ -1957,8 +2130,7 @@ static void universalGetInfo1 (dxJointUniversal *j, dxJoint::Info1 *info)
   // records the result.
   if (limiting1 || limiting2) {
     dReal angle1, angle2;
-    angle1 = getUniversalAngle1(j);
-    angle2 = getUniversalAngle2(j);
+    getUniversalAngles (j, &angle1, &angle2);
     if (limiting1 && j->limot1.testRotationalLimit (angle1)) constraint1 = true;
     if (limiting2 && j->limot2.testRotationalLimit (angle2)) constraint2 = true;
   }
@@ -2061,9 +2233,9 @@ static void universalComputeInitialRelativeRotations (dxJointUniversal *joint)
 }
 
 
-extern "C" void dJointSetUniversalAnchor (dxJointUniversal *joint,
-					  dReal x, dReal y, dReal z)
+void dJointSetUniversalAnchor (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
   setAnchors (joint,x,y,z,joint->anchor1,joint->anchor2);
@@ -2071,9 +2243,9 @@ extern "C" void dJointSetUniversalAnchor (dxJointUniversal *joint,
 }
 
 
-extern "C" void dJointSetUniversalAxis1 (dxJointUniversal *joint,
-					 dReal x, dReal y, dReal z)
+void dJointSetUniversalAxis1 (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
   if (joint->flags & dJOINT_REVERSE)
@@ -2084,9 +2256,9 @@ extern "C" void dJointSetUniversalAxis1 (dxJointUniversal *joint,
 }
 
 
-extern "C" void dJointSetUniversalAxis2 (dxJointUniversal *joint,
-					 dReal x, dReal y, dReal z)
+void dJointSetUniversalAxis2 (dJointID j, dReal x, dReal y, dReal z)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
   if (joint->flags & dJOINT_REVERSE)
@@ -2097,9 +2269,9 @@ extern "C" void dJointSetUniversalAxis2 (dxJointUniversal *joint,
 }
 
 
-extern "C" void dJointGetUniversalAnchor (dxJointUniversal *joint,
-					  dVector3 result)
+void dJointGetUniversalAnchor (dJointID j, dVector3 result)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
@@ -2110,9 +2282,9 @@ extern "C" void dJointGetUniversalAnchor (dxJointUniversal *joint,
 }
 
 
-extern "C" void dJointGetUniversalAnchor2 (dxJointUniversal *joint,
-					  dVector3 result)
+void dJointGetUniversalAnchor2 (dJointID j, dVector3 result)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
@@ -2123,9 +2295,9 @@ extern "C" void dJointGetUniversalAnchor2 (dxJointUniversal *joint,
 }
 
 
-extern "C" void dJointGetUniversalAxis1 (dxJointUniversal *joint,
-					 dVector3 result)
+void dJointGetUniversalAxis1 (dJointID j, dVector3 result)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
@@ -2136,9 +2308,9 @@ extern "C" void dJointGetUniversalAxis1 (dxJointUniversal *joint,
 }
 
 
-extern "C" void dJointGetUniversalAxis2 (dxJointUniversal *joint,
-					 dVector3 result)
+void dJointGetUniversalAxis2 (dJointID j, dVector3 result)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(result,"bad result argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
@@ -2149,9 +2321,9 @@ extern "C" void dJointGetUniversalAxis2 (dxJointUniversal *joint,
 }
 
 
-extern "C" void dJointSetUniversalParam (dxJointUniversal *joint,
-				     int parameter, dReal value)
+void dJointSetUniversalParam (dJointID j, int parameter, dReal value)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
   if ((parameter & 0xff00) == 0x100) {
@@ -2163,8 +2335,9 @@ extern "C" void dJointSetUniversalParam (dxJointUniversal *joint,
 }
 
 
-extern "C" dReal dJointGetUniversalParam (dxJointUniversal *joint, int parameter)
+dReal dJointGetUniversalParam (dJointID j, int parameter)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
   if ((parameter & 0xff00) == 0x100) {
@@ -2175,9 +2348,21 @@ extern "C" dReal dJointGetUniversalParam (dxJointUniversal *joint, int parameter
   }
 }
 
-
-extern "C" dReal dJointGetUniversalAngle1 (dxJointUniversal *joint)
+void dJointGetUniversalAngles (dJointID j, dReal *angle1, dReal *angle2)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
+  if (joint->flags & dJOINT_REVERSE)
+    return getUniversalAngles (joint, angle2, angle1);
+  else
+    return getUniversalAngles (joint, angle1, angle2);
+}
+
+
+dReal dJointGetUniversalAngle1 (dJointID j)
+{
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
   if (joint->flags & dJOINT_REVERSE)
@@ -2187,8 +2372,9 @@ extern "C" dReal dJointGetUniversalAngle1 (dxJointUniversal *joint)
 }
 
 
-extern "C" dReal dJointGetUniversalAngle2 (dxJointUniversal *joint)
+dReal dJointGetUniversalAngle2 (dJointID j)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
   if (joint->flags & dJOINT_REVERSE)
@@ -2198,8 +2384,9 @@ extern "C" dReal dJointGetUniversalAngle2 (dxJointUniversal *joint)
 }
 
 
-extern "C" dReal dJointGetUniversalAngle1Rate (dxJointUniversal *joint)
+dReal dJointGetUniversalAngle1Rate (dJointID j)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
 
@@ -2219,8 +2406,9 @@ extern "C" dReal dJointGetUniversalAngle1Rate (dxJointUniversal *joint)
 }
 
 
-extern "C" dReal dJointGetUniversalAngle2Rate (dxJointUniversal *joint)
+dReal dJointGetUniversalAngle2Rate (dJointID j)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
 
@@ -2240,8 +2428,9 @@ extern "C" dReal dJointGetUniversalAngle2Rate (dxJointUniversal *joint)
 }
 
 
-extern "C" void dJointAddUniversalTorques (dxJointUniversal *joint, dReal torque1, dReal torque2)
+void dJointAddUniversalTorques (dJointID j, dReal torque1, dReal torque2)
 {
+  dxJointUniversal* joint = (dxJointUniversal*)j;
   dVector3 axis1, axis2;
   dAASSERT(joint);
   dUASSERT(joint->vtable == &__duniversal_vtable,"joint is not a universal");
@@ -2274,6 +2463,698 @@ dxJoint::Vtable __duniversal_vtable = {
   (dxJoint::getInfo1_fn*) universalGetInfo1,
   (dxJoint::getInfo2_fn*) universalGetInfo2,
   dJointTypeUniversal};
+
+
+
+//****************************************************************************
+// Prismatic and Rotoide
+
+static void PRInit (dxJointPR *j)
+{
+  // Default Position
+  // Z^
+  //  | Body 1       P      R          Body2
+  //  |+---------+   _      _         +-----------+
+  //  ||         |----|----(_)--------+           |
+  //  |+---------+   -                +-----------+
+  //  |
+  // X.-----------------------------------------> Y
+  // N.B. X is comming out of the page
+  dSetZero (j->anchor2,4);
+
+  dSetZero (j->axisR1,4);
+  j->axisR1[0] = 1;
+  dSetZero (j->axisR2,4);
+  j->axisR2[0] = 1;
+
+  dSetZero (j->axisP1,4);
+  j->axisP1[1] = 1;
+  dSetZero (j->qrel,4);
+  dSetZero (j->offset,4);
+
+  j->limotR.init (j->world);
+  j->limotP.init (j->world);
+}
+
+
+dReal dJointGetPRPosition (dJointID j)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not a Prismatic and Rotoide");
+
+  dVector3 q;
+  // get the offset in global coordinates
+  dMULTIPLY0_331 (q,joint->node[0].body->posr.R,joint->offset);
+
+  if (joint->node[1].body) {
+    dVector3 anchor2;
+
+    // get the anchor2 in global coordinates
+    dMULTIPLY0_331 (anchor2,joint->node[1].body->posr.R,joint->anchor2);
+
+    q[0] = ( (joint->node[0].body->posr.pos[0] + q[0]) -
+             (joint->node[1].body->posr.pos[0] + anchor2[0]) );
+    q[1] = ( (joint->node[0].body->posr.pos[1] + q[1]) -
+             (joint->node[1].body->posr.pos[1] + anchor2[1]) );
+    q[2] = ( (joint->node[0].body->posr.pos[2] + q[2]) -
+             (joint->node[1].body->posr.pos[2] + anchor2[2]) );
+
+  }
+  else {
+    //N.B. When there is no body 2 the joint->anchor2 is already in
+    //     global coordinates
+
+    q[0] = ( (joint->node[0].body->posr.pos[0] + q[0]) -
+             (joint->anchor2[0]) );
+    q[1] = ( (joint->node[0].body->posr.pos[1] + q[1]) -
+             (joint->anchor2[1]) );
+    q[2] = ( (joint->node[0].body->posr.pos[2] + q[2]) -
+             (joint->anchor2[2]) );
+
+  }
+
+  dVector3 axP;
+  // get prismatic axis in global coordinates
+  dMULTIPLY0_331 (axP,joint->node[0].body->posr.R,joint->axisP1);
+
+  return dDOT(axP, q);
+}
+
+
+dReal dJointGetPRPositionRate (dJointID j)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not a Prismatic and Rotoide");
+
+  if (joint->node[0].body) {
+		// We want to find the rate of change of the prismatic part of the joint
+		// We can find it by looking at the speed difference between body1 and the
+		// anchor point.
+
+		// r will be used to find the distance between body1 and the anchor point
+		dVector3 r;
+		if (joint->node[1].body) {
+			// Find joint->anchor2 in global coordinates
+			dVector3 anchor2;
+			dMULTIPLY0_331 (anchor2,joint->node[1].body->posr.R,joint->anchor2);
+
+			r[0] = joint->node[0].body->posr.pos[0] - anchor2[0];
+			r[1] = joint->node[0].body->posr.pos[1] - anchor2[1];
+			r[2] = joint->node[0].body->posr.pos[2] - anchor2[2];
+		}
+		else {
+			//N.B. When there is no body 2 the joint->anchor2 is already in
+			//     global coordinates
+			r[0] = joint->node[0].body->posr.pos[0] - joint->anchor2[0];
+			r[1] = joint->node[0].body->posr.pos[1] - joint->anchor2[1];
+			r[2] = joint->node[0].body->posr.pos[2] - joint->anchor2[2];
+		}
+
+		// The body1 can have velocity coming from the rotation of
+		// the rotoide axis. We need to remove this.
+
+		// Take only the angular rotation coming from the rotation
+		// of the rotoide articulation
+		// N.B. Body1 and Body2 should have the same rotation along axis
+		//      other than the rotoide axis.
+		dVector3 angular;
+		dMULTIPLY0_331 (angular,joint->node[0].body->posr.R,joint->axisR1);
+		dReal omega = dDOT(angular, joint->node[0].body->avel);
+		angular[0] *= omega;
+		angular[1] *= omega;
+		angular[2] *= omega;
+
+		// Find the contribution of the angular rotation to the linear speed
+		// N.B. We do vel = r X w instead of vel = w x r to have vel negative
+		//      since we want to remove it from the linear velocity of the body
+		dVector3 lvel1;
+		dCROSS(lvel1, =, r, angular);
+
+		lvel1[0] += joint->node[0].body->lvel[0];
+		lvel1[1] += joint->node[0].body->lvel[1];
+		lvel1[2] += joint->node[0].body->lvel[2];
+
+		// Since we want rate of change along the prismatic axis
+		// get axisP1 in global coordinates and get the component
+		// along this axis only
+		dVector3 axP1;
+		dMULTIPLY0_331 (axP1,joint->node[0].body->posr.R,joint->axisP1);
+		return dDOT(axP1, lvel1);
+	}
+
+	return 0.0;
+}
+
+
+
+static void PRGetInfo1 (dxJointPR *j, dxJoint::Info1 *info)
+{
+  info->m = 4;
+  info->nub = 4;
+
+  bool added = false;
+
+  added = false;
+  // see if the prismatic articulation is powered
+  if (j->limotP.fmax > 0)
+  {
+    added = true;
+    (info->m)++;  // powered needs an extra constraint row
+  }
+
+  // see if we're at a joint limit.
+  j->limotP.limit = 0;
+  if ((j->limotP.lostop > -dInfinity || j->limotP.histop < dInfinity) &&
+      j->limotP.lostop <= j->limotP.histop) {
+    // measure joint position
+    dReal pos = dJointGetPRPosition (j);
+    if (pos <= j->limotP.lostop) {
+      j->limotP.limit = 1;
+      j->limotP.limit_err = pos - j->limotP.lostop;
+      if (!added)
+        (info->m)++;
+    }
+
+    if (pos >= j->limotP.histop) {
+      j->limotP.limit = 2;
+      j->limotP.limit_err = pos - j->limotP.histop;
+      if (!added)
+        (info->m)++;
+    }
+  }
+
+}
+
+
+
+static void PRGetInfo2 (dxJointPR *joint, dxJoint::Info2 *info)
+{
+  int s = info->rowskip;
+  int s2= 2*s;
+  int s3= 3*s;
+  int s4= 4*s;
+
+  dReal k = info->fps * info->erp;
+
+
+  dVector3 q;  // plane space of axP and after that axR
+
+  // pull out pos and R for both bodies. also get the `connection'
+  // vector pos2-pos1.
+
+  dReal *pos1,*pos2,*R1,*R2;
+  pos1 = joint->node[0].body->posr.pos;
+  R1 = joint->node[0].body->posr.R;
+  if (joint->node[1].body) {
+    pos2 = joint->node[1].body->posr.pos;
+    R2 = joint->node[1].body->posr.R;
+  }
+  else {
+   //     pos2 = 0; // N.B. We can do that to be safe but it is no necessary
+   //     R2 = 0;   // N.B. We can do that to be safe but it is no necessary
+  }
+
+
+  dVector3 axP; // Axis of the prismatic joint in global frame
+  dMULTIPLY0_331 (axP, R1, joint->axisP1);
+
+  // distance between the body1 and the anchor2 in global frame
+  // Calculated in the same way as the offset
+  dVector3 dist;
+
+  if (joint->node[1].body)
+  {
+    dMULTIPLY0_331 (dist, R2, joint->anchor2);
+    dist[0] += pos2[0] - pos1[0];
+    dist[1] += pos2[1] - pos1[1];
+    dist[2] += pos2[2] - pos1[2];
+  }
+  else {
+    dist[0] = joint->anchor2[0] - pos1[0];
+    dist[1] = joint->anchor2[1] - pos1[1];
+    dist[2] = joint->anchor2[2] - pos1[2];
+  }
+
+
+  // ======================================================================
+  // Work on the Rotoide part (i.e. row 0, 1 and maybe 4 if rotoide powered
+
+  // Set the two rotoide rows. The rotoide axis should be the only unconstrained
+  // rotational axis, the angular velocity of the two bodies perpendicular to
+  // the rotoide axis should be equal. Thus the constraint equations are
+  //    p*w1 - p*w2 = 0
+  //    q*w1 - q*w2 = 0
+  // where p and q are unit vectors normal to the rotoide axis, and w1 and w2
+  // are the angular velocity vectors of the two bodies.
+  dVector3 ax1;
+  dMULTIPLY0_331 (ax1, joint->node[0].body->posr.R, joint->axisR1);
+  dCROSS(q , =, ax1, axP);
+
+  info->J1a[0] = axP[0];
+  info->J1a[1] = axP[1];
+  info->J1a[2] = axP[2];
+  info->J1a[s+0] = q[0];
+  info->J1a[s+1] = q[1];
+  info->J1a[s+2] = q[2];
+
+  if (joint->node[1].body) {
+    info->J2a[0] = -axP[0];
+    info->J2a[1] = -axP[1];
+    info->J2a[2] = -axP[2];
+    info->J2a[s+0] = -q[0];
+    info->J2a[s+1] = -q[1];
+    info->J2a[s+2] = -q[2];
+  }
+
+
+  // Compute the right hand side of the constraint equation set. Relative
+  // body velocities along p and q to bring the rotoide back into alignment.
+  // ax1,ax2 are the unit length rotoide axes of body1 and body2 in world frame.
+  // We need to rotate both bodies along the axis u = (ax1 x ax2).
+  // if `theta' is the angle between ax1 and ax2, we need an angular velocity
+  // along u to cover angle erp*theta in one step :
+  //   |angular_velocity| = angle/time = erp*theta / stepsize
+  //                      = (erp*fps) * theta
+  //    angular_velocity  = |angular_velocity| * (ax1 x ax2) / |ax1 x ax2|
+  //                      = (erp*fps) * theta * (ax1 x ax2) / sin(theta)
+  // ...as ax1 and ax2 are unit length. if theta is smallish,
+  // theta ~= sin(theta), so
+  //    angular_velocity  = (erp*fps) * (ax1 x ax2)
+  // ax1 x ax2 is in the plane space of ax1, so we project the angular
+  // velocity to p and q to find the right hand side.
+
+  dVector3 ax2;
+  if (joint->node[1].body) {
+    dMULTIPLY0_331 (ax2, R2, joint->axisR2);
+  }
+  else {
+    ax2[0] = joint->axisR2[0];
+    ax2[1] = joint->axisR2[1];
+    ax2[2] = joint->axisR2[2];
+  }
+
+  dVector3 b;
+  dCROSS (b,=,ax1, ax2);
+  info->c[0] = k * dDOT(b, axP);
+  info->c[1] = k * dDOT(b, q);
+
+
+
+  // ==========================
+  // Work on the Prismatic part (i.e row 2,3 and 4 if only the prismatic is powered
+  // or 5 if rotoide and prismatic powered
+
+  // two rows. we want: vel2 = vel1 + w1 x c ... but this would
+  // result in three equations, so we project along the planespace vectors
+  // so that sliding along the prismatic axis is disregarded. for symmetry we
+  // also substitute (w1+w2)/2 for w1, as w1 is supposed to equal w2.
+
+  // p1 + R1 dist' = p2 + R2 anchor2' ## OLD ## p1 + R1 anchor1' = p2 + R2 dist'
+  // v1 + w1 x R1 dist' + v_p = v2 + w2 x R2 anchor2'## OLD  v1 + w1 x R1 anchor1' = v2 + w2 x R2 dist' + v_p
+  // v_p is speed of prismatic joint (i.e. elongation rate)
+  // Since the constraints are perpendicular to v_p we have:
+  // p dot v_p = 0 and q dot v_p = 0
+  // ax1 dot ( v1 + w1 x dist = v2 + w2 x anchor2 )
+  // q dot ( v1 + w1 x dist = v2 + w2 x anchor2 )
+  // ==
+  // ax1 . v1 + ax1 . w1 x dist = ax1 . v2 + ax1 . w2 x anchor2 ## OLD ## ax1 . v1 + ax1 . w1 x anchor1 = ax1 . v2 + ax1 . w2 x dist
+  // since a . (b x c) = - b . (a x c) = - (a x c) . b
+  // and a x b = - b x a
+  // ax1 . v1 - ax1 x dist . w1 - ax1 . v2 - (- ax1 x anchor2 . w2) = 0
+  // ax1 . v1 + dist x ax1 . w1 - ax1 . v2 - anchor2 x ax1 . w2 = 0
+  // Coeff for 1er line of: J1l => ax1, J2l => -ax1
+  // Coeff for 2er line of: J1l => q, J2l => -q
+  // Coeff for 1er line of: J1a => dist x ax1, J2a => - anchor2 x ax1
+  // Coeff for 2er line of: J1a => dist x q,   J2a => - anchor2 x q
+
+
+	dCROSS ((info->J1a)+s2, = , dist, ax1);
+
+	dCROSS ((info->J1a)+s3, = , dist, q);
+
+
+  info->J1l[s2+0] = ax1[0];
+	info->J1l[s2+1] = ax1[1];
+	info->J1l[s2+2] = ax1[2];
+
+  info->J1l[s3+0] = q[0];
+	info->J1l[s3+1] = q[1];
+	info->J1l[s3+2] = q[2];
+
+  if (joint->node[1].body) {
+    dVector3 anchor2;
+
+    // Calculate anchor2 in world coordinate
+    dMULTIPLY0_331 (anchor2, R2, joint->anchor2);
+
+		// ax2 x anchor2 instead of anchor2 x ax2 since we want the negative value
+		dCROSS ((info->J2a)+s2, = , ax2, anchor2); // since ax1 == ax2
+
+		// The cross product is in reverse order since we want the negative value
+		dCROSS ((info->J2a)+s3, = , q, anchor2);
+
+		info->J2l[s2+0] = -ax1[0];
+		info->J2l[s2+1] = -ax1[1];
+		info->J2l[s2+2] = -ax1[2];
+
+    info->J2l[s3+0] = -q[0];
+		info->J2l[s3+1] = -q[1];
+		info->J2l[s3+2] = -q[2];
+  }
+
+
+  // We want to make correction for motion not in the line of the axisP
+  // We calculate the displacement w.r.t. the anchor pt.
+  //
+  // compute the elements 2 and 3 of right hand side.
+  // we want to align the offset point (in body 2's frame) with the center of body 1.
+  // The position should be the same when we are not along the prismatic axis
+  dVector3 err;
+  dMULTIPLY0_331 (err, R1, joint->offset);
+  err[0] += dist[0];
+  err[1] += dist[1];
+  err[2] += dist[2];
+  info->c[2] = k * dDOT(ax1, err);
+  info->c[3] = k * dDOT(q, err);
+
+  // Here we can't use addLimot because of some assumption in the function
+  int powered = joint->limotP.fmax > 0;
+  if (powered || joint->limotP.limit) {
+    info->J1l[s4+0] = axP[0];
+    info->J1l[s4+1] = axP[1];
+    info->J1l[s4+2] = axP[2];
+    if (joint->node[1].body) {
+      info->J2l[s4+0] = -axP[0];
+      info->J2l[s4+1] = -axP[1];
+      info->J2l[s4+2] = -axP[2];
+    }
+    // linear limot torque decoupling step:
+    //
+    // if this is a linear limot (e.g. from a slider), we have to be careful
+    // that the linear constraint forces (+/- ax1) applied to the two bodies
+    // do not create a torque couple. in other words, the points that the
+    // constraint force is applied at must lie along the same ax1 axis.
+    // a torque couple will result in powered or limited slider-jointed free
+    // bodies from gaining angular momentum.
+    // the solution used here is to apply the constraint forces at the point
+    // halfway between the body centers. there is no penalty (other than an
+    // extra tiny bit of computation) in doing this adjustment. note that we
+    // only need to do this if the constraint connects two bodies.
+
+		dVector3 ltd;  // Linear Torque Decoupling vector (a torque)
+    if (joint->node[1].body) {
+			dVector3 c;
+      c[0]=REAL(0.5)*(joint->node[1].body->posr.pos[0]-joint->node[0].body->posr.pos[0]);
+      c[1]=REAL(0.5)*(joint->node[1].body->posr.pos[1]-joint->node[0].body->posr.pos[1]);
+      c[2]=REAL(0.5)*(joint->node[1].body->posr.pos[2]-joint->node[0].body->posr.pos[2]);
+			dReal val = dDOT(q, c);
+			c[0] -= val * c[0];
+			c[1] -= val * c[1];
+			c[2] -= val * c[2];
+
+      dCROSS (ltd,=,c,axP);
+      info->J1a[s4+0] = ltd[0];
+      info->J1a[s4+1] = ltd[1];
+      info->J1a[s4+2] = ltd[2];
+      info->J2a[s4+0] = ltd[0];
+      info->J2a[s4+1] = ltd[1];
+      info->J2a[s4+2] = ltd[2];
+    }
+
+    // if we're limited low and high simultaneously, the joint motor is
+    // ineffective
+    if (joint->limotP.limit && (joint->limotP.lostop == joint->limotP.histop))
+      powered = 0;
+
+    int row = 4;
+    if (powered) {
+      info->cfm[row] = joint->limotP.normal_cfm;
+      if (!joint->limotP.limit) {
+        info->c[row] = joint->limotP.vel;
+        info->lo[row] = -joint->limotP.fmax;
+        info->hi[row] = joint->limotP.fmax;
+      }
+      else {
+        // the joint is at a limit, AND is being powered. if the joint is
+        // being powered into the limit then we apply the maximum motor force
+        // in that direction, because the motor is working against the
+        // immovable limit. if the joint is being powered away from the limit
+        // then we have problems because actually we need *two* lcp
+        // constraints to handle this case. so we fake it and apply some
+        // fraction of the maximum force. the fraction to use can be set as
+        // a fudge factor.
+
+        dReal fm = joint->limotP.fmax;
+        dReal vel = joint->limotP.vel;
+        int limit = joint->limotP.limit;
+        if ((vel > 0) || (vel==0 && limit==2)) fm = -fm;
+
+        // if we're powering away from the limit, apply the fudge factor
+        if ((limit==1 && vel > 0) || (limit==2 && vel < 0))
+          fm *= joint->limotP.fudge_factor;
+
+
+        dBodyAddForce (joint->node[0].body,-fm*axP[0],-fm*axP[1],-fm*axP[2]);
+
+				if (joint->node[1].body) {
+					dBodyAddForce (joint->node[1].body,fm*axP[0],fm*axP[1],fm*axP[2]);
+
+					// linear limot torque decoupling step: refer to above discussion
+					dBodyAddTorque (joint->node[0].body,-fm*ltd[0],-fm*ltd[1],
+													-fm*ltd[2]);
+					dBodyAddTorque (joint->node[1].body,-fm*ltd[0],-fm*ltd[1],
+													-fm*ltd[2]);
+				}
+      }
+    }
+
+		if (joint->limotP.limit) {
+      dReal k = info->fps * joint->limotP.stop_erp;
+      info->c[row] = -k * joint->limotP.limit_err;
+      info->cfm[row] = joint->limotP.stop_cfm;
+
+      if (joint->limotP.lostop == joint->limotP.histop) {
+				// limited low and high simultaneously
+				info->lo[row] = -dInfinity;
+				info->hi[row] = dInfinity;
+      }
+      else {
+        if (joint->limotP.limit == 1) {
+					// low limit
+					info->lo[row] = 0;
+					info->hi[row] = dInfinity;
+				}
+				else {
+					// high limit
+					info->lo[row] = -dInfinity;
+					info->hi[row] = 0;
+				}
+
+				// deal with bounce
+        if (joint->limotP.bounce > 0) {
+					// calculate joint velocity
+          dReal vel;
+          vel = dDOT(joint->node[0].body->lvel, axP);
+          if (joint->node[1].body)
+            vel -= dDOT(joint->node[1].body->lvel, axP);
+
+					// only apply bounce if the velocity is incoming, and if the
+					// resulting c[] exceeds what we already have.
+          if (joint->limotP.limit == 1) {
+						// low limit
+						if (vel < 0) {
+              dReal newc = -joint->limotP.bounce * vel;
+							if (newc > info->c[row]) info->c[row] = newc;
+						}
+					}
+					else {
+						// high limit - all those computations are reversed
+						if (vel > 0) {
+              dReal newc = -joint->limotP.bounce * vel;
+							if (newc < info->c[row]) info->c[row] = newc;
+						}
+					}
+				}
+      }
+    }
+  }
+}
+
+
+// compute initial relative rotation body1 -> body2, or env -> body1
+static void PRComputeInitialRelativeRotation (dxJointPR *joint)
+{
+  if (joint->node[0].body) {
+    if (joint->node[1].body) {
+      dQMultiply1 (joint->qrel,joint->node[0].body->q,joint->node[1].body->q);
+    }
+    else {
+      // set joint->qrel to the transpose of the first body q
+      joint->qrel[0] = joint->node[0].body->q[0];
+      for (int i=1; i<4; i++) joint->qrel[i] = -joint->node[0].body->q[i];
+      // WARNING do we need the - in -joint->node[0].body->q[i]; or not
+    }
+  }
+}
+
+void dJointSetPRAnchor (dJointID j, dReal x, dReal y, dReal z)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not a Prismatic and Rotoide");
+
+  dVector3 dummy;
+  setAnchors (joint,x,y,z,dummy,joint->anchor2);
+}
+
+
+void dJointSetPRAxis1 (dJointID j, dReal x, dReal y, dReal z)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not a  Prismatic and Rotoide");
+
+  setAxes (joint,x,y,z,joint->axisP1, 0);
+
+  PRComputeInitialRelativeRotation (joint);
+
+  // compute initial relative rotation body1 -> body2, or env -> body1
+  // also compute distance between anchor of body1 w.r.t center of body 2
+  dVector3 c;
+  if (joint->node[1].body) {
+    dVector3 anchor2;
+    dMULTIPLY0_331 (anchor2,joint->node[1].body->posr.R, joint->anchor2);
+
+    c[0] = ( joint->node[1].body->posr.pos[0] + anchor2[0] -
+             joint->node[0].body->posr.pos[0] );
+    c[1] = ( joint->node[1].body->posr.pos[1] + anchor2[1] -
+             joint->node[0].body->posr.pos[1] );
+    c[2] = ( joint->node[1].body->posr.pos[2] + anchor2[2] -
+             joint->node[0].body->posr.pos[2] );
+  }
+  else if (joint->node[0].body) {
+    c[0] = joint->anchor2[0] - joint->node[0].body->posr.pos[0];
+    c[1] = joint->anchor2[1] - joint->node[0].body->posr.pos[1];
+    c[2] = joint->anchor2[2] - joint->node[0].body->posr.pos[2];
+  }
+	else
+	{
+    joint->offset[0] = joint->anchor2[0];
+		joint->offset[1] = joint->anchor2[1];
+		joint->offset[2] = joint->anchor2[2];
+
+		return;
+	}
+
+
+  dMULTIPLY1_331 (joint->offset,joint->node[0].body->posr.R,c);
+}
+
+
+void dJointSetPRAxis2 (dJointID j, dReal x, dReal y, dReal z)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not a Prismatic and Rotoide");
+  setAxes (joint,x,y,z,joint->axisR1,joint->axisR2);
+  PRComputeInitialRelativeRotation (joint);
+}
+
+
+void dJointSetPRParam (dJointID j, int parameter, dReal value)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not a Prismatic and Rotoide");
+  if ((parameter & 0xff00) == 0x100) {
+    joint->limotR.set (parameter,value);
+  }
+  else {
+    joint->limotP.set (parameter & 0xff,value);
+  }
+}
+
+void dJointGetPRAnchor (dJointID j, dVector3 result)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(result,"bad result argument");
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not a Prismatic and Rotoide");
+
+  if (joint->node[1].body)
+    getAnchor2 (joint,result,joint->anchor2);
+  else
+  {
+    result[0] = joint->anchor2[0];
+    result[1] = joint->anchor2[1];
+    result[2] = joint->anchor2[2];
+  }
+
+}
+
+void dJointGetPRAxis1 (dJointID j, dVector3 result)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(result,"bad result argument");
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not a Prismatic and Rotoide");
+  getAxis(joint, result, joint->axisP1);
+}
+
+void dJointGetPRAxis2 (dJointID j, dVector3 result)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(result,"bad result argument");
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not a Prismatic and Rotoide");
+  getAxis(joint, result, joint->axisR1);
+}
+
+dReal dJointGetPRParam (dJointID j, int parameter)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not Prismatic and Rotoide");
+  if ((parameter & 0xff00) == 0x100) {
+    return joint->limotR.get (parameter & 0xff);
+  }
+	else {
+		return joint->limotP.get (parameter);
+	}
+}
+
+void dJointAddPRTorque (dJointID j, dReal torque)
+{
+  dxJointPR* joint = (dxJointPR*)j;
+  dVector3 axis;
+  dAASSERT(joint);
+  dUASSERT(joint->vtable == &__dPR_vtable,"joint is not a Prismatic and Rotoide");
+
+  if (joint->flags & dJOINT_REVERSE)
+    torque = -torque;
+
+  getAxis (joint,axis,joint->axisR1);
+  axis[0] *= torque;
+  axis[1] *= torque;
+  axis[2] *= torque;
+
+  if (joint->node[0].body != 0)
+    dBodyAddTorque (joint->node[0].body, axis[0], axis[1], axis[2]);
+  if (joint->node[1].body != 0)
+    dBodyAddTorque(joint->node[1].body, -axis[0], -axis[1], -axis[2]);
+}
+
+
+dxJoint::Vtable __dPR_vtable = {
+  sizeof(dxJointPR),
+  (dxJoint::init_fn*) PRInit,
+  (dxJoint::getInfo1_fn*) PRGetInfo1,
+  (dxJoint::getInfo2_fn*) PRGetInfo2,
+  dJointTypePR
+};
+
 
 //****************************************************************************
 // angular motor
@@ -2473,8 +3354,9 @@ static void amotorGetInfo2 (dxJointAMotor *joint, dxJoint::Info2 *info)
 }
 
 
-extern "C" void dJointSetAMotorNumAxes (dxJointAMotor *joint, int num)
+void dJointSetAMotorNumAxes (dJointID j, int num)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint && num >= 0 && num <= 3);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   if (joint->mode == dAMotorEuler) {
@@ -2488,9 +3370,9 @@ extern "C" void dJointSetAMotorNumAxes (dxJointAMotor *joint, int num)
 }
 
 
-extern "C" void dJointSetAMotorAxis (dxJointAMotor *joint, int anum, int rel,
-				     dReal x, dReal y, dReal z)
+void dJointSetAMotorAxis (dJointID j, int anum, int rel, dReal x, dReal y, dReal z)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint && anum >= 0 && anum <= 2 && rel >= 0 && rel <= 2);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   dUASSERT(!(!joint->node[1].body &&  (joint->flags & dJOINT_REVERSE) && rel == 1),"no first body, can't set axis rel=1");
@@ -2535,9 +3417,9 @@ extern "C" void dJointSetAMotorAxis (dxJointAMotor *joint, int anum, int rel,
 }
 
 
-extern "C" void dJointSetAMotorAngle (dxJointAMotor *joint, int anum,
-				      dReal angle)
+void dJointSetAMotorAngle (dJointID j, int anum, dReal angle)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint && anum >= 0 && anum < 3);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   if (joint->mode == dAMotorUser) {
@@ -2548,9 +3430,9 @@ extern "C" void dJointSetAMotorAngle (dxJointAMotor *joint, int anum,
 }
 
 
-extern "C" void dJointSetAMotorParam (dxJointAMotor *joint, int parameter,
-				      dReal value)
+void dJointSetAMotorParam (dJointID j, int parameter, dReal value)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   int anum = parameter >> 8;
@@ -2561,8 +3443,9 @@ extern "C" void dJointSetAMotorParam (dxJointAMotor *joint, int parameter,
 }
 
 
-extern "C" void dJointSetAMotorMode (dxJointAMotor *joint, int mode)
+void dJointSetAMotorMode (dJointID j, int mode)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   joint->mode = mode;
@@ -2573,17 +3456,18 @@ extern "C" void dJointSetAMotorMode (dxJointAMotor *joint, int mode)
 }
 
 
-extern "C" int dJointGetAMotorNumAxes (dxJointAMotor *joint)
+int dJointGetAMotorNumAxes (dJointID j)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   return joint->num;
 }
 
 
-extern "C" void dJointGetAMotorAxis (dxJointAMotor *joint, int anum,
-				     dVector3 result)
+void dJointGetAMotorAxis (dJointID j, int anum, dVector3 result)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint && anum >= 0 && anum < 3);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   if (anum < 0) anum = 0;
@@ -2610,8 +3494,9 @@ extern "C" void dJointGetAMotorAxis (dxJointAMotor *joint, int anum,
 }
 
 
-extern "C" int dJointGetAMotorAxisRel (dxJointAMotor *joint, int anum)
+int dJointGetAMotorAxisRel (dJointID j, int anum)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint && anum >= 0 && anum < 3);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   if (anum < 0) anum = 0;
@@ -2620,8 +3505,9 @@ extern "C" int dJointGetAMotorAxisRel (dxJointAMotor *joint, int anum)
 }
 
 
-extern "C" dReal dJointGetAMotorAngle (dxJointAMotor *joint, int anum)
+dReal dJointGetAMotorAngle (dJointID j, int anum)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint && anum >= 0 && anum < 3);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   if (anum < 0) anum = 0;
@@ -2630,16 +3516,18 @@ extern "C" dReal dJointGetAMotorAngle (dxJointAMotor *joint, int anum)
 }
 
 
-extern "C" dReal dJointGetAMotorAngleRate (dxJointAMotor *joint, int anum)
+dReal dJointGetAMotorAngleRate (dJointID j, int anum)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   // @@@
   dDebug (0,"not yet implemented");
   return 0;
 }
 
 
-extern "C" dReal dJointGetAMotorParam (dxJointAMotor *joint, int parameter)
+dReal dJointGetAMotorParam (dJointID j, int parameter)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   int anum = parameter >> 8;
@@ -2650,16 +3538,18 @@ extern "C" dReal dJointGetAMotorParam (dxJointAMotor *joint, int parameter)
 }
 
 
-extern "C" int dJointGetAMotorMode (dxJointAMotor *joint)
+int dJointGetAMotorMode (dJointID j)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dAASSERT(joint);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
   return joint->mode;
 }
 
 
-extern "C" void dJointAddAMotorTorques (dxJointAMotor *joint, dReal torque1, dReal torque2, dReal torque3)
+void dJointAddAMotorTorques (dJointID j, dReal torque1, dReal torque2, dReal torque3)
 {
+  dxJointAMotor* joint = (dxJointAMotor*)j;
   dVector3 axes[3];
   dAASSERT(joint);
   dUASSERT(joint->vtable == &__damotor_vtable,"joint is not an amotor");
@@ -2697,6 +3587,158 @@ dxJoint::Vtable __damotor_vtable = {
   (dxJoint::getInfo2_fn*) amotorGetInfo2,
   dJointTypeAMotor};
 
+
+
+//****************************************************************************
+// lmotor joint
+static void lmotorInit (dxJointLMotor *j)
+{
+  int i;
+  j->num = 0;
+  for (i=0;i<3;i++) {
+    dSetZero(j->axis[i],4);
+    j->limot[i].init(j->world);
+  }
+}
+
+static void lmotorComputeGlobalAxes (dxJointLMotor *joint, dVector3 ax[3])
+{
+  for (int i=0; i< joint->num; i++) {
+    if (joint->rel[i] == 1) {
+      dMULTIPLY0_331 (ax[i],joint->node[0].body->posr.R,joint->axis[i]);
+    }
+    else if (joint->rel[i] == 2) {
+      if (joint->node[1].body) {   // jds: don't assert, just ignore
+        dMULTIPLY0_331 (ax[i],joint->node[1].body->posr.R,joint->axis[i]);
+      }
+    } else {
+      ax[i][0] = joint->axis[i][0];
+      ax[i][1] = joint->axis[i][1];
+      ax[i][2] = joint->axis[i][2];
+    }
+  }
+}
+
+static void lmotorGetInfo1 (dxJointLMotor *j, dxJoint::Info1 *info)
+{
+  info->m = 0;
+  info->nub = 0;
+  for (int i=0; i < j->num; i++) {
+    if (j->limot[i].fmax > 0) {
+      info->m++;
+    }
+  }
+}
+
+static void lmotorGetInfo2 (dxJointLMotor *joint, dxJoint::Info2 *info)
+{
+  int row=0;
+  dVector3 ax[3];
+  lmotorComputeGlobalAxes(joint, ax);
+
+  for (int i=0;i<joint->num;i++) {
+    row += joint->limot[i].addLimot(joint,info,row,ax[i], 0);
+  }
+}
+
+void dJointSetLMotorAxis (dJointID j, int anum, int rel, dReal x, dReal y, dReal z)
+{
+  dxJointLMotor* joint = (dxJointLMotor*)j;
+//for now we are ignoring rel!
+  dAASSERT(joint && anum >= 0 && anum <= 2 && rel >= 0 && rel <= 2);
+  dUASSERT(joint->vtable == &__dlmotor_vtable,"joint is not an lmotor");
+  if (anum < 0) anum = 0;
+  if (anum > 2) anum = 2;
+
+  if (!joint->node[1].body && rel==2) rel = 1; //ref 1
+
+  joint->rel[anum] = rel;
+
+  dVector3 r;
+  r[0] = x;
+  r[1] = y;
+  r[2] = z;
+  r[3] = 0;
+  if (rel > 0) {
+    if (rel==1) {
+      dMULTIPLY1_331 (joint->axis[anum],joint->node[0].body->posr.R,r);
+	} else {
+	  //second body has to exists thanks to ref 1 line
+      dMULTIPLY1_331 (joint->axis[anum],joint->node[1].body->posr.R,r);
+	}
+  } else {
+    joint->axis[anum][0] = r[0];
+    joint->axis[anum][1] = r[1];
+    joint->axis[anum][2] = r[2];
+  }
+
+  dNormalize3 (joint->axis[anum]);
+}
+
+void dJointSetLMotorNumAxes (dJointID j, int num)
+{
+  dxJointLMotor* joint = (dxJointLMotor*)j;
+  dAASSERT(joint && num >= 0 && num <= 3);
+  dUASSERT(joint->vtable == &__dlmotor_vtable,"joint is not an lmotor");
+  if (num < 0) num = 0;
+  if (num > 3) num = 3;
+  joint->num = num;
+}
+
+void dJointSetLMotorParam (dJointID j, int parameter, dReal value)
+{
+  dxJointLMotor* joint = (dxJointLMotor*)j;
+  dAASSERT(joint);
+  dUASSERT(joint->vtable == &__dlmotor_vtable,"joint is not an lmotor");
+  int anum = parameter >> 8;
+  if (anum < 0) anum = 0;
+  if (anum > 2) anum = 2;
+  parameter &= 0xff;
+  joint->limot[anum].set (parameter, value);
+}
+
+int dJointGetLMotorNumAxes (dJointID j)
+{
+  dxJointLMotor* joint = (dxJointLMotor*)j;
+  dAASSERT(joint);
+  dUASSERT(joint->vtable == &__dlmotor_vtable,"joint is not an lmotor");
+  return joint->num;
+}
+
+
+void dJointGetLMotorAxis (dJointID j, int anum, dVector3 result)
+{
+  dxJointLMotor* joint = (dxJointLMotor*)j;
+  dAASSERT(joint && anum >= 0 && anum < 3);
+  dUASSERT(joint->vtable == &__dlmotor_vtable,"joint is not an lmotor");
+  if (anum < 0) anum = 0;
+  if (anum > 2) anum = 2;
+  result[0] = joint->axis[anum][0];
+  result[1] = joint->axis[anum][1];
+  result[2] = joint->axis[anum][2];
+}
+
+dReal dJointGetLMotorParam (dJointID j, int parameter)
+{
+  dxJointLMotor* joint = (dxJointLMotor*)j;
+  dAASSERT(joint);
+  dUASSERT(joint->vtable == &__dlmotor_vtable,"joint is not an lmotor");
+  int anum = parameter >> 8;
+  if (anum < 0) anum = 0;
+  if (anum > 2) anum = 2;
+  parameter &= 0xff;
+  return joint->limot[anum].get (parameter);
+}
+
+dxJoint::Vtable __dlmotor_vtable = {
+  sizeof(dxJointLMotor),
+	(dxJoint::init_fn*) lmotorInit,
+	(dxJoint::getInfo1_fn*) lmotorGetInfo1,
+	(dxJoint::getInfo2_fn*) lmotorGetInfo2,
+	dJointTypeLMotor
+};
+
+
 //****************************************************************************
 // fixed joint
 
@@ -2704,6 +3746,8 @@ static void fixedInit (dxJointFixed *j)
 {
   dSetZero (j->offset,4);
   dSetZero (j->qrel,4);
+  j->erp = j->world->global_erp;
+  j->cfm = j->world->global_cfm;
 }
 
 
@@ -2726,6 +3770,11 @@ static void fixedGetInfo2 (dxJointFixed *joint, dxJoint::Info2 *info)
   info->J1l[0] = 1;
   info->J1l[s+1] = 1;
   info->J1l[2*s+2] = 1;
+
+  info->erp = joint->erp;
+  info->cfm[0] = joint->cfm;
+  info->cfm[1] = joint->cfm;
+  info->cfm[2] = joint->cfm;
 
   dVector3 ofs;
   dMULTIPLY0_331 (ofs,joint->node[0].body->posr.R,joint->offset);
@@ -2750,8 +3799,9 @@ static void fixedGetInfo2 (dxJointFixed *joint, dxJoint::Info2 *info)
 }
 
 
-extern "C" void dJointSetFixed (dxJointFixed *joint)
+void dJointSetFixed (dJointID j)
 {
+  dxJointFixed* joint = (dxJointFixed*)j;
   dUASSERT(joint,"bad joint argument");
   dUASSERT(joint->vtable == &__dfixed_vtable,"joint is not fixed");
   int i;
@@ -2774,6 +3824,49 @@ extern "C" void dJointSetFixed (dxJointFixed *joint)
       for (i=0; i<4; i++) joint->offset[i] = joint->node[0].body->posr.pos[i];
     }
   }
+}
+
+void dxJointFixed::set (int num, dReal value)
+{
+  switch (num) {
+  case dParamCFM:
+    cfm = value;
+    break;
+  case dParamERP:
+    erp = value;
+    break;
+  }
+}
+ 
+
+dReal dxJointFixed::get (int num)
+{
+  switch (num) {
+  case dParamCFM:
+    return cfm;
+  case dParamERP:
+    return erp;
+  default:
+	return 0;
+  }
+}
+
+
+void dJointSetFixedParam (dJointID j, int parameter, dReal value)
+{
+  dxJointFixed* joint = (dxJointFixed*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dfixed_vtable,"joint is not a fixed joint");
+  joint->set (parameter,value);
+}
+
+
+dReal dJointGetFixedParam (dJointID j, int parameter)
+{
+  dxJointFixed* joint = (dxJointFixed*)j;
+  dUASSERT(joint,"bad joint argument");
+  dUASSERT(joint->vtable == &__dfixed_vtable,"joint is not a fixed joint");
+  return joint->get (parameter);
 }
 
 
@@ -2806,3 +3899,167 @@ dxJoint::Vtable __dnull_vtable = {
   (dxJoint::getInfo1_fn*) nullGetInfo1,
   (dxJoint::getInfo2_fn*) nullGetInfo2,
   dJointTypeNull};
+
+
+
+
+/*
+    This code is part of the Plane2D ODE joint
+    by psero@gmx.de
+    Wed Apr 23 18:53:43 CEST 2003
+
+    Add this code to the file: ode/src/joint.cpp
+*/
+
+
+# define        VoXYZ(v1, o1, x, y, z) \
+                    ( \
+                        (v1)[0] o1 (x), \
+                        (v1)[1] o1 (y), \
+                        (v1)[2] o1 (z)  \
+                    )
+
+static dReal   Midentity[3][3] =
+                {
+                    {   1,  0,  0   },
+                    {   0,  1,  0   },
+                    {   0,  0,  1,  }
+                };
+
+
+
+static void     plane2dInit (dxJointPlane2D *j)
+/*********************************************/
+{
+    /* MINFO ("plane2dInit ()"); */
+    j->motor_x.init (j->world);
+    j->motor_y.init (j->world);
+    j->motor_angle.init (j->world);
+}
+
+
+
+static void     plane2dGetInfo1 (dxJointPlane2D *j, dxJoint::Info1 *info)
+/***********************************************************************/
+{
+  /* MINFO ("plane2dGetInfo1 ()"); */
+
+  info->nub = 3;
+  info->m = 3;
+
+  if (j->motor_x.fmax > 0)
+      j->row_motor_x = info->m ++;
+  if (j->motor_y.fmax > 0)
+      j->row_motor_y = info->m ++;
+  if (j->motor_angle.fmax > 0)
+      j->row_motor_angle = info->m ++;
+}
+
+
+
+static void     plane2dGetInfo2 (dxJointPlane2D *joint, dxJoint::Info2 *info)
+/***************************************************************************/
+{
+    int         r0 = 0,
+                r1 = info->rowskip,
+                r2 = 2 * r1;
+    dReal       eps = info->fps * info->erp;
+
+    /* MINFO ("plane2dGetInfo2 ()"); */
+
+/*
+    v = v1, w = omega1
+    (v2, omega2 not important (== static environment))
+
+    constraint equations:
+        xz = 0
+        wx = 0
+        wy = 0
+
+    <=> ( 0 0 1 ) (vx)   ( 0 0 0 ) (wx)   ( 0 )
+        ( 0 0 0 ) (vy) + ( 1 0 0 ) (wy) = ( 0 )
+        ( 0 0 0 ) (vz)   ( 0 1 0 ) (wz)   ( 0 )
+        J1/J1l           Omega1/J1a
+*/
+
+    // fill in linear and angular coeff. for left hand side:
+
+    VoXYZ (&info->J1l[r0], =, 0, 0, 1);
+    VoXYZ (&info->J1l[r1], =, 0, 0, 0);
+    VoXYZ (&info->J1l[r2], =, 0, 0, 0);
+
+    VoXYZ (&info->J1a[r0], =, 0, 0, 0);
+    VoXYZ (&info->J1a[r1], =, 1, 0, 0);
+    VoXYZ (&info->J1a[r2], =, 0, 1, 0);
+
+    // error correction (against drift):
+
+    // a) linear vz, so that z (== pos[2]) == 0
+    info->c[0] = eps * -joint->node[0].body->posr.pos[2];
+
+# if 0
+    // b) angular correction? -> left to application !!!
+    dReal       *body_z_axis = &joint->node[0].body->R[8];
+    info->c[1] = eps * +atan2 (body_z_axis[1], body_z_axis[2]); // wx error
+    info->c[2] = eps * -atan2 (body_z_axis[0], body_z_axis[2]); // wy error
+# endif
+
+    // if the slider is powered, or has joint limits, add in the extra row:
+
+    if (joint->row_motor_x > 0)
+        joint->motor_x.addLimot (
+            joint, info, joint->row_motor_x, Midentity[0], 0);
+
+    if (joint->row_motor_y > 0)
+        joint->motor_y.addLimot (
+            joint, info, joint->row_motor_y, Midentity[1], 0);
+
+    if (joint->row_motor_angle > 0)
+        joint->motor_angle.addLimot (
+            joint, info, joint->row_motor_angle, Midentity[2], 1);
+}
+
+
+
+dxJoint::Vtable __dplane2d_vtable =
+{
+  sizeof (dxJointPlane2D),
+  (dxJoint::init_fn*) plane2dInit,
+  (dxJoint::getInfo1_fn*) plane2dGetInfo1,
+  (dxJoint::getInfo2_fn*) plane2dGetInfo2,
+  dJointTypePlane2D
+};
+
+
+void dJointSetPlane2DXParam (dxJoint *joint,
+                      int parameter, dReal value)
+{
+	dUASSERT (joint, "bad joint argument");
+	dUASSERT (joint->vtable == &__dplane2d_vtable, "joint is not a plane2d");
+	dxJointPlane2D* joint2d = (dxJointPlane2D*)( joint );
+	joint2d->motor_x.set (parameter, value);
+}
+
+
+void dJointSetPlane2DYParam (dxJoint *joint,
+                      int parameter, dReal value)
+{
+	dUASSERT (joint, "bad joint argument");
+	dUASSERT (joint->vtable == &__dplane2d_vtable, "joint is not a plane2d");
+	dxJointPlane2D* joint2d = (dxJointPlane2D*)( joint );
+	joint2d->motor_y.set (parameter, value);
+}
+
+
+
+void dJointSetPlane2DAngleParam (dxJoint *joint,
+                      int parameter, dReal value)
+{
+	dUASSERT (joint, "bad joint argument");
+	dUASSERT (joint->vtable == &__dplane2d_vtable, "joint is not a plane2d");
+	dxJointPlane2D* joint2d = (dxJointPlane2D*)( joint );
+	joint2d->motor_angle.set (parameter, value);
+}
+
+
+
