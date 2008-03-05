@@ -810,9 +810,11 @@ dInternalStepIslandFast (dxWorld * world, dxBody * const *bodies, int nb, dxJoin
 
 			for (i = 0; i < 4; i++)
 				body->tacc[i] = saveTacc[b * 4 + i];
+#ifdef dGYROSCOPIC
 			// compute rotational force
 			dMULTIPLY0_331 (tmp, globalI + b * 12, body->avel);
 			dCROSS (body->tacc, -=, body->avel, tmp);
+#endif
 
 			// add the gravity force to all bodies
 			if ((body->flags & dxBodyNoGravity) == 0)
@@ -842,6 +844,7 @@ dInternalStepIslandFast (dxWorld * world, dxBody * const *bodies, int nb, dxJoin
 			dxJoint::Info1 i1 = info[j];
 			dxJoint::Info2 i2 = Jinfo[j];
                         const int r = dRandInt(j+1);
+			dIASSERT (r < nj);
 			joints[j] = joints[r];
 			info[j] = info[r];
 			Jinfo[j] = Jinfo[r];
