@@ -57,7 +57,9 @@
 #include "jsfun.h"
 #include "jsinterp.h"
 #include "jsnum.h"
+#include "jsobj.h"
 #include "jsopcode.h"
+#include "jsscope.h"
 #include "jsscript.h"
 
 /* Forward declarations for js_ErrorClass's initializer. */
@@ -338,7 +340,7 @@ InitExnPrivate(JSContext *cx, JSObject *exnObject, JSString *message,
     JS_ASSERT(priv->stackElems + stackDepth == elem);
     JS_ASSERT(GetStackTraceValueBuffer(priv) + valueCount == values);
 
-    OBJ_SET_SLOT(cx, exnObject, JSSLOT_PRIVATE, PRIVATE_TO_JSVAL(priv));
+    STOBJ_SET_SLOT(exnObject, JSSLOT_PRIVATE, PRIVATE_TO_JSVAL(priv));
 
     if (report) {
         /*
@@ -759,7 +761,7 @@ Exception(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
      * data so that the finalizer doesn't attempt to free it.
      */
     if (OBJ_GET_CLASS(cx, obj) == &js_ErrorClass)
-        OBJ_SET_SLOT(cx, obj, JSSLOT_PRIVATE, JSVAL_VOID);
+        STOBJ_SET_SLOT(obj, JSSLOT_PRIVATE, JSVAL_VOID);
 
     /* Set the 'message' property. */
     if (argc != 0) {
@@ -791,7 +793,8 @@ Exception(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 
     /* Set the 'lineNumber' property. */
     if (argc > 2) {
-        if (!js_ValueToECMAUint32(cx, argv[2], &lineno))
+        lineno = js_ValueToECMAUint32(cx, &argv[2]);
+        if (JSVAL_IS_NULL(argv[2]))
             return JS_FALSE;
     } else {
         if (!fp)
@@ -819,8 +822,9 @@ exn_toString(JSContext *cx, uintN argc, jsval *vp)
     jschar *chars, *cp;
     size_t name_length, message_length, length;
 
-    obj = JSVAL_TO_OBJECT(vp[1]);
-    if (!OBJ_GET_PROPERTY(cx, obj,
+    obj = JS_THIS_OBJECT(cx, vp);
+    if (!obj ||
+        !OBJ_GET_PROPERTY(cx, obj,
                           ATOM_TO_JSID(cx->runtime->atomState.nameAtom),
                           &v)) {
         return JS_FALSE;
@@ -880,7 +884,8 @@ exn_toSource(JSContext *cx, uintN argc, jsval *vp)
     jschar *chars, *cp;
 
     obj = JS_THIS_OBJECT(cx, vp);
-    if (!OBJ_GET_PROPERTY(cx, obj,
+    if (!obj ||
+        !OBJ_GET_PROPERTY(cx, obj,
                           ATOM_TO_JSID(cx->runtime->atomState.nameAtom),
                           vp)) {
         return JS_FALSE;
@@ -905,8 +910,11 @@ exn_toSource(JSContext *cx, uintN argc, jsval *vp)
         goto out;
     localroots[1] = STRING_TO_JSVAL(filename);
 
-    ok = JS_GetProperty(cx, obj, js_lineNumber_str, &localroots[2]) &&
-         js_ValueToECMAUint32 (cx, localroots[2], &lineno);
+    ok = JS_GetProperty(cx, obj, js_lineNumber_str, &localroots[2]);
+    if (!ok)
+        goto out;
+    lineno = js_ValueToECMAUint32 (cx, &localroots[2]);
+    ok = !JSVAL_IS_NULL(localroots[2]);
     if (!ok)
         goto out;
 
@@ -1048,12 +1056,11 @@ js_InitExceptionClasses(JSContext *cx, JSObject *obj)
             break;
 
         /* So exn_finalize knows whether to destroy private data. */
-        OBJ_SET_SLOT(cx, protos[i], JSSLOT_PRIVATE, JSVAL_VOID);
+        STOBJ_SET_SLOT(protos[i], JSSLOT_PRIVATE, JSVAL_VOID);
 
         /* Make a constructor function for the current name. */
         atom = cx->runtime->atomState.classAtoms[exceptions[i].key];
-        fun = js_DefineFunction(cx, obj, atom, exceptions[i].native, 3,
-                                JSPROP_READONLY | JSPROP_PERMANENT);
+        fun = js_DefineFunction(cx, obj, atom, exceptions[i].native, 3, 0);
         if (!fun)
             break;
 
@@ -1336,7 +1343,8 @@ js_ReportUncaughtException(JSContext *cx)
         ok = JS_GetProperty(cx, exnObject, js_lineNumber_str, &roots[4]);
         if (!ok)
             goto out;
-        ok = js_ValueToECMAUint32 (cx, roots[4], &lineno);
+        lineno = js_ValueToECMAUint32 (cx, &roots[4]);
+        ok = !JSVAL_IS_NULL(roots[4]);
         if (!ok)
             goto out;
 
@@ -1352,7 +1360,11 @@ js_ReportUncaughtException(JSContext *cx)
     } else {
         /* Flag the error as an exception. */
         reportp->flags |= JSREPORT_EXCEPTION;
+
+        /* Pass the exception object. */
+        JS_SetPendingException(cx, exn);
         js_ReportErrorAgain(cx, bytes, reportp);
+        JS_ClearPendingException(cx);
     }
 
 out:

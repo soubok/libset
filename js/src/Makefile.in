@@ -93,6 +93,7 @@ CSRCS		= \
 		jsgc.c \
 		jshash.c \
 		jsinterp.c \
+		jsinvoke.c \
 		jsiter.c \
 		jslock.c \
 		jslog2.c \
@@ -150,7 +151,6 @@ EXPORTS		= \
 		jsobj.h \
 		jsopcode.tbl \
 		jsopcode.h \
-		jsosdep.h \
 		jsotypes.h \
 		jsparse.h \
 		jsprf.h \

@@ -121,8 +121,16 @@ typedef enum JSOpLength {
                                      parenthesized statement head */
 #define JOF_INVOKE       (1U<<22) /* JSOP_CALL, JSOP_NEW, JSOP_EVAL */
 #define JOF_TMPSLOT      (1U<<23) /* interpreter uses extra temporary slot
-                                     to root intermediate objects */
+                                     to root intermediate objects besides
+                                     the slots opcode uses */
+#define JOF_TMPSLOT2     (2U<<23) /* interpreter uses extra 2 temporary slot
+                                     besides the slots opcode uses */
 #define JOF_TMPSLOT_SHIFT 23
+#define JOF_TMPSLOT_MASK  (JS_BITMASK(2) << JOF_TMPSLOT_SHIFT)
+
+/* Shorthands for type from format and type from opcode. */
+#define JOF_TYPE(fmt)   ((fmt) & JOF_TYPEMASK)
+#define JOF_OPTYPE(op)  JOF_TYPE(js_CodeSpec[op].format)
 
 /* Shorthands for mode from format and mode from opcode. */
 #define JOF_MODE(fmt)   ((fmt) & JOF_MODEMASK)
@@ -256,6 +264,7 @@ struct JSCodeSpec {
 
 extern const JSCodeSpec js_CodeSpec[];
 extern uintN            js_NumCodeSpecs;
+extern const char       *js_CodeName[];
 extern const char       js_EscapeMap[];
 
 /*
@@ -298,10 +307,14 @@ js_puts(JSPrinter *jp, const char *s);
 
 /*
  * Get index operand from the bytecode using a bytecode analysis to deduce the
- * the index register.
+ * the index register. This function is infallible, in spite of taking cx as
+ * its first parameter; it uses only cx->runtime when calling JS_GetTrapOpcode.
+ * The GET_*_FROM_BYTECODE macros that call it pick up cx from their caller's
+ * lexical environments.
  */
 uintN
-js_GetIndexFromBytecode(JSScript *script, jsbytecode *pc, ptrdiff_t pcoff);
+js_GetIndexFromBytecode(JSContext *cx, JSScript *script, jsbytecode *pc,
+                        ptrdiff_t pcoff);
 
 /*
  * A slower version of GET_ATOM when the caller does not want to maintain
@@ -309,13 +322,13 @@ js_GetIndexFromBytecode(JSScript *script, jsbytecode *pc, ptrdiff_t pcoff);
  */
 #define GET_ATOM_FROM_BYTECODE(script, pc, pcoff, atom)                       \
     JS_BEGIN_MACRO                                                            \
-        uintN index_ = js_GetIndexFromBytecode((script), (pc), (pcoff));      \
+        uintN index_ = js_GetIndexFromBytecode(cx, (script), (pc), (pcoff));  \
         JS_GET_SCRIPT_ATOM((script), index_, atom);                           \
     JS_END_MACRO
 
 #define GET_OBJECT_FROM_BYTECODE(script, pc, pcoff, obj)                      \
     JS_BEGIN_MACRO                                                            \
-        uintN index_ = js_GetIndexFromBytecode((script), (pc), (pcoff));      \
+        uintN index_ = js_GetIndexFromBytecode(cx, (script), (pc), (pcoff));  \
         JS_GET_SCRIPT_OBJECT((script), index_, obj);                          \
     JS_END_MACRO
 
@@ -327,7 +340,7 @@ js_GetIndexFromBytecode(JSScript *script, jsbytecode *pc, ptrdiff_t pcoff);
 
 #define GET_REGEXP_FROM_BYTECODE(script, pc, pcoff, obj)                      \
     JS_BEGIN_MACRO                                                            \
-        uintN index_ = js_GetIndexFromBytecode((script), (pc), (pcoff));      \
+        uintN index_ = js_GetIndexFromBytecode(cx, (script), (pc), (pcoff));  \
         JS_GET_SCRIPT_REGEXP((script), index_, obj);                          \
     JS_END_MACRO
 
