@@ -175,7 +175,7 @@ js_ReportIsNotFunction(JSContext *cx, jsval *vp, uintN flags);
 extern JSObject *
 js_GetCallObject(JSContext *cx, JSStackFrame *fp, JSObject *parent);
 
-extern JSBool
+extern JS_FRIEND_API(JSBool)
 js_PutCallObject(JSContext *cx, JSStackFrame *fp);
 
 extern JSBool
@@ -193,7 +193,7 @@ js_GetArgsProperty(JSContext *cx, JSStackFrame *fp, jsid id, jsval *vp);
 extern JSObject *
 js_GetArgsObject(JSContext *cx, JSStackFrame *fp);
 
-extern JSBool
+extern JS_FRIEND_API(JSBool)
 js_PutArgsObject(JSContext *cx, JSStackFrame *fp);
 
 extern JSBool
@@ -205,6 +205,8 @@ typedef enum JSLocalKind {
     JSLOCAL_VAR,
     JSLOCAL_CONST
 } JSLocalKind;
+
+#define JS_GET_LOCAL_NAME_COUNT(fun)    ((fun)->nargs + (fun)->u.i.nvars)
 
 extern JSBool
 js_AddLocal(JSContext *cx, JSFunction *fun, JSAtom *atom, JSLocalKind kind);
@@ -219,21 +221,27 @@ extern JSLocalKind
 js_LookupLocal(JSContext *cx, JSFunction *fun, JSAtom *atom, uintN *indexp);
 
 /*
- * Get names of arguments and variables for the interpreted function.
+ * Functions to work with local names as an array of words.
  *
- * The result is an array allocated from the given pool with
- *   fun->nargs + fun->u.i.nvars
- * elements with the names of the arguments coming first. The argument
- * name is null when it corresponds to a destructive pattern.
+ * js_GetLocalNameArray returns the array or null when it cannot be allocated
+ * The function must be called only when JS_GET_LOCAL_NAME_COUNT(fun) is not
+ * zero. The function use the supplied pool to allocate the array.
  *
- * When bitmap is not null, on successful return it will contain a bit array
- * where for each index below fun->nargs the bit is set when the corresponding
- * argument name is not null. For indexes greater or equal fun->nargs the bit
- * is set when the corresponding var is really a const.
+ * The elements of the array with index below fun->nargs correspond to the
+ * names of function arguments and of function variables otherwise. Use
+ * JS_LOCAL_NAME_TO_ATOM to convert array's element into an atom. It can be
+ * null when the element is an argument corresponding to a destructuring
+ * pattern. For a variable use JS_LOCAL_NAME_IS_CONST to check if it
+ * corresponds to the const declaration.
  */
-extern JSAtom **
-js_GetLocalNames(JSContext *cx, JSFunction *fun, JSArenaPool *pool,
-                 uint32 **bitmap);
+extern jsuword *
+js_GetLocalNameArray(JSContext *cx, JSFunction *fun, JSArenaPool *pool);
+
+#define JS_LOCAL_NAME_TO_ATOM(nameWord)                                       \
+    ((JSAtom *) ((nameWord) & ~(jsuword) 1))
+
+#define JS_LOCAL_NAME_IS_CONST(nameWord)                                      \
+    ((((nameWord) & (jsuword) 1)) != 0)
 
 extern void
 js_FreezeLocalNames(JSContext *cx, JSFunction *fun);

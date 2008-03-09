@@ -74,6 +74,8 @@
 #define OBJECT_TO_JSID(obj)         ((jsid)OBJECT_TO_JSVAL(obj))
 #define OBJECT_JSVAL_TO_JSID(v)     ((jsid)v)
 
+#define ID_TO_VALUE(id)             ((jsval)(id))
+
 /*
  * Convenience constants.
  */
@@ -93,6 +95,7 @@ typedef struct JSGenerator          JSGenerator;
 typedef struct JSParseContext       JSParseContext;
 typedef struct JSParsedObjectBox    JSParsedObjectBox;
 typedef struct JSParseNode          JSParseNode;
+typedef struct JSPropCacheEntry     JSPropCacheEntry;
 typedef struct JSSharpObjectMap     JSSharpObjectMap;
 typedef struct JSTempValueRooter    JSTempValueRooter;
 typedef struct JSThread             JSThread;
