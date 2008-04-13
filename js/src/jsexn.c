@@ -296,7 +296,7 @@ InitExnPrivate(JSContext *cx, JSObject *exnObject, JSString *message,
     overflow |= (valueCount > ((size_t)-1 - size) / sizeof(jsval));
     size += valueCount * sizeof(jsval);
     if (overflow) {
-        JS_ReportOutOfMemory(cx);
+        js_ReportAllocationOverflow(cx);
         return JS_FALSE;
     }
     priv = (JSExnPrivate *)JS_malloc(cx, size);
@@ -332,8 +332,8 @@ InitExnPrivate(JSContext *cx, JSObject *exnObject, JSString *message,
         elem->filename = NULL;
         if (fp->script) {
             elem->filename = fp->script->filename;
-            if (fp->pc)
-                elem->ulineno = js_PCToLineNumber(cx, fp->script, fp->pc);
+            if (fp->regs)
+                elem->ulineno = js_PCToLineNumber(cx, fp->script, fp->regs->pc);
         }
         ++elem;
     }
@@ -750,7 +750,7 @@ Exception(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
                                            .classPrototypeAtom),
                               rval))
             return JS_FALSE;
-        obj = js_NewObject(cx, &js_ErrorClass, JSVAL_TO_OBJECT(*rval), NULL);
+        obj = js_NewObject(cx, &js_ErrorClass, JSVAL_TO_OBJECT(*rval), NULL, 0);
         if (!obj)
             return JS_FALSE;
         *rval = OBJECT_TO_JSVAL(obj);
@@ -799,7 +799,9 @@ Exception(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
     } else {
         if (!fp)
             fp = JS_GetScriptedCaller(cx, NULL);
-        lineno = (fp && fp->pc) ? js_PCToLineNumber(cx, fp->script, fp->pc) : 0;
+        lineno = (fp && fp->regs)
+                 ? js_PCToLineNumber(cx, fp->script, fp->regs->pc)
+                 : 0;
     }
 
     return (OBJ_GET_CLASS(cx, obj) != &js_ErrorClass) ||
@@ -1042,7 +1044,6 @@ js_InitExceptionClasses(JSContext *cx, JSObject *obj)
     for (i = 0; exceptions[i].name != 0; i++) {
         JSAtom *atom;
         JSFunction *fun;
-        JSObject *funobj;
         JSString *nameString;
         int protoIndex = exceptions[i].protoIndex;
 
@@ -1051,7 +1052,7 @@ js_InitExceptionClasses(JSContext *cx, JSObject *obj)
                                  (protoIndex != JSEXN_NONE)
                                  ? protos[protoIndex]
                                  : obj_proto,
-                                 obj);
+                                 obj, 0);
         if (!protos[i])
             break;
 
@@ -1067,11 +1068,8 @@ js_InitExceptionClasses(JSContext *cx, JSObject *obj)
         /* Make this constructor make objects of class Exception. */
         fun->u.n.clasp = &js_ErrorClass;
 
-        /* Extract the constructor object. */
-        funobj = fun->object;
-
         /* Make the prototype and constructor links. */
-        if (!js_SetClassPrototype(cx, funobj, protos[i],
+        if (!js_SetClassPrototype(cx, FUN_OBJECT(fun), protos[i],
                                   JSPROP_READONLY | JSPROP_PERMANENT)) {
             break;
         }
@@ -1090,7 +1088,7 @@ js_InitExceptionClasses(JSContext *cx, JSObject *obj)
         }
 
         /* Finally, stash the constructor for later uses. */
-        if (!js_SetClassObject(cx, obj, exceptions[i].key, funobj))
+        if (!js_SetClassObject(cx, obj, exceptions[i].key, FUN_OBJECT(fun)))
             break;
     }
 
@@ -1221,7 +1219,7 @@ js_ErrorToException(JSContext *cx, const char *message, JSErrorReport *reportp)
         goto out;
     tv[0] = OBJECT_TO_JSVAL(errProto);
 
-    errObject = js_NewObject(cx, &js_ErrorClass, errProto, NULL);
+    errObject = js_NewObject(cx, &js_ErrorClass, errProto, NULL, 0);
     if (!errObject) {
         ok = JS_FALSE;
         goto out;

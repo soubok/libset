@@ -1063,12 +1063,12 @@ NewCompilerFunction(JSContext *cx, JSTreeContext *tc, JSAtom *atom,
     JSFunction *fun;
 
     JS_ASSERT((lambda & ~JSFUN_LAMBDA) == 0);
-    parent = (tc->flags & TCF_IN_FUNCTION) ? tc->fun->object : cx->fp->varobj;
+    parent = (tc->flags & TCF_IN_FUNCTION) ? FUN_OBJECT(tc->fun) : cx->fp->varobj;
     fun = js_NewFunction(cx, NULL, NULL, 0, JSFUN_INTERPRETED | lambda,
                          parent, atom);
     if (fun && !(tc->flags & TCF_COMPILE_N_GO)) {
-        STOBJ_SET_PARENT(fun->object, NULL);
-        STOBJ_SET_PROTO(fun->object, NULL);
+        STOBJ_SET_PARENT(FUN_OBJECT(fun), NULL);
+        STOBJ_SET_PROTO(FUN_OBJECT(fun), NULL);
     }
     return fun;
 }
@@ -1191,7 +1191,7 @@ FunctionDef(JSContext *cx, JSTokenStream *ts, JSTreeContext *tc,
      * Create wrapping box for fun->object early to protect against a
      * last-ditch GC.
      */
-    funpob = js_NewParsedObjectBox(cx, tc->parseContext, fun->object);
+    funpob = js_NewParsedObjectBox(cx, tc->parseContext, FUN_OBJECT(fun));
     if (!funpob)
         return NULL;
 
@@ -1657,6 +1657,37 @@ BindLet(JSContext *cx, BindData *data, JSAtom *atom, JSTreeContext *tc)
                                    (intN)data->u.let.index++,
                                    NULL);
 }
+
+#if JS_HAS_DESTRUCTURING
+/*
+ * The catch/finally handler implementation in the interpreter assumes that
+ * any operation that introduces a new scope (like a "let" or "with" block)
+ * increases the stack depth. This way, it is possible to restore the scope
+ * chain based on stack depth of the handler alone. A let block with an empty
+ * destructuring pattern like in
+ *
+ *   let [] = 1;
+ *
+ * would violate this assumption as the there would be no let locals to store
+ * on the stack. To satisfy it we add an empty property to such blocks so
+ * OBJ_BLOCK_COUNT(cx, blockObj), that gives the number of slots, would be
+ * always positive.
+ */
+static JSBool
+EnsureNonEmptyLet(JSContext *cx, JSTreeContext *tc)
+{
+    jsid id;
+
+    if (OBJ_BLOCK_COUNT(cx, tc->blockChain) != 0)
+        return JS_TRUE;
+
+    id = ATOM_TO_JSID(cx->runtime->atomState.emptyAtom);
+    return js_DefineNativeProperty(cx, tc->blockChain, id,
+                                   JSVAL_VOID, NULL, NULL,
+                                   JSPROP_PERMANENT | JSPROP_READONLY,
+                                   SPROP_HAS_SHORTID, 0, NULL);
+}
+#endif
 
 static JSBool
 BindVarOrConst(JSContext *cx, BindData *data, JSAtom *atom, JSTreeContext *tc)
@@ -2971,7 +3002,7 @@ Statement(JSContext *cx, JSTokenStream *ts, JSTreeContext *tc)
                   case TOK_LB:
                   case TOK_LC:
                     pn3 = DestructuringExpr(cx, &data, tc, tt);
-                    if (!pn3)
+                    if (!pn3 || !EnsureNonEmptyLet(cx, tc))
                         return NULL;
                     break;
 #endif
@@ -3588,6 +3619,10 @@ Variables(JSContext *cx, JSTokenStream *ts, JSTreeContext *tc)
                 tc->flags |= TCF_FUN_HEAVYWEIGHT;
         }
     } while (js_MatchToken(cx, ts, TOK_COMMA));
+#if JS_HAS_DESTRUCTURING
+    if (let && !EnsureNonEmptyLet(cx, tc))
+        return NULL;
+#endif
 
     pn->pn_pos.end = PN_LAST(pn)->pn_pos.end;
     return pn;
@@ -4293,7 +4328,7 @@ GeneratorExpr(JSContext *cx, JSTokenStream *ts, JSTreeContext *tc,
     lambda->pn_op = JSOP_ANONFUNOBJ;
     lambda->pn_pos.begin = body->pn_pos.begin;
     lambda->pn_funpob = js_NewParsedObjectBox(cx, tc->parseContext,
-                                              fun->object);
+                                              FUN_OBJECT(fun));
     if (!lambda->pn_funpob)
         return NULL;
     lambda->pn_body = body;
@@ -6385,9 +6420,11 @@ js_FoldConstants(JSContext *cx, JSParseNode *pn, JSTreeContext *tc)
                 pn->pn_type = TOK_RP;
                 pn->pn_arity = PN_UNARY;
                 pn->pn_kid = pn2;
-            } else {
-                PN_MOVE_NODE(pn, pn2);
+                if (pn3 && pn3 != pn2)
+                    RecycleTree(pn3, tc);
+                break;
             }
+            PN_MOVE_NODE(pn, pn2);
         }
         if (!pn2 || (pn->pn_type == TOK_SEMI && !pn->pn_kid)) {
             /*
