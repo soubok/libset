@@ -252,7 +252,7 @@ IndexToValue(JSContext *cx, jsuint index, jsval *vp)
         *vp = INT_TO_JSVAL(index);
         return JS_TRUE;
     }
-    return js_NewDoubleValue(cx, (jsdouble)index, vp);
+    return JS_NewDoubleValue(cx, (jsdouble)index, vp);
 }
 
 static JSBool
@@ -329,7 +329,7 @@ ResizeSlots(JSContext *cx, JSObject *obj, uint32 oldlen, uint32 len)
     }
 
     if (len > ~(uint32)0 / sizeof(jsval)) {
-        JS_ReportOutOfMemory(cx);
+        js_ReportAllocationOverflow(cx);
         return JS_FALSE;
     }
 
@@ -1798,7 +1798,7 @@ array_sort(JSContext *cx, uintN argc, jsval *vp)
      */
 #if JS_BITS_PER_WORD == 32
     if ((size_t)len > ~(size_t)0 / (2 * sizeof(jsval))) {
-        JS_ReportOutOfMemory(cx);
+        js_ReportAllocationOverflow(cx);
         return JS_FALSE;
     }
 #endif
@@ -1902,7 +1902,7 @@ array_sort(JSContext *cx, uintN argc, jsval *vp)
              */
 #if JS_BITS_PER_WORD == 32
             if ((size_t)newlen > ~(size_t)0 / (4 * sizeof(jsval))) {
-                JS_ReportOutOfMemory(cx);
+                js_ReportAllocationOverflow(cx);
                 ok = JS_FALSE;
                 goto out;
             }
@@ -2375,12 +2375,12 @@ array_concat(JSContext *cx, uintN argc, jsval *vp)
         if (!ok)
             goto out;
         v = argv[i];
-        if (JSVAL_IS_OBJECT(v)) {
+        if (!JSVAL_IS_PRIMITIVE(v)) {
             JSObject *wobj;
 
             aobj = JSVAL_TO_OBJECT(v);
             wobj = js_GetWrappedObject(cx, aobj);
-            if (aobj && OBJ_IS_ARRAY(cx, wobj)) {
+            if (OBJ_IS_ARRAY(cx, wobj)) {
                 ok = OBJ_GET_PROPERTY(cx, aobj,
                                       ATOM_TO_JSID(cx->runtime->atomState
                                                    .lengthAtom),
@@ -2478,7 +2478,7 @@ array_slice(JSContext *cx, uintN argc, jsval *vp)
     if (begin > end)
         begin = end;
 
-    if (OBJ_IS_DENSE_ARRAY(cx, obj)) {
+    if (OBJ_IS_DENSE_ARRAY(cx, obj) && end <= ARRAY_DENSE_LENGTH(obj)) {
         nobj = js_NewArrayObject(cx, end - begin, obj->dslots + begin);
         if (!nobj)
             return JS_FALSE;
@@ -2570,7 +2570,7 @@ array_indexOfHelper(JSContext *cx, JSBool isLast, uintN argc, jsval *vp)
             return JS_FALSE;
         }
         if (!hole && js_StrictlyEqual(cx, *vp, vp[2]))
-            return js_NewNumberValue(cx, i, vp);
+            return js_NewNumberInRootedValue(cx, i, vp);
         if (i == stop)
             goto not_found;
         i += direction;
@@ -2879,7 +2879,7 @@ Array(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 
     /* If called without new, replace obj with a new Array object. */
     if (!(cx->fp->flags & JSFRAME_CONSTRUCTING)) {
-        obj = js_NewObject(cx, &js_ArrayClass, NULL, NULL);
+        obj = js_NewObject(cx, &js_ArrayClass, NULL, NULL, 0);
         if (!obj)
             return JS_FALSE;
         *rval = OBJECT_TO_JSVAL(obj);
@@ -2929,7 +2929,7 @@ js_NewArrayObject(JSContext *cx, jsuint length, jsval *vector)
     JSTempValueRooter tvr;
     JSObject *obj;
 
-    obj = js_NewObject(cx, &js_ArrayClass, NULL, NULL);
+    obj = js_NewObject(cx, &js_ArrayClass, NULL, NULL, 0);
     if (!obj)
         return NULL;
 
@@ -2946,7 +2946,7 @@ js_NewArrayObject(JSContext *cx, jsuint length, jsval *vector)
 JSObject *
 js_NewSlowArrayObject(JSContext *cx)
 {
-    JSObject *obj = js_NewObject(cx, &js_SlowArrayClass, NULL, NULL);
+    JSObject *obj = js_NewObject(cx, &js_SlowArrayClass, NULL, NULL, 0);
     if (obj)
         obj->fslots[JSSLOT_ARRAY_LENGTH] = 0;
     return obj;

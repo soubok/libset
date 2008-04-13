@@ -400,7 +400,7 @@ js_ValueToIterator(JSContext *cx, uintN flags, jsval *vp)
              * we use the parent slot to keep track of the iterable, we must
              * fix it up after.
              */
-            iterobj = js_NewObject(cx, &js_IteratorClass, NULL, NULL);
+            iterobj = js_NewObject(cx, &js_IteratorClass, NULL, NULL, 0);
             if (!iterobj)
                 goto bad;
 
@@ -720,12 +720,12 @@ JSObject *
 js_NewGenerator(JSContext *cx, JSStackFrame *fp)
 {
     JSObject *obj;
-    uintN argc, nargs, nvars, depth, nslots;
+    uintN argc, nargs, nvars, nslots;
     JSGenerator *gen;
     jsval *newsp;
 
     /* After the following return, failing control flow must goto bad. */
-    obj = js_NewObject(cx, &js_GeneratorClass, NULL, NULL);
+    obj = js_NewObject(cx, &js_GeneratorClass, NULL, NULL, 0);
     if (!obj)
         return NULL;
 
@@ -733,8 +733,7 @@ js_NewGenerator(JSContext *cx, JSStackFrame *fp)
     argc = fp->argc;
     nargs = JS_MAX(argc, fp->fun->nargs);
     nvars = fp->nvars;
-    depth = fp->script->depth;
-    nslots = 2 + nargs + nvars + 2 * depth;
+    nslots = 2 + nargs + nvars + fp->script->depth;
 
     /* Allocate obj's private data struct. */
     gen = (JSGenerator *)
@@ -792,10 +791,12 @@ js_NewGenerator(JSContext *cx, JSStackFrame *fp)
     gen->frame.down = NULL;
     gen->frame.annotation = NULL;
     gen->frame.scopeChain = fp->scopeChain;
-    gen->frame.pc = fp->pc;
 
-    /* Allocate generating pc and operand stack space. */
-    gen->frame.spbase = gen->frame.sp = newsp + depth;
+    gen->frame.spbase = newsp;
+    JS_ASSERT(fp->spbase == fp->regs->sp);
+    gen->savedRegs.sp = newsp;
+    gen->savedRegs.pc = fp->regs->pc;
+    gen->frame.regs = &gen->savedRegs;
 
     /* Copy remaining state (XXX sharp* and xml* should be local vars). */
     gen->frame.sharpDepth = 0;
@@ -854,7 +855,7 @@ SendToGenerator(JSContext *cx, JSGeneratorOp op, JSObject *obj,
              * Store the argument to send as the result of the yield
              * expression.
              */
-            gen->frame.sp[-1] = arg;
+            gen->savedRegs.sp[-1] = arg;
         }
         gen->state = JSGEN_RUNNING;
         break;

@@ -137,7 +137,8 @@ static JSPropertySpec object_props[] = {
                                                   obj_getSlot,  obj_setSlot},
     {js_parent_str,JSSLOT_PARENT,JSPROP_READONLY|JSPROP_PERMANENT|JSPROP_SHARED,
                                                   obj_getSlot,  obj_setSlot},
-    {js_count_str, 0,            JSPROP_PERMANENT,obj_getCount, obj_getCount},
+    {js_count_str, 0,            JSPROP_PERMANENT|JSPROP_SHARED,
+                                                  obj_getCount, obj_getCount},
     {0,0,0,0,0}
 };
 
@@ -1146,7 +1147,13 @@ js_ComputeFilename(JSContext *cx, JSStackFrame *caller,
         return principals->codebase;
     }
 
-    *linenop = js_PCToLineNumber(cx, caller->script, caller->pc);
+    if (caller->regs && *caller->regs->pc == JSOP_EVAL) {
+        JS_ASSERT(caller->regs->pc[JSOP_EVAL_LENGTH] == JSOP_LINENO);
+        *linenop = GET_UINT16(caller->regs->pc + JSOP_EVAL_LENGTH);
+    } else {
+        *linenop = js_PCToLineNumber(cx, caller->script,
+                                     caller->regs ? caller->regs->pc : NULL);
+    }
     return caller->script->filename;
 }
 
@@ -1170,8 +1177,8 @@ obj_eval(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 
     fp = cx->fp;
     caller = JS_GetScriptedCaller(cx, fp);
-    JS_ASSERT(!caller || caller->pc);
-    indirectCall = (caller && *caller->pc != JSOP_EVAL);
+    JS_ASSERT(!caller || caller->regs);
+    indirectCall = (caller && *caller->regs->pc != JSOP_EVAL);
 
     /*
      * Ban all indirect uses of eval (global.foo = eval; global.foo(...)) and
@@ -1753,7 +1760,7 @@ Object(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
         JS_ASSERT(!argc || JSVAL_IS_NULL(argv[0]) || JSVAL_IS_VOID(argv[0]));
         if (cx->fp->flags & JSFRAME_CONSTRUCTING)
             return JS_TRUE;
-        obj = js_NewObject(cx, &js_ObjectClass, NULL, NULL);
+        obj = js_NewObject(cx, &js_ObjectClass, NULL, NULL, 0);
         if (!obj)
             return JS_FALSE;
     }
@@ -1894,7 +1901,7 @@ js_NewWithObject(JSContext *cx, JSObject *proto, JSObject *parent, jsint depth)
 {
     JSObject *obj;
 
-    obj = js_NewObject(cx, &js_WithClass, proto, parent);
+    obj = js_NewObject(cx, &js_WithClass, proto, parent, 0);
     if (!obj)
         return NULL;
     STOBJ_SET_SLOT(obj, JSSLOT_PRIVATE, PRIVATE_TO_JSVAL(cx->fp));
@@ -1913,7 +1920,7 @@ js_NewBlockObject(JSContext *cx)
      * scopes.  Make sure obj has its own scope too, since clearing proto does
      * not affect OBJ_SCOPE(obj).
      */
-    obj = js_NewObject(cx, &js_BlockClass, NULL, NULL);
+    obj = js_NewObject(cx, &js_BlockClass, NULL, NULL, 0);
     if (!obj)
         return NULL;
     JS_LOCK_OBJ(cx, obj);
@@ -1931,7 +1938,7 @@ js_CloneBlockObject(JSContext *cx, JSObject *proto, JSObject *parent,
 {
     JSObject *clone;
 
-    clone = js_NewObject(cx, &js_BlockClass, proto, parent);
+    clone = js_NewObject(cx, &js_BlockClass, proto, parent, 0);
     if (!clone)
         return NULL;
     STOBJ_SET_SLOT(clone, JSSLOT_PRIVATE, PRIVATE_TO_JSVAL(fp));
@@ -1959,7 +1966,7 @@ js_PutBlockObject(JSContext *cx, JSBool normalUnwind)
 
     /* Block and its locals must be on the current stack for GC safety. */
     JS_ASSERT((size_t) OBJ_BLOCK_DEPTH(cx, obj) <=
-              (size_t) (fp->sp - fp->spbase));
+              (size_t) (fp->regs->sp - fp->spbase));
 
     if (normalUnwind) {
         depth = OBJ_BLOCK_DEPTH(cx, obj);
@@ -1968,8 +1975,14 @@ js_PutBlockObject(JSContext *cx, JSBool normalUnwind)
                 continue;
             if (!(sprop->flags & SPROP_HAS_SHORTID))
                 continue;
+            if (sprop->id == ATOM_TO_JSID(cx->runtime->atomState.emptyAtom)) {
+                /* See comments before EnsureNonEmptyLet from jsparse.c. */
+                JS_ASSERT(OBJ_BLOCK_COUNT(cx, obj) == 1);
+                JS_ASSERT(sprop->shortid == 0);
+                continue;
+            }
             slot = depth + (uintN) sprop->shortid;
-            JS_ASSERT(slot < (size_t) (fp->sp - fp->spbase));
+            JS_ASSERT(slot < (size_t) (fp->regs->sp - fp->spbase));
             if (!js_DefineNativeProperty(cx, obj, sprop->id,
                                          fp->spbase[slot], NULL, NULL,
                                          JSPROP_ENUMERATE | JSPROP_PERMANENT,
@@ -2417,7 +2430,8 @@ js_GetClassId(JSContext *cx, JSClass *clasp, jsid *idp)
 }
 
 JSObject *
-js_NewObject(JSContext *cx, JSClass *clasp, JSObject *proto, JSObject *parent)
+js_NewObject(JSContext *cx, JSClass *clasp, JSObject *proto, JSObject *parent,
+             uintN objectSize)
 {
     jsid id;
 
@@ -2434,12 +2448,12 @@ js_NewObject(JSContext *cx, JSClass *clasp, JSObject *proto, JSObject *parent)
         }
     }
 
-    return js_NewObjectWithGivenProto(cx, clasp, proto, parent);
+    return js_NewObjectWithGivenProto(cx, clasp, proto, parent, objectSize);
 }
 
 JSObject *
 js_NewObjectWithGivenProto(JSContext *cx, JSClass *clasp, JSObject *proto,
-                           JSObject *parent)
+                           JSObject *parent, uintN objectSize)
 {
     JSObject *obj;
     JSObjectOps *ops;
@@ -2453,24 +2467,25 @@ js_NewObjectWithGivenProto(JSContext *cx, JSClass *clasp, JSObject *proto,
         jsdtrace_object_create_start(cx->fp, clasp);
 #endif
 
-    /* Always call the class's getObjectOps hook if it has one. */
-    ops = clasp->getObjectOps
-          ? clasp->getObjectOps(cx, clasp)
-          : &js_ObjectOps;
+    /* Currently only functions can have non-standard allocation size. */
+    if (clasp == &js_FunctionClass) {
+        if (objectSize == 0)
+            objectSize = sizeof(JSFunction);
+        else
+            JS_ASSERT(objectSize == sizeof(JSObject));
+    } else {
+        JS_ASSERT(objectSize == 0);
+        objectSize = sizeof(JSObject);
+    }
 
     /*
-     * Allocate a zeroed object from the GC heap.  Do this *after* any other
-     * GC-thing allocations under js_GetClassPrototype or clasp->getObjectOps,
-     * to avoid displacing the newborn root for obj.
+     * Allocate an object from the GC heap and initialize all its fields before
+     * doing any operation that can potentially trigger GC.
      */
-    obj = (JSObject *) js_NewGCThing(cx, GCX_OBJECT, sizeof(JSObject));
+    obj = (JSObject *) js_NewGCThing(cx, GCX_OBJECT, objectSize);
     if (!obj)
         goto earlybad;
 
-    /*
-     * Initialize all JSObject fields before doing any operation that can
-     * potentially trigger GC.
-     */
     obj->map = NULL;
     obj->dslots = NULL;
 
@@ -2490,6 +2505,11 @@ js_NewObjectWithGivenProto(JSContext *cx, JSClass *clasp, JSObject *proto,
     for (i = JSSLOT_PRIVATE; i != JS_INITIAL_NSLOTS; ++i)
         obj->fslots[i] = JSVAL_VOID;
 
+#ifdef DEBUG
+    memset((uint8 *) obj + sizeof(JSObject), JS_FREE_PATTERN,
+           objectSize - sizeof(JSObject));
+#endif
+
     /*
      * Root obj to prevent it from being collected out from under this call to
      * js_NewObject. There's a possibilty of GC under the objectHook call-out
@@ -2497,11 +2517,16 @@ js_NewObjectWithGivenProto(JSContext *cx, JSClass *clasp, JSObject *proto,
      */
     JS_PUSH_TEMP_ROOT_OBJECT(cx, obj, &tvr);
 
+    /* Always call the class's getObjectOps hook if it has one. */
+    ops = clasp->getObjectOps
+          ? clasp->getObjectOps(cx, clasp)
+          : &js_ObjectOps;
+
     /*
      * Default parent to the parent of the prototype, which was set from
      * the parent of the prototype's constructor.
      */
-    if (!parent && proto)
+    if (proto && !parent)
         STOBJ_SET_PARENT(obj, OBJ_GET_PARENT(cx, proto));
 
     /*
@@ -2765,7 +2790,7 @@ js_ConstructObject(JSContext *cx, JSClass *clasp, JSObject *proto,
             proto = JSVAL_TO_OBJECT(rval);
     }
 
-    obj = js_NewObject(cx, clasp, proto, parent);
+    obj = js_NewObject(cx, clasp, proto, parent, 0);
     if (!obj)
         goto out;
 
@@ -3269,8 +3294,8 @@ js_LookupPropertyWithFlags(JSContext *cx, JSObject *obj, jsid id, uintN flags,
                 if (clasp->flags & JSCLASS_NEW_RESOLVE) {
                     newresolve = (JSNewResolveOp)resolve;
                     if (!(flags & JSRESOLVE_CLASSNAME) &&
-                        cx->fp &&
-                        (pc = cx->fp->pc)) {
+                        cx->fp && cx->fp->regs) {
+                        pc = cx->fp->regs->pc;
                         cs = &js_CodeSpec[*pc];
                         format = cs->format;
                         if (JOF_MODE(format) != JOF_NAME)
@@ -3467,10 +3492,10 @@ js_FindIdentifierBase(JSContext *cx, jsid id, JSPropCacheEntry *entry)
     if (prop) {
         OBJ_DROP_PROPERTY(cx, pobj, prop);
 
-        JS_ASSERT(!entry ||
-                  entry->kpc == ((PCVCAP_TAG(entry->vcap) > 1)
-                                 ? (jsbytecode *) JSID_TO_ATOM(id)
-                                 : cx->fp->pc));
+        JS_ASSERT_IF(entry,
+                     entry->kpc == ((PCVCAP_TAG(entry->vcap) > 1)
+                                    ? (jsbytecode *) JSID_TO_ATOM(id)
+                                    : cx->fp->regs->pc));
         return obj;
     }
 
@@ -3629,10 +3654,11 @@ js_GetPropertyHelper(JSContext *cx, JSObject *obj, jsid id, jsval *vp,
          * Give a strict warning if foo.bar is evaluated by a script for an
          * object foo with no property named 'bar'.
          */
-        if (JSVAL_IS_VOID(*vp) && cx->fp && (pc = cx->fp->pc)) {
+        if (JSVAL_IS_VOID(*vp) && cx->fp && cx->fp->regs) {
             JSOp op;
             uintN flags;
 
+            pc = cx->fp->regs->pc;
             op = (JSOp) *pc;
             if (op == JSOP_GETXPROP) {
                 flags = JSREPORT_ERROR;
@@ -4649,7 +4675,7 @@ js_PrimitiveToObject(JSContext *cx, jsval *vp)
     JS_ASSERT(!JSVAL_IS_OBJECT(*vp));
     JS_ASSERT(*vp != JSVAL_VOID);
     clasp = PrimitiveClasses[JSVAL_TAG(*vp) - 1];
-    obj = js_NewObject(cx, clasp, NULL, NULL);
+    obj = js_NewObject(cx, clasp, NULL, NULL, 0);
     if (!obj)
         return JS_FALSE;
     STOBJ_SET_SLOT(obj, JSSLOT_PRIVATE, *vp);
@@ -5020,9 +5046,9 @@ js_TraceObject(JSTracer *trc, JSObject *obj)
      * don't move it up and unify it with the |if (!traceScope)| section
      * above.
      */
-    nslots = (scope->object != obj)
-             ? STOBJ_NSLOTS(obj)
-             : LOCKED_OBJ_NSLOTS(obj);
+    nslots = STOBJ_NSLOTS(obj);
+    if (scope->object == obj && scope->map.freeslot < nslots)
+        nslots = scope->map.freeslot;
 
     for (i = 0; i != nslots; ++i) {
         v = STOBJ_GET_SLOT(obj, i);
@@ -5155,17 +5181,32 @@ void printString(JSString *str) {
 
 void printVal(JSContext *cx, jsval val);
 
-void printObj(JSContext *cx, JSObject *jsobj) {
-    jsuint i;
+void printObj(JSContext *cx, JSObject *obj) {
+    jsuint i, slots;
     jsval val;
     JSClass *clasp;
 
-    fprintf(stderr, "object %p\n", (void *)jsobj);
-    clasp = OBJ_GET_CLASS(cx, jsobj);
+    fprintf(stderr, "object %p\n", (void *) obj);
+    clasp = OBJ_GET_CLASS(cx, obj);
     fprintf(stderr, "class %p %s\n", (void *)clasp, clasp->name);
-    for (i=0; i < STOBJ_NSLOTS(jsobj); i++) {
+    if (OBJ_IS_DENSE_ARRAY(cx, obj)) {
+        slots = JS_MIN((jsuint) obj->fslots[JSSLOT_ARRAY_LENGTH],
+                       ARRAY_DENSE_LENGTH(obj));
+        for (i = 0; i < slots; i++) {
+            val = obj->dslots[i];
+            if (JSVAL_IS_OBJECT(val))
+                fprintf(stderr, "object %p\n", (void*)JSVAL_TO_OBJECT(val));
+            else
+                printVal(cx, val);
+        }
+
+        return;
+    }
+
+    slots = STOBJ_NSLOTS(obj);
+    for (i=0; i < slots; i++) {
         fprintf(stderr, "slot %3d ", i);
-        val = STOBJ_GET_SLOT(jsobj, i);
+        val = STOBJ_GET_SLOT(obj, i);
         if (JSVAL_IS_OBJECT(val))
             fprintf(stderr, "object %p\n", (void *)JSVAL_TO_OBJECT(val));
         else
@@ -5187,6 +5228,8 @@ void printVal(JSContext *cx, jsval val) {
         printString(JSVAL_TO_STRING(val));
     } else if (JSVAL_IS_DOUBLE(val)) {
         fprintf(stderr, "(double) %g\n", *JSVAL_TO_DOUBLE(val));
+    } else if (val == JSVAL_HOLE) {
+        fprintf(stderr, "hole\n");
     } else {
         JS_ASSERT(JSVAL_IS_BOOLEAN(val));
         fprintf(stderr, "(boolean) %s\n",

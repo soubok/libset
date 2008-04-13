@@ -331,7 +331,7 @@ js_GetXMLNamespaceObject(JSContext *cx, JSXMLNamespace *ns)
         JS_ASSERT(JS_GetPrivate(cx, obj) == ns);
         return obj;
     }
-    obj = js_NewObject(cx, &js_NamespaceClass.base, NULL, NULL);
+    obj = js_NewObject(cx, &js_NamespaceClass.base, NULL, NULL, 0);
     if (!obj || !JS_SetPrivate(cx, obj, ns)) {
         cx->weakRoots.newborn[GCX_OBJECT] = NULL;
         return NULL;
@@ -607,7 +607,7 @@ js_GetXMLQNameObject(JSContext *cx, JSXMLQName *qn)
         JS_ASSERT(JS_GetPrivate(cx, obj) == qn);
         return obj;
     }
-    obj = js_NewObject(cx, &js_QNameClass.base, NULL, NULL);
+    obj = js_NewObject(cx, &js_QNameClass.base, NULL, NULL, 0);
     if (!obj || !JS_SetPrivate(cx, obj, qn)) {
         cx->weakRoots.newborn[GCX_OBJECT] = NULL;
         return NULL;
@@ -632,7 +632,7 @@ js_GetAttributeNameObject(JSContext *cx, JSXMLQName *qn)
             return NULL;
     }
 
-    obj = js_NewObject(cx, &js_AttributeNameClass, NULL, NULL);
+    obj = js_NewObject(cx, &js_AttributeNameClass, NULL, NULL, 0);
     if (!obj || !JS_SetPrivate(cx, obj, qn)) {
         cx->weakRoots.newborn[GCX_OBJECT] = NULL;
         return NULL;
@@ -748,7 +748,7 @@ Namespace(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
         }
 
         /* Create and return a new QName object exactly as if constructed. */
-        obj = js_NewObject(cx, &js_NamespaceClass.base, NULL, NULL);
+        obj = js_NewObject(cx, &js_NamespaceClass.base, NULL, NULL, 0);
         if (!obj)
             return JS_FALSE;
         *rval = OBJECT_TO_JSVAL(obj);
@@ -856,7 +856,7 @@ QName(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
          */
         obj = js_NewObject(cx,
                            JS_ValueToFunction(cx, argv[-2])->u.n.clasp,
-                           NULL, NULL);
+                           NULL, NULL, 0);
         if (!obj)
             return JS_FALSE;
         *rval = OBJECT_TO_JSVAL(obj);
@@ -2002,15 +2002,15 @@ ParseXMLSource(JSContext *cx, JSString *src)
     chars [offset + dstlen] = 0;
 
     xml = NULL;
-    for (fp = cx->fp; fp && !fp->pc; fp = fp->down)
+    for (fp = cx->fp; fp && !fp->regs; fp = fp->down)
         JS_ASSERT(!fp->script);
     filename = NULL;
     lineno = 1;
     if (fp) {
-        op = (JSOp) *fp->pc;
+        op = (JSOp) *fp->regs->pc;
         if (op == JSOP_TOXML || op == JSOP_TOXMLLIST) {
             filename = fp->script->filename;
-            lineno = js_PCToLineNumber(cx, fp->script, fp->pc);
+            lineno = js_PCToLineNumber(cx, fp->script, fp->regs->pc);
             for (endp = srcp + srclen; srcp < endp; srcp++) {
                 if (*srcp == '\n')
                     --lineno;
@@ -2367,7 +2367,7 @@ EscapeElementValue(JSContext *cx, JSStringBuffer *sb, JSString *str)
             newlength += 4;
 
         if (newlength < length) {
-            JS_ReportOutOfMemory(cx);
+            js_ReportAllocationOverflow(cx);
             return NULL;
         }
     }
@@ -2424,7 +2424,7 @@ EscapeAttributeValue(JSContext *cx, JSStringBuffer *sb, JSString *str,
             newlength += 4;
 
         if (newlength < length) {
-            JS_ReportOutOfMemory(cx);
+            js_ReportAllocationOverflow(cx);
             return NULL;
         }
     }
@@ -5844,7 +5844,7 @@ xml_childIndex(JSContext *cx, uintN argc, jsval *vp)
             break;
     }
     JS_ASSERT(i < n);
-    return js_NewNumberValue(cx, i, vp);
+    return js_NewNumberInRootedValue(cx, i, vp);
 }
 
 /* XML and XMLList */
@@ -6334,7 +6334,7 @@ xml_length(JSContext *cx, uintN argc, jsval *vp)
     if (xml->xml_class != JSXML_CLASS_LIST) {
         *vp = JSVAL_ONE;
     } else {
-        if (!js_NewNumberValue(cx, xml->xml_kids.length, vp))
+        if (!js_NewNumberInRootedValue(cx, xml->xml_kids.length, vp))
             return JS_FALSE;
     }
     return JS_TRUE;
@@ -7584,7 +7584,7 @@ NewXMLObject(JSContext *cx, JSXML *xml)
 {
     JSObject *obj;
 
-    obj = js_NewObject(cx, &js_XMLClass, NULL, NULL);
+    obj = js_NewObject(cx, &js_XMLClass, NULL, NULL, 0);
     if (!obj || !JS_SetPrivate(cx, obj, xml)) {
         cx->weakRoots.newborn[GCX_OBJECT] = NULL;
         return NULL;
@@ -7713,7 +7713,7 @@ js_InitXMLClass(JSContext *cx, JSObject *obj)
     fun = JS_DefineFunction(cx, obj, js_XMLList_str, XMLList, 1, 0);
     if (!fun)
         return NULL;
-    if (!js_SetClassPrototype(cx, fun->object, proto,
+    if (!js_SetClassPrototype(cx, FUN_OBJECT(fun), proto,
                               JSPROP_READONLY | JSPROP_PERMANENT)) {
         return NULL;
     }
@@ -7997,7 +7997,8 @@ js_GetAnyName(JSContext *cx, jsval *vp)
                     break;
                 }
 
-                obj = js_NewObjectWithGivenProto(cx, &js_AnyNameClass, NULL, NULL);
+                obj = js_NewObjectWithGivenProto(cx, &js_AnyNameClass, NULL,
+                                                 NULL, 0);
                 if (!obj || !JS_SetPrivate(cx, obj, qn)) {
                     cx->weakRoots.newborn[GCX_OBJECT] = NULL;
                     ok = JS_FALSE;
@@ -8281,7 +8282,7 @@ js_StepXMLListFilter(JSContext *cx, JSBool initialized)
     JSXML *xml, *list;
     JSXMLFilter *filter;
 
-    sp = cx->fp->sp;
+    sp = cx->fp->regs->sp;
     if (!initialized) {
         /*
          * We haven't iterated yet, so initialize the filter based on the
@@ -8311,7 +8312,7 @@ js_StepXMLListFilter(JSContext *cx, JSBool initialized)
                 return JS_FALSE;
         }
 
-        filterobj = js_NewObject(cx, &js_XMLFilterClass, NULL, NULL);
+        filterobj = js_NewObject(cx, &js_XMLFilterClass, NULL, NULL, 0);
         if (!filterobj)
             return JS_FALSE;
 

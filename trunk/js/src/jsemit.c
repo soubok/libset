@@ -2053,7 +2053,7 @@ CheckSideEffects(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn,
          * name in that scope object.  See comments at case JSOP_NAMEDFUNOBJ:
          * in jsinterp.c.
          */
-        fun = GET_FUNCTION_PRIVATE(cx, pn->pn_funpob->object);
+        fun = (JSFunction *) pn->pn_funpob->object;
         if (fun->atom)
             *answer = JS_TRUE;
         break;
@@ -3937,7 +3937,7 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
         }
 #endif
 
-        fun = GET_FUNCTION_PRIVATE(cx, pn->pn_funpob->object);
+        fun = (JSFunction *) pn->pn_funpob->object;
         if (fun->u.i.script) {
             /*
              * This second pass is needed to emit JSOP_NOP with a source note
@@ -5353,6 +5353,21 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
         op = PN_OP(pn);
 #if JS_HAS_GETTER_SETTER
         if (op == JSOP_GETTER || op == JSOP_SETTER) {
+            if (pn2->pn_type == TOK_NAME && PN_OP(pn2) != JSOP_SETNAME) {
+                /*
+                 * x getter = y where x is a local or let variable is not
+                 * supported.
+                 */
+                js_ReportCompileErrorNumber(cx,
+                                            TS(cg->treeContext.parseContext),
+                                            pn2, JSREPORT_ERROR,
+                                            JSMSG_BAD_GETTER_OR_SETTER,
+                                            (op == JSOP_GETTER)
+                                            ? js_getter_str
+                                            : js_setter_str);
+                return JS_FALSE;
+            }
+
             /* We'll emit these prefix bytecodes after emitting the r.h.s. */
         } else
 #endif
@@ -5436,14 +5451,14 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
         /* Finally, emit the specialized assignment bytecode. */
         switch (pn2->pn_type) {
           case TOK_NAME:
-            if (pn2->pn_slot < 0 || !pn2->pn_const) {
-                if (pn2->pn_slot >= 0) {
+            if (pn2->pn_slot >= 0) {
+                if (!pn2->pn_const)
                     EMIT_UINT16_IMM_OP(PN_OP(pn2), atomIndex);
-                } else {
-          case TOK_DOT:
-                    EMIT_INDEX_OP(PN_OP(pn2), atomIndex);
-                }
+                break;
             }
+            /* FALL THROUGH */
+          case TOK_DOT:
+            EMIT_INDEX_OP(PN_OP(pn2), atomIndex);
             break;
           case TOK_LB:
 #if JS_HAS_LVALUE_RETURN
@@ -5907,6 +5922,8 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
         argc = pn->pn_count - 1;
         if (js_Emit3(cx, cg, PN_OP(pn), ARGC_HI(argc), ARGC_LO(argc)) < 0)
             return JS_FALSE;
+        if (PN_OP(pn) == JSOP_EVAL)
+            EMIT_UINT16_IMM_OP(JSOP_LINENO, pn->pn_pos.begin.lineno);
         break;
       }
 
