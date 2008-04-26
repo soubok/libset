@@ -624,6 +624,12 @@ JS_TypeOfValue(JSContext *cx, jsval v)
         type = JSTYPE_OBJECT;           /* XXXbe JSTYPE_NULL for JS2 */
         obj = JSVAL_TO_OBJECT(v);
         if (obj) {
+            JSObject *wrapped;
+
+            wrapped = js_GetWrappedObject(cx, obj);
+            if (wrapped)
+                obj = wrapped;
+
             ops = obj->map->ops;
 #if JS_HAS_XML_SUPPORT
             if (ops == &js_XMLObjectOps.base) {
@@ -1242,12 +1248,35 @@ js_InitFunctionAndObjectClasses(JSContext *cx, JSObject *obj)
     }
 
     /* Initialize the function class first so constructors can be made. */
-    fun_proto = js_InitFunctionClass(cx, obj);
-    if (!fun_proto)
+    if (!js_GetClassPrototype(cx, obj, INT_TO_JSID(JSProto_Function),
+                              &fun_proto)) {
+        fun_proto = NULL;
         goto out;
+    }
+    if (!fun_proto) {
+        fun_proto = js_InitFunctionClass(cx, obj);
+        if (!fun_proto)
+            goto out;
+    } else {
+        JSObject *ctor;
+
+        ctor = JS_GetConstructor(cx, fun_proto);
+        if (!ctor) {
+            fun_proto = NULL;
+            goto out;
+        }
+        OBJ_DEFINE_PROPERTY(cx, obj, ATOM_TO_JSID(CLASS_ATOM(cx, Function)),
+                            OBJECT_TO_JSVAL(ctor), 0, 0, 0, NULL);
+    }
 
     /* Initialize the object class next so Object.prototype works. */
-    obj_proto = js_InitObjectClass(cx, obj);
+    if (!js_GetClassPrototype(cx, obj, INT_TO_JSID(JSProto_Object),
+                              &obj_proto)) {
+        fun_proto = NULL;
+        goto out;
+    }
+    if (!obj_proto)
+        obj_proto = js_InitObjectClass(cx, obj);
     if (!obj_proto) {
         fun_proto = NULL;
         goto out;
@@ -1389,7 +1418,7 @@ static JSStdName standard_class_atoms[] = {
  */
 static JSStdName standard_class_names[] = {
     /* ECMA requires that eval be a direct property of the global object. */
-    {js_InitObjectClass,        EAGER_ATOM(eval), NULL},
+    {js_InitEval,               EAGER_ATOM(eval), NULL},
 
     /* Global properties and functions defined by the Number class. */
     {js_InitNumberClass,        LAZY_ATOM(NaN), NULL},
@@ -2770,7 +2799,6 @@ JS_InitClass(JSContext *cx, JSObject *obj, JSObject *parent_proto,
 
         /* Bootstrap Function.prototype (see also JS_InitStandardClasses). */
         if (OBJ_GET_CLASS(cx, ctor) == clasp) {
-            JS_ASSERT(!OBJ_GET_PROTO(cx, ctor));
             OBJ_SET_PROTO(cx, ctor, proto);
         }
     }
@@ -2885,6 +2913,7 @@ JS_PUBLIC_API(JSBool)
 JS_SetPrototype(JSContext *cx, JSObject *obj, JSObject *proto)
 {
     CHECK_REQUEST(cx);
+    JS_ASSERT(obj != proto);
 #ifdef DEBUG
     /*
      * FIXME: bug 408416. The cycle-detection required for script-writeable
@@ -2928,6 +2957,7 @@ JS_PUBLIC_API(JSBool)
 JS_SetParent(JSContext *cx, JSObject *obj, JSObject *parent)
 {
     CHECK_REQUEST(cx);
+    JS_ASSERT(obj != parent);
 #ifdef DEBUG
     /* FIXME: bug 408416, see JS_SetPrototype just above. */
     if (obj->map->ops->setParent)
