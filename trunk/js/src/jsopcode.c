@@ -1606,8 +1606,18 @@ InitSprintStack(JSContext *cx, SprintStack *ss, JSPrinter *jp, uintN depth)
     return JS_TRUE;
 }
 
-static JS_INLINE jsbytecode *
-DecompileBytecode(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
+/*
+ * If nb is non-negative, decompile nb bytecodes starting at pc.  Otherwise
+ * the decompiler starts at pc and continues until it reaches an opcode for
+ * which decompiling would result in the stack depth equaling -(nb + 1).
+ *
+ * The nextop parameter is either JSOP_NOP or the "next" opcode in order of
+ * abstract interpretation (not necessarily physically next in a bytecode
+ * vector). So nextop is JSOP_POP for the last operand in a comma expression,
+ * or JSOP_AND for the right operand of &&.
+ */
+static jsbytecode *
+Decompile(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
 {
     JSContext *cx;
     JSPrinter *jp, *jp2;
@@ -1714,6 +1724,7 @@ DecompileBytecode(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
     JS_END_MACRO
 
     cx = ss->sprinter.context;
+    JS_CHECK_RECURSION(cx, return NULL);
 
     jp = ss->printer;
     startpc = pc;
@@ -1833,6 +1844,22 @@ DecompileBytecode(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
                             op = JSOP_CALL;
                             break;
 #endif
+                          case JSOP_GETTHISPROP:
+                            /*
+                             * NB: JSOP_GETTHISPROP can't fail due to |this|
+                             * being null or undefined at runtime (beware that
+                             * this may change for ES4). Therefore any error
+                             * resulting from this op must be due to the value
+                             * of the property accessed via |this|, so do not
+                             * rewrite op to JSOP_THIS.
+                             *
+                             * The next three cases should not change op if
+                             * js_DecompileValueGenerator was called from the
+                             * the property getter. They should rewrite only
+                             * if the base object in the arg/var/local is null
+                             * or undefined. FIXME: bug 431569.
+                             */
+                            break;
                           case JSOP_GETARGPROP:
                             op = JSOP_GETARG;
                             break;
@@ -1843,12 +1870,6 @@ DecompileBytecode(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
                             op = JSOP_GETLOCAL;
                             break;
                           default:
-                            /*
-                             * NB: JSOP_GETTHISPROP can't happen here, as
-                             * there is no way (yet, watch out for proposed
-                             * ES4/JS2 strict mode) for this to be null or
-                             * undefined at runtime.
-                             */
                             LOCAL_ASSERT(0);
                         }
                     }
@@ -4546,46 +4567,6 @@ DecompileBytecode(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
     return pc;
 }
 
-/*
- * If nb is non-negative, decompile nb bytecodes starting at pc.  Otherwise
- * the decompiler starts at pc and continues until it reaches an opcode for
- * which decompiling would result in the stack depth equaling -(nb + 1).
- *
- * The nextop parameter is either JSOP_NOP or the "next" opcode in order of
- * abstract interpretation (not necessarily physically next in a bytecode
- * vector). So nextop is JSOP_POP for the last operand in a comma expression,
- * or JSOP_AND for the right operand of &&.
- */
-static jsbytecode *
-Decompile(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
-{
-    JSContext *cx;
-    JSPrinter *jp;
-    jsbytecode *oldcode, *oldmain, *code;
-
-    cx = ss->sprinter.context;
-    JS_CHECK_RECURSION(cx, return NULL);
-
-    jp = ss->printer;
-    oldcode = jp->script->code;
-    oldmain = jp->script->main;
-    code = js_UntrapScriptCode(cx, jp->script);
-    if (code != oldcode) {
-        jp->script->code = code;
-        jp->script->main = code + (oldmain - jp->script->code);
-        pc = code + (pc - oldcode);
-    }
-
-    pc = DecompileBytecode(ss, pc, nb, nextop);
-
-    if (code != oldcode) {
-        JS_free(cx, jp->script->code);
-        jp->script->code = oldcode;
-        jp->script->main = oldmain;
-    }
-    return (pc ? pc - code + oldcode : NULL);
-}
-
 static JSBool
 DecompileCode(JSPrinter *jp, JSScript *script, jsbytecode *pc, uintN len,
               uintN pcdepth)
@@ -4596,6 +4577,7 @@ DecompileCode(JSPrinter *jp, JSScript *script, jsbytecode *pc, uintN len,
     void *mark;
     JSBool ok;
     JSScript *oldscript;
+    jsbytecode *oldcode, *oldmain, *code;
     char *last;
 
     depth = script->depth;
@@ -4630,11 +4612,25 @@ DecompileCode(JSPrinter *jp, JSScript *script, jsbytecode *pc, uintN len,
     /* Call recursive subroutine to do the hard work. */
     oldscript = jp->script;
     jp->script = script;
+    oldcode = jp->script->code;
+    oldmain = jp->script->main;
+    code = js_UntrapScriptCode(cx, jp->script);
+    if (code != oldcode) {
+        jp->script->code = code;
+        jp->script->main = code + (oldmain - oldcode);
+        pc = code + (pc - oldcode);
+    }
+
     ok = Decompile(&ss, pc, len, JSOP_NOP) != NULL;
+    if (code != oldcode) {
+        JS_free(cx, jp->script->code);
+        jp->script->code = oldcode;
+        jp->script->main = oldmain;
+    }
     jp->script = oldscript;
 
     /* If the given code didn't empty the stack, do it now. */
-    if (ss.top) {
+    if (ok && ss.top) {
         do {
             last = OFF2STR(&ss.sprinter, PopOff(&ss, JSOP_POP));
         } while (ss.top > pcdepth);
@@ -4911,6 +4907,7 @@ static char *
 DecompileExpression(JSContext *cx, JSScript *script, JSFunction *fun,
                     jsbytecode *pc)
 {
+    jsbytecode *code, *oldcode, *oldmain;
     JSOp op;
     const JSCodeSpec *cs;
     jsbytecode *begin, *end;
@@ -4922,9 +4919,20 @@ DecompileExpression(JSContext *cx, JSScript *script, JSFunction *fun,
     char *name;
 
     JS_ASSERT(script->main <= pc && pc < script->code + script->length);
+
+    pcstack = NULL;
+    oldcode = script->code;
+    oldmain = script->main;
+
+    /* From this point the control must flow through the label out. */
+    code = js_UntrapScriptCode(cx, script);
+    if (code != oldcode) {
+        script->code = code;
+        script->main = code + (oldmain - oldcode);
+        pc = code + (pc - oldcode);
+    }
+
     op = (JSOp) *pc;
-    if (op == JSOP_TRAP)
-        op = JS_GetTrapOpcode(cx, script, pc);
 
     /* None of these stack-writing ops generates novel values. */
     JS_ASSERT(op != JSOP_CASE && op != JSOP_CASEX &&
@@ -4935,8 +4943,10 @@ DecompileExpression(JSContext *cx, JSScript *script, JSFunction *fun,
      * |this| could convert to a very long object initialiser, so cite it by
      * its keyword name instead.
      */
-    if (op == JSOP_THIS)
-        return JS_strdup(cx, js_this_str);
+    if (op == JSOP_THIS) {
+        name = JS_strdup(cx, js_this_str);
+        goto out;
+    }
 
     /*
      * JSOP_BINDNAME is special: it generates a value, the base object of a
@@ -4944,8 +4954,10 @@ DecompileExpression(JSContext *cx, JSScript *script, JSFunction *fun,
      * js_DecompileValueGenerator, the name being bound is irrelevant.  Just
      * fall back to the base object.
      */
-    if (op == JSOP_BINDNAME)
-        return FAILED_EXPRESSION_DECOMPILER;
+    if (op == JSOP_BINDNAME) {
+        name = FAILED_EXPRESSION_DECOMPILER;
+        goto out;
+    }
 
     /* NAME ops are self-contained, others require left or right context. */
     cs = &js_CodeSpec[op];
@@ -4957,8 +4969,10 @@ DecompileExpression(JSContext *cx, JSScript *script, JSFunction *fun,
       case JOF_XMLNAME:
       case 0:
         sn = js_GetSrcNote(script, pc);
-        if (!sn)
-            return FAILED_EXPRESSION_DECOMPILER;
+        if (!sn) {
+            name = FAILED_EXPRESSION_DECOMPILER;
+            goto out;
+        }
         switch (SN_TYPE(sn)) {
           case SRC_PCBASE:
             begin -= js_GetSrcNoteOffset(sn, 0);
@@ -4968,18 +4982,23 @@ DecompileExpression(JSContext *cx, JSScript *script, JSFunction *fun,
             begin += cs->length;
             break;
           default:
-            return FAILED_EXPRESSION_DECOMPILER;
+            name = FAILED_EXPRESSION_DECOMPILER;
+            goto out;
         }
         break;
       default:;
     }
     len = PTRDIFF(end, begin, jsbytecode);
-    if (len <= 0)
-        return FAILED_EXPRESSION_DECOMPILER;
+    if (len <= 0) {
+        name = FAILED_EXPRESSION_DECOMPILER;
+        goto out;
+    }
 
     pcstack = (jsbytecode **) JS_malloc(cx, script->depth * sizeof *pcstack);
-    if (!pcstack)
-        return NULL;
+    if (!pcstack) {
+        name = NULL;
+        goto out;
+    }
 
     /* From this point the control must flow through the label out. */
     pcdepth = ReconstructPCStack(cx, script, begin, pcstack);
@@ -5001,6 +5020,12 @@ DecompileExpression(JSContext *cx, JSScript *script, JSFunction *fun,
     }
 
   out:
+    if (code != oldcode) {
+        JS_free(cx, script->code);
+        script->code = oldcode;
+        script->main = oldmain;
+    }
+
     JS_free(cx, pcstack);
     return name;
 }
@@ -5202,7 +5227,10 @@ ReconstructPCStack(JSContext *cx, JSScript *script, jsbytecode *pc,
             JS_ASSERT(ndefs == 0);
             LOCAL_ASSERT(pcdepth >= 1);
             LOCAL_ASSERT(nuses == 0 ||
-                         *pcstack[pcdepth - 1] == JSOP_ENTERBLOCK);
+                         *pcstack[pcdepth - 1] == JSOP_ENTERBLOCK ||
+                         (*pcstack[pcdepth - 1] == JSOP_TRAP &&
+                          JS_GetTrapOpcode(cx, script, pcstack[pcdepth - 1])
+                          == JSOP_ENTERBLOCK));
             pcstack[pcdepth - 1] = pc;
             break;
         }

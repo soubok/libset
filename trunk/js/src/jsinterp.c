@@ -80,7 +80,7 @@
 #ifdef js_invoke_c__
 
 uint32
-js_GenerateShape(JSContext *cx)
+js_GenerateShape(JSContext *cx, JSBool gcLocked)
 {
     JSRuntime *rt;
     uint32 shape;
@@ -90,7 +90,7 @@ js_GenerateShape(JSContext *cx)
     JS_ASSERT(shape != 0);
     if (shape & SHAPE_OVERFLOW_BIT) {
         rt->gcPoke = JS_TRUE;
-        js_GC(cx, GC_NORMAL);
+        js_GC(cx, gcLocked ? GC_LOCK_HELD : GC_NORMAL);
         shape = JS_ATOMIC_INCREMENT(&rt->shapeGen);
         JS_ASSERT(shape != 0);
         JS_ASSERT_IF(shape & SHAPE_OVERFLOW_BIT,
@@ -852,6 +852,9 @@ js_ComputeThis(JSContext *cx, JSBool lazy, jsval *argv)
 
 #if JS_HAS_NO_SUCH_METHOD
 
+#define JSSLOT_FOUND_FUNCTION   JSSLOT_PRIVATE
+#define JSSLOT_SAVED_ID         (JSSLOT_PRIVATE + 1)
+
 JSClass js_NoSuchMethodClass = {
     "NoSuchMethod",
     JSCLASS_HAS_RESERVED_SLOTS(2) | JSCLASS_IS_ANONYMOUS |
@@ -939,8 +942,8 @@ js_OnUnknownMethod(JSContext *cx, jsval *vp)
             ok = JS_FALSE;
             goto out;
         }
-        STOBJ_SET_SLOT(obj, JSSLOT_PRIVATE, tvr.u.value);
-        STOBJ_SET_SLOT(obj, JSSLOT_PRIVATE + 1, vp[0]);
+        obj->fslots[JSSLOT_FOUND_FUNCTION] = tvr.u.value;
+        obj->fslots[JSSLOT_SAVED_ID] = vp[0];
         vp[0] = OBJECT_TO_JSVAL(obj);
     }
     ok = JS_TRUE;
@@ -953,25 +956,35 @@ js_OnUnknownMethod(JSContext *cx, jsval *vp)
 static JSBool
 NoSuchMethod(JSContext *cx, uintN argc, jsval *vp, uint32 flags)
 {
-    JSObject *obj, *thisp, *argsobj;
-    jsval fval, idval, args[2];
+    jsval *invokevp;
+    void *mark;
+    JSBool ok;
+    JSObject *obj, *argsobj;
+
+    invokevp = js_AllocStack(cx, 2 + 2, &mark);
+    if (!invokevp)
+        return JS_FALSE;
 
     JS_ASSERT(!JSVAL_IS_PRIMITIVE(vp[0]));
+    JS_ASSERT(!JSVAL_IS_PRIMITIVE(vp[1]));
     obj = JSVAL_TO_OBJECT(vp[0]);
     JS_ASSERT(STOBJ_GET_CLASS(obj) == &js_NoSuchMethodClass);
-    fval = OBJ_GET_SLOT(cx, obj, JSSLOT_PRIVATE);
-    idval = OBJ_GET_SLOT(cx, obj, JSSLOT_PRIVATE + 1);
 
-    JS_ASSERT(!JSVAL_IS_PRIMITIVE(vp[1]));
-    thisp = JSVAL_TO_OBJECT(vp[1]);
-
-    args[0] = idval;
+    invokevp[0] = obj->fslots[JSSLOT_FOUND_FUNCTION];
+    invokevp[1] = vp[1];
+    invokevp[2] = obj->fslots[JSSLOT_SAVED_ID];
     argsobj = js_NewArrayObject(cx, argc, vp + 2);
-    if (!argsobj)
-        return JS_FALSE;
-    args[1] = OBJECT_TO_JSVAL(argsobj);
-    return js_InternalInvoke(cx, thisp, fval, flags | JSINVOKE_INTERNAL,
-                             2, args, &vp[0]);
+    if (!argsobj) {
+        ok = JS_FALSE;
+    } else {
+        invokevp[3] = OBJECT_TO_JSVAL(argsobj);
+        ok = (flags & JSINVOKE_CONSTRUCT)
+             ? js_InvokeConstructor(cx, 2, invokevp)
+             : js_Invoke(cx, 2, invokevp, flags);
+        vp[0] = invokevp[0];
+    }
+    js_FreeStack(cx, mark);
+    return ok;
 }
 
 #endif /* JS_HAS_NO_SUCH_METHOD */
@@ -1143,9 +1156,9 @@ have_fun:
     rootedArgsFlag = JSFRAME_ROOTED_ARGV;
     if (nslots != 0) {
         /*
-         * The extra slots required by the function must be continues with the
-         * arguments. Thus, when the last arena does not have room to fit
-         * nslots right after sp and AllocateAfterSP fails, we have to copy
+         * The extra slots required by the function continue with argument
+         * slots. Thus, when the last stack pool arena does not have room to
+         * fit nslots right after sp and AllocateAfterSP fails, we have to copy
          * [vp..vp+2+argc) slots and clear rootedArgsFlag to root the copy.
          */
         if (!AllocateAfterSP(cx, sp, nslots)) {
@@ -1352,7 +1365,7 @@ js_InternalInvoke(JSContext *cx, JSObject *obj, jsval fval, uintN flags,
     invokevp[1] = OBJECT_TO_JSVAL(obj);
     memcpy(invokevp + 2, argv, argc * sizeof *argv);
 
-    ok = js_Invoke(cx, argc, invokevp, flags | JSINVOKE_INTERNAL);
+    ok = js_Invoke(cx, argc, invokevp, flags);
     if (ok) {
         /*
          * Store *rval in the a scoped local root if a scope is open, else in
@@ -1796,7 +1809,7 @@ js_StrictlyEqual(JSContext *cx, jsval lval, jsval rval)
 }
 
 JSBool
-js_InvokeConstructor(JSContext *cx, jsval *vp, uintN argc)
+js_InvokeConstructor(JSContext *cx, uintN argc, jsval *vp)
 {
     JSFunction *fun, *fun2;
     JSObject *obj, *obj2, *proto, *parent;
@@ -3798,7 +3811,7 @@ interrupt:
             vp = regs.sp - (2 + argc);
             JS_ASSERT(vp >= fp->spbase);
 
-            if (!js_InvokeConstructor(cx, vp, argc))
+            if (!js_InvokeConstructor(cx, argc, vp))
                 goto error;
             regs.sp = vp + 1;
             LOAD_INTERRUPT_HANDLER(cx);
@@ -4350,6 +4363,7 @@ interrupt:
                             JS_ASSERT(PCVAL_IS_SPROP(entry->vword));
                             sprop = PCVAL_TO_SPROP(entry->vword);
                             JS_ASSERT(!(sprop->attrs & JSPROP_READONLY));
+                            JS_ASSERT(!(sprop->attrs & JSPROP_SHARED));
                             JS_ASSERT(!SCOPE_IS_SEALED(OBJ_SCOPE(obj)));
 
                             if (scope->object == obj) {
@@ -6487,6 +6501,7 @@ interrupt:
 
           BEGIN_CASE(JSOP_ENTERBLOCK)
             LOAD_OBJECT(0);
+            JS_ASSERT(!OBJ_IS_CLONED_BLOCK(obj));
             JS_ASSERT(fp->spbase + OBJ_BLOCK_DEPTH(cx, obj) == regs.sp);
             vp = regs.sp + OBJ_BLOCK_COUNT(cx, obj);
             JS_ASSERT(regs.sp < vp);
