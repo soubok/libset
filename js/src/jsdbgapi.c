@@ -105,7 +105,8 @@ js_UntrapScriptCode(JSContext *cx, JSScript *script)
     for (trap = (JSTrap *)rt->trapList.next;
          trap != (JSTrap *)&rt->trapList;
          trap = (JSTrap *)trap->links.next) {
-        if (trap->script == script) {
+        if (trap->script == script &&
+            (size_t)(trap->pc - script->code) < script->length) {
             if (code == script->code) {
                 jssrcnote *sn, *notes;
                 size_t nbytes;
@@ -120,6 +121,7 @@ js_UntrapScriptCode(JSContext *cx, JSScript *script)
                 if (!code)
                     break;
                 memcpy(code, script->code, nbytes);
+                JS_CLEAR_GSN_CACHE(cx);
             }
             code[trap->pc - script->code] = trap->op;
         }
@@ -148,9 +150,11 @@ JS_SetTrap(JSContext *cx, JSScript *script, jsbytecode *pc,
         sample = rt->debuggerMutations;
         DBG_UNLOCK(rt);
         trap = (JSTrap *) JS_malloc(cx, sizeof *trap);
-        if (!trap || !js_AddRoot(cx, &trap->closure, "trap->closure")) {
-            if (trap)
-                JS_free(cx, trap);
+        if (!trap)
+            return JS_FALSE;
+        trap->closure = NULL;
+        if(!js_AddRoot(cx, &trap->closure, "trap->closure")) {
+            JS_free(cx, trap);
             return JS_FALSE;
         }
         DBG_LOCK(rt);
@@ -172,8 +176,10 @@ JS_SetTrap(JSContext *cx, JSScript *script, jsbytecode *pc,
     trap->handler = handler;
     trap->closure = closure;
     DBG_UNLOCK(rt);
-    if (junk)
+    if (junk) {
+        js_RemoveRoot(rt, &junk->closure);
         JS_free(cx, junk);
+    }
     return JS_TRUE;
 }
 
