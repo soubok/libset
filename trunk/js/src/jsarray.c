@@ -646,11 +646,11 @@ array_lookupProperty(JSContext *cx, JSObject *obj, jsid id, JSObject **objp,
      * We have only indexed properties up to DENSELEN (excepting holes), plus
      * the length property. For all else, we delegate to the prototype.
      */
-    if ((!js_IdIsIndex(id, &i) &&
-         id != ATOM_TO_JSID(cx->runtime->atomState.lengthAtom)) ||
-        obj->fslots[JSSLOT_ARRAY_LENGTH] == 0 ||
-        i >= ARRAY_DENSE_LENGTH(obj) ||
-        obj->dslots[i] == JSVAL_HOLE)
+    if (id != ATOM_TO_JSID(cx->runtime->atomState.lengthAtom) &&
+        (!js_IdIsIndex(id, &i) ||
+         obj->fslots[JSSLOT_ARRAY_LENGTH] == 0 ||
+         i >= ARRAY_DENSE_LENGTH(obj) ||
+         obj->dslots[i] == JSVAL_HOLE))
     {
         JSObject *proto = STOBJ_GET_PROTO(obj);
 
@@ -2074,23 +2074,16 @@ array_pop(JSContext *cx, uintN argc, jsval *vp)
     if (!obj)
         return JS_FALSE;
     if (OBJ_IS_DENSE_ARRAY(cx, obj)) {
-        *vp = JSVAL_VOID;
         index = obj->fslots[JSSLOT_ARRAY_LENGTH];
-        if (index == 0)
+        if (index == 0) {
+            *vp = JSVAL_VOID;
             return JS_TRUE;
-        index--;
-        if (index < ARRAY_DENSE_LENGTH(obj)) {
-            *vp = obj->dslots[index];
-            JS_ASSERT(*vp != JSVAL_HOLE);
-            if (index == 0) {
-                JS_free(cx, obj->dslots - 1);
-                obj->dslots = NULL;
-            } else {
-                ARRAY_SET_DENSE_LENGTH(obj, index);
-            }
-            obj->fslots[JSSLOT_ARRAY_COUNT]--;
         }
-
+        index--;
+        if (!GetArrayElement(cx, obj, index, &hole, vp))
+            return JS_FALSE;
+        if (!hole && !DeleteArrayElement(cx, obj, index))
+            return JS_FALSE;
         obj->fslots[JSSLOT_ARRAY_LENGTH] = index;
         return JS_TRUE;
     }
