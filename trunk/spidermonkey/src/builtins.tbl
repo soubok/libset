@@ -36,6 +36,33 @@
  *
  * ***** END LICENSE BLOCK ***** */
 
+/**
+ * This file declares the various builtins we recognize, and is
+ * included in various places in interesting ways.  Each line starts
+ * with "BUILTIN" then an integer indicating the number of arguments
+ * the builtin takes.  Builtins with no arguments are not supported at
+ * the moment.
+ *
+ * This is followed, in parentheses, by the following things, in order:
+ * - A name for the builtin.  Prefixed with "F_" this is the opcode name to
+ *   pass to insCall.  Prefixed with "js_" this is the name of the actual
+ *   native method to call.
+ * - The sizes of the arguments to the native, in order.  These can be "LO" for
+ *   integers (any size), pointers, or jsvals and "F" for doubles.
+ * - The size of the return value.  This can be "LO" for 32-bit integers, "P"
+ *   for pointers or jsvals, "F" for doubles, "Q" for 64-bit integers.
+ * - The actual C++ type of the return value
+ * - The C++ types of the arguments, in order
+ * - A boolean value (0 = false, 1 = true) indicating whether the builtin call
+ *   can be optimized away during common subexpression elimination.  This
+ *   should only be true if the the builtin is idempotent and the return value
+ *   is uniquely determined by the values of the arguments.
+ * - A boolean value  (0 = false, 1 = true) indicating whether the builtin call
+ *   can be optimized away during constant folding.  This should only be true
+ *   if the builtin is idempotent and if the return value can be determined at
+ *   compile time if the input values are known at compile time.
+ */
+
 /*
  * NB: bool FASTCALL is not compatible with Nanojit's calling convention usage.
  * Do not use bool FASTCALL, use JSBool only!
@@ -46,6 +73,7 @@ BUILTIN2(BoxInt32,              LO, LO, P,      jsval,     JSContext*, jsint, 1,
 BUILTIN1(UnboxDouble,           LO,     F,      jsdouble,  jsval, 1, 1)
 BUILTIN1(UnboxInt32,            LO,     LO,     int32,     jsval, 1, 1)
 BUILTIN2(dmod,                  F,  F,  F,      jsdouble,  jsdouble, jsdouble, 1, 1)
+BUILTIN2(imod,                  LO, LO, LO,     jsint,     jsint,      jsint, 1, 1)
 BUILTIN1(DoubleToInt32,         F,      LO,     int32,     jsdouble, 1, 1)
 BUILTIN1(DoubleToUint32,        F,      LO,     int32,     jsdouble, 1, 1)
 BUILTIN1(Math_sin,              F,      F,      jsdouble,  jsdouble, 1, 1)
@@ -64,8 +92,11 @@ BUILTIN3(ConcatStrings,         LO, LO, LO, P,  JSString*, JSContext*, JSString*
 BUILTIN3(String_getelem,        LO, LO, LO, P,  JSString*, JSContext*, JSString*, jsint, 1, 1)
 BUILTIN2(String_fromCharCode,   LO, LO, P,      JSString*, JSContext*, jsint, 1, 1)
 BUILTIN2(String_p_charCodeAt,   LO,     LO, LO, jsint,     JSString*, jsint, 1, 1)
-BUILTIN3(String_p_concat_1int,  LO, LO, LO, P,  JSString*, JSContest*, JSString*, jsint, 1, 1)
+BUILTIN3(String_p_concat_1int,  LO, LO, LO, P,  JSString*, JSContext*, JSString*, jsint, 1, 1)
+BUILTIN4(String_p_concat_2str,  LO, LO, LO, LO, P,  JSString*, JSContext*, JSString*, JSString*, JSString*, 1, 1)
+BUILTIN5(String_p_concat_3str,  LO, LO, LO, LO, LO, P,  JSString*, JSContext*, JSString*, JSString*, JSString*, JSString*, 1, 1)
 BUILTIN4(String_p_match,        LO, LO, LO, LO, P, JSObject*, JSContext*, JSString*, jsbytecode*, JSObject*, 1, 1)
+BUILTIN4(String_p_match_obj,    LO, LO, LO, LO, P, JSObject*, JSContext*, JSObject*, jsbytecode*, JSObject*, 1, 1)
 BUILTIN4(String_p_replace_str,  LO, LO, LO, LO, P, JSString*, JSContext*, JSString*, JSObject*, JSString*, 1, 1)
 BUILTIN4(String_p_replace_str2, LO, LO, LO, LO, P, JSString*, JSContext*, JSString*, JSString*, JSString*, 1, 1)
 BUILTIN5(String_p_replace_str3, LO, LO, LO, LO, LO, P, JSString*, JSContext*, JSString*, JSString*, JSString*, JSString*, 1, 1)
@@ -80,8 +111,10 @@ BUILTIN2(StringToInt32,         LO,     LO, LO, jsint,     JSContext*, JSString*
 BUILTIN2(ParseInt,              LO,     LO, F,  jsdouble,  JSContext*, JSString*, 1, 1)
 BUILTIN1(ParseIntDouble,        F,          F,  jsdouble,  jsdouble, 1, 1)
 BUILTIN2(ParseFloat,            LO,     LO, F,  jsdouble,  JSContext*, JSString*, 1, 1)
-BUILTIN3(Any_getelem,           LO, LO, LO, P,  jsval,     JSContext*, JSObject*, JSString*, 0, 0)
-BUILTIN4(Any_setelem,           LO, LO, LO, LO, LO, bool,  JSContext*, JSObject*, JSString*, jsval, 0, 0)
+BUILTIN3(Any_getprop,           LO, LO, LO, P,  jsval,     JSContext*, JSObject*, JSString*, 0, 0)
+BUILTIN4(Any_setprop,           LO, LO, LO, LO, LO, bool,  JSContext*, JSObject*, JSString*, jsval, 0, 0)
+BUILTIN3(Any_getelem,           LO, LO, LO, P,  jsval,     JSContext*, JSObject*, jsuint, 0, 0)
+BUILTIN4(Any_setelem,           LO, LO, LO, LO, LO, bool,  JSContext*, JSObject*, jsuint, jsval, 0, 0)
 BUILTIN3(FastValueToIterator,   LO, LO, LO, P,  JSObject*, JSContext*, jsuint, jsval, 0, 0)
 BUILTIN2(FastCallIteratorNext,  LO,     LO, P,  JSObject*, JSContext*, JSObject*, 0, 0)
 BUILTIN2(CloseIterator,         LO,     LO, LO, bool,      JSContext*, jsval, 0, 0)
@@ -105,6 +138,9 @@ BUILTIN3(Array_1str,            LO, LO, LO, P,  JSObject*, JSContext*, JSObject*
 BUILTIN4(Array_2obj,            LO, LO, LO, LO, P, JSObject*, JSContext*, JSObject*, JSObject*, JSObject**, 0, 0)
 BUILTIN5(Array_3num,            LO, LO, F, F, F, P, JSObject*, JSContext*, JSObject*, jsdouble, jsdouble, jsdouble, 0, 0)
 BUILTIN1(Arguments,             LO,     P,      JSObject*, JSContext*, 0, 0)
+
+// Don't really need an argument here, but we don't support arg-less builtins
+BUILTIN1(Date_now,              LO,     F,      jsdouble, JSContext*, 0, 0)
 
 // soft float
 BUILTIN1(fneg,   F,       F,  jsdouble, jsdouble, 1, 1)

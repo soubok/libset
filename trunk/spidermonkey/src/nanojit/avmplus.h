@@ -65,12 +65,12 @@
 #include <windows.h>
 #endif
 
-#ifdef DEBUG
+#if defined(DEBUG) || defined(_MSC_VER) && _MSC_VER < 1400
 #if !defined _DEBUG
 #define _DEBUG
 #endif
-#define NJ_VERBOSE
-#define NJ_PROFILE
+#define NJ_VERBOSE 1
+#define NJ_PROFILE 1
 #include <stdarg.h>
 #endif
 
@@ -216,9 +216,17 @@ namespace nanojit
     #define SideExitSize(e) sizeof(SideExit)
 }
 
+class GC;
+
 class GCObject 
 {
 public:
+    inline void*
+    operator new(size_t size, GC* gc)
+    {
+        return calloc(1, size);
+    }
+
     static void operator delete (void *gcObject)
     {
         free(gcObject); 
@@ -316,18 +324,6 @@ public:
     }
 };
 
-inline void*
-operator new(size_t size, GC* gc)
-{
-    return calloc(1, size);
-}
-
-inline void
-operator delete(void* p)
-{
-    free(p);
-}
-
 #define DWB(x) x
 #define DRCWB(x) x
 
@@ -345,7 +341,9 @@ namespace avmplus
         JSContext *cx; /* current VM context handle */
         void* eos; /* first unusable word after the native stack */
         void* eor; /* first unusable word after the call stack */
-        nanojit::GuardRecord* nestedExit; /* innermost nested guard for NESTED_EXIT exits */
+        nanojit::GuardRecord* lastTreeExitGuard; /* guard we exited on during a tree call */
+        nanojit::GuardRecord* lastTreeCallGuard; /* guard we want to grow from if the tree
+                                                    call exit guard mismatched */
     };
 
     class String
@@ -447,11 +445,18 @@ namespace avmplus
         static GC* gc;
         static String* k_str[];
         static bool sse2_available;
+        static bool cmov_available;
 
         static inline bool
         use_sse2()
         {
             return sse2_available;
+        }
+        
+        static inline bool
+        use_cmov()
+        {
+            return cmov_available;
         }
 
         static inline bool
@@ -748,7 +753,7 @@ namespace avmplus
      * no duplicates are allowed.
      */
     template <class K, class T, ListElementType valType>
-    class SortedMap
+    class SortedMap : public GCObject
     {
     public:
         enum { kInitialCapacity= 64 };
@@ -914,7 +919,7 @@ namespace avmplus
             ~BitSet()
             {
                 if (capacity > kDefaultCapacity)
-                    delete bits.ptr;
+                    free(bits.ptr);
             }
 
             void reset()
