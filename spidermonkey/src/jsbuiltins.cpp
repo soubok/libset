@@ -51,6 +51,7 @@
 #include "jslibmath.h"
 #include "jsmath.h"
 #include "jsnum.h"
+#include "prmjtime.h"
 #include "jsscope.h"
 #include "jsstr.h"
 #include "jstracer.h"
@@ -83,6 +84,15 @@ js_dmod(jsdouble a, jsdouble b)
     else
 #endif
         r = fmod(a, b);
+    return r;
+}
+
+jsint FASTCALL
+js_imod(jsint a, jsint b)
+{
+    if (a < 0 || b <= 0)
+        return -1;
+    int r = a % b;
     return r;
 }
 
@@ -235,6 +245,29 @@ js_Array_p_join(JSContext* cx, JSObject* obj, JSString *str)
     return JSVAL_TO_STRING(v);
 }
 
+jsval FASTCALL
+js_Array_p_push1(JSContext* cx, JSObject* obj, jsval v)
+{
+    if (!(OBJ_IS_DENSE_ARRAY(cx, obj) 
+          ? js_array_push1_dense(cx, obj, v, &v)
+          : js_array_push_slowly(cx, obj, 1, &v, &v))) {
+        return JSVAL_ERROR_COOKIE;
+    }
+    return v;
+}
+
+jsval FASTCALL
+js_Array_p_pop(JSContext* cx, JSObject* obj)
+{
+    jsval v;
+    if (!(OBJ_IS_DENSE_ARRAY(cx, obj) 
+          ? js_array_pop_dense(cx, obj, &v)
+          : js_array_pop_slowly(cx, obj, &v))) {
+        return JSVAL_ERROR_COOKIE;
+    }
+    return v;
+}
+
 JSString* FASTCALL
 js_String_p_substring(JSContext* cx, JSString* str, jsint begin, jsint end)
 {
@@ -298,10 +331,42 @@ js_String_p_concat_1int(JSContext* cx, JSString* str, jsint i)
     return js_ConcatStrings(cx, str, istr);
 }
 
+JSString* FASTCALL
+js_String_p_concat_2str(JSContext* cx, JSString* str, JSString* a, JSString* b)
+{
+    str = js_ConcatStrings(cx, str, a);
+    if (str)
+        return js_ConcatStrings(cx, str, b);
+    return NULL;
+}
+
+JSString* FASTCALL
+js_String_p_concat_3str(JSContext* cx, JSString* str, JSString* a, JSString* b, JSString* c)
+{
+    str = js_ConcatStrings(cx, str, a);
+    if (str) {
+        str = js_ConcatStrings(cx, str, b);
+        if (str)
+            return js_ConcatStrings(cx, str, c);
+    }
+    return NULL;
+}
+
 JSObject* FASTCALL
 js_String_p_match(JSContext* cx, JSString* str, jsbytecode *pc, JSObject* regexp)
 {
     jsval vp[3] = { JSVAL_NULL, STRING_TO_JSVAL(str), OBJECT_TO_JSVAL(regexp) };
+    if (!js_StringMatchHelper(cx, 1, vp, pc))
+        return (JSObject*) JSVAL_TO_BOOLEAN(JSVAL_VOID);
+    JS_ASSERT(JSVAL_IS_NULL(vp[0]) ||
+              (!JSVAL_IS_PRIMITIVE(vp[0]) && OBJ_IS_ARRAY(cx, JSVAL_TO_OBJECT(vp[0]))));
+    return JSVAL_TO_OBJECT(vp[0]);
+}
+
+JSObject* FASTCALL
+js_String_p_match_obj(JSContext* cx, JSObject* str, jsbytecode *pc, JSObject* regexp)
+{
+    jsval vp[3] = { JSVAL_NULL, OBJECT_TO_JSVAL(str), OBJECT_TO_JSVAL(regexp) };
     if (!js_StringMatchHelper(cx, 1, vp, pc))
         return (JSObject*) JSVAL_TO_BOOLEAN(JSVAL_VOID);
     JS_ASSERT(JSVAL_IS_NULL(vp[0]) ||
@@ -427,7 +492,7 @@ js_ParseIntDouble(jsdouble d)
 }
 
 jsval FASTCALL
-js_Any_getelem(JSContext* cx, JSObject* obj, JSString* idstr)
+js_Any_getprop(JSContext* cx, JSObject* obj, JSString* idstr)
 {
     jsval v;
     jsid id;
@@ -440,10 +505,35 @@ js_Any_getelem(JSContext* cx, JSObject* obj, JSString* idstr)
 }
 
 JSBool FASTCALL
-js_Any_setelem(JSContext* cx, JSObject* obj, JSString* idstr, jsval v)
+js_Any_setprop(JSContext* cx, JSObject* obj, JSString* idstr, jsval v)
 {
     jsid id;
     if (!js_ValueToStringId(cx, STRING_TO_JSVAL(idstr), &id))
+        return JS_FALSE;
+    return OBJ_SET_PROPERTY(cx, obj, id, &v);
+}
+
+jsval FASTCALL
+js_Any_getelem(JSContext* cx, JSObject* obj, jsint index)
+{
+    jsval v;
+    jsid id;
+    if (index < 0)
+        return JSVAL_ERROR_COOKIE;
+    if (!js_IndexToId(cx, index, &id))
+        return JSVAL_ERROR_COOKIE;
+    if (!OBJ_GET_PROPERTY(cx, obj, id, &v))
+        return JSVAL_ERROR_COOKIE;
+    return v;
+}
+
+JSBool FASTCALL
+js_Any_setelem(JSContext* cx, JSObject* obj, jsint index, jsval v)
+{
+    jsid id;
+    if (index < 0)
+        return JSVAL_ERROR_COOKIE;
+    if (!js_IndexToId(cx, index, &id))
         return JS_FALSE;
     return OBJ_SET_PROPERTY(cx, obj, id, &v);
 }
@@ -480,8 +570,19 @@ js_CallTree(InterpState* state, Fragment* f)
     lr = u.func(state, NULL);
 #endif
 
-    if (lr->exit->exitType == NESTED_EXIT)
-        lr = state->nestedExit;
+    if (lr->exit->exitType == NESTED_EXIT) {
+        /* This only occurs once a tree call guard mismatches and we unwind the tree call stack.
+           We store the first (innermost) tree call guard in state and we will try to grow
+           the outer tree the failing call was in starting at that guard. */
+        if (!state->lastTreeCallGuard)
+            state->lastTreeCallGuard = lr;
+    } else {
+        /* If the tree exits on a regular (non-nested) guard, keep updating lastTreeExitGuard
+           with that guard. If we mismatch on a tree call guard, this will contain the last
+           non-nested guard we encountered, which is the innermost loop or branch guard. */
+        state->lastTreeExitGuard = lr;
+    }
+
     return lr;
 }
 
@@ -525,11 +626,6 @@ js_FastNewObject(JSContext* cx, JSObject* ctor)
     JSClass* clasp = FUN_INTERPRETED(fun) ? &js_ObjectClass : fun->u.n.clasp;
     JS_ASSERT(clasp != &js_ArrayClass);
 
-    JS_ASSERT(JS_ON_TRACE(cx));
-    JSObject* obj = (JSObject*) js_NewGCThing(cx, GCX_OBJECT, sizeof(JSObject));
-    if (!obj)
-        return NULL;
-
     JS_LOCK_OBJ(cx, ctor);
     JSScope *scope = OBJ_SCOPE(ctor);
     JS_ASSERT(scope->object == ctor);
@@ -540,8 +636,20 @@ js_FastNewObject(JSContext* cx, JSObject* ctor)
     jsval v = LOCKED_OBJ_GET_SLOT(ctor, sprop->slot);
     JS_UNLOCK_SCOPE(cx, scope);
 
-    JS_ASSERT(!JSVAL_IS_PRIMITIVE(v));
-    JSObject* proto = JSVAL_TO_OBJECT(v);
+    JSObject* proto;
+    if (JSVAL_IS_PRIMITIVE(v)) {
+        if (!js_GetClassPrototype(cx, JSVAL_TO_OBJECT(ctor->fslots[JSSLOT_PARENT]), 
+                                  INT_TO_JSID(JSProto_Object), &proto)) {
+            return NULL;
+        }
+    } else {
+        proto = JSVAL_TO_OBJECT(v);
+    }
+
+    JS_ASSERT(JS_ON_TRACE(cx));
+    JSObject* obj = (JSObject*) js_NewGCThing(cx, GCX_OBJECT, sizeof(JSObject));
+    if (!obj)
+        return NULL;
 
     obj->classword = jsuword(clasp);
     obj->fslots[JSSLOT_PROTO] = OBJECT_TO_JSVAL(proto);
@@ -709,7 +817,7 @@ js_Array_1int(JSContext* cx, JSObject* proto, jsint i)
     JS_ASSERT(JS_ON_TRACE(cx));                                               \
     JSObject* obj = js_FastNewArray(cx, proto);                               \
     if (obj) {                                                                \
-        uint32 len = ARRAY_GROWBY;                                            \
+        const uint32 len = ARRAY_GROWBY;                                      \
         jsval* newslots = (jsval*) JS_malloc(cx, sizeof (jsval) * (len + 1)); \
         if (newslots) {                                                       \
             obj->dslots = newslots + 1;                                       \
@@ -753,6 +861,12 @@ JSObject* FASTCALL
 js_Arguments(JSContext* cx)
 {
     return NULL;
+}
+
+jsdouble FASTCALL
+js_Date_now(JSContext*)
+{
+    return PRMJ_Now() / PRMJ_USEC_PER_MSEC;
 }
 
 /* soft float */

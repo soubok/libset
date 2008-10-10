@@ -139,6 +139,8 @@ typedef struct JSTraceMonitor {
     CLS(SlotList)           globalSlots;
     CLS(TypeMap)            globalTypeMap;
     JSFragmentCacheEntry    fcache[JS_FRAGMENT_CACHE_SIZE];
+    jsval                   *recoveryDoublePool;
+    jsval                   *recoveryDoublePoolPtr;
 } JSTraceMonitor;
 
 #ifdef JS_TRACER
@@ -165,9 +167,6 @@ struct JSThread {
      * locks on each JS_malloc.
      */
     uint32              gcMallocBytes;
-
-    /* Thread-local gc free lists array. */
-    JSGCThing           *gcFreeLists[GC_NUM_FREELISTS];
 
     /*
      * Store the GSN cache in struct JSThread, not struct JSContext, both to
@@ -247,6 +246,7 @@ struct JSRuntime {
     JSGCChunkInfo       *gcChunkList;
     JSGCArenaList       gcArenaList[GC_NUM_FREELISTS];
     JSGCDoubleArenaList gcDoubleArenaList;
+    JSGCFreeListSet     *gcFreeListsPool;
     JSDHashTable        gcRootsHash;
     JSDHashTable        *gcLocksHash;
     jsrefcount          gcKeepAtoms;
@@ -490,7 +490,7 @@ struct JSRuntime {
 
     jsuword             nativeEnumCache[NATIVE_ENUM_CACHE_SIZE];
 
-   /*
+    /*
      * Various metering fields are defined at the end of JSRuntime. In this
      * way there is no need to recompile all the code that refers to other
      * fields of JSRuntime after enabling the corresponding metering macro.
@@ -724,6 +724,9 @@ JS_STATIC_ASSERT(sizeof(JSTempValueUnion) == sizeof(void *));
 #define JS_PUSH_TEMP_ROOT_SCRIPT(cx,script_,tvr)                              \
     JS_PUSH_TEMP_ROOT_COMMON(cx, script_, tvr, JSTVU_SCRIPT, script)
 
+
+#define JSRESOLVE_INFER         0xffff  /* infer bits from current bytecode */
+
 struct JSContext {
     /* JSRuntime contextList linkage. */
     JSCList             links;
@@ -876,6 +879,10 @@ struct JSContext {
     /* Stack of thread-stack-allocated temporary GC roots. */
     JSTempValueRooter   *tempValueRooters;
 
+#ifdef JS_THREADSAFE
+    JSGCFreeListSet     *gcLocalFreeLists;
+#endif
+
     /* List of pre-allocated doubles. */
     JSGCDoubleCell      *doubleFreeList;
 
@@ -887,6 +894,9 @@ struct JSContext {
 
     /* Pinned regexp pool used for regular expressions. */
     JSArenaPool         regexpPool;
+
+    /* Stored here to avoid passing it around as a parameter. */
+    uintN               resolveFlags;
 };
 
 #ifdef JS_THREADSAFE
@@ -919,6 +929,21 @@ class JSAutoTempValueRooter
 
     JSContext *mContext;
     JSTempValueRooter mTvr;
+};
+
+class JSAutoResolveFlags
+{
+  public:
+    JSAutoResolveFlags(JSContext *cx, uintN flags)
+        : mContext(cx), mSaved(cx->resolveFlags) {
+        cx->resolveFlags = flags;
+    }
+
+    ~JSAutoResolveFlags() { mContext->resolveFlags = mSaved; }
+
+  private:
+    JSContext *mContext;
+    uintN mSaved;
 };
 #endif
 

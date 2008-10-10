@@ -68,7 +68,7 @@
 #define INT32_ERROR_COOKIE 0xffffabcd
 
 template <typename T>
-class Queue {
+class Queue : public GCObject {
     T* _data;
     unsigned _len;
     unsigned _max;
@@ -203,7 +203,7 @@ public:
 
 extern struct nanojit::CallInfo builtins[];
 
-class TraceRecorder {
+class TraceRecorder : public GCObject {
     JSContext*              cx;
     JSTraceMonitor*         traceMonitor;
     JSObject*               globalObj;
@@ -238,6 +238,7 @@ class TraceRecorder {
     nanojit::Fragment*      whichTreeToTrash;
     Queue<jsbytecode*>      inlinedLoopEdges;
     Queue<jsbytecode*>      cfgMerges;
+    jsval*                  global_dslots;
 
     bool isGlobal(jsval* p) const;
     ptrdiff_t nativeGlobalOffset(jsval* p) const;
@@ -275,7 +276,8 @@ class TraceRecorder {
     void stack(int n, nanojit::LIns* i);
 
     nanojit::LIns* f2i(nanojit::LIns* f);
-
+    nanojit::LIns* makeNumberInt32(nanojit::LIns* f);
+    
     bool ifop();
     bool switchop();
     bool inc(jsval& v, jsint incr, bool pre = true);
@@ -284,9 +286,8 @@ class TraceRecorder {
     bool incElem(jsint incr, bool pre = true);
     bool incName(jsint incr, bool pre = true);
 
-    enum { CMP_NEGATE = 1, CMP_TRY_BRANCH_AFTER_COND = 2, CMP_CASE = 4 };
+    enum { CMP_NEGATE = 1, CMP_TRY_BRANCH_AFTER_COND = 2, CMP_CASE = 4, CMP_STRICT = 8 };
     bool cmp(nanojit::LOpcode op, int flags = 0);
-    bool equal(int flags = 0);
 
     bool unary(nanojit::LOpcode op);
     bool binary(nanojit::LOpcode op);
@@ -313,7 +314,7 @@ class TraceRecorder {
     
     bool name(jsval*& vp);
     bool prop(JSObject* obj, nanojit::LIns* obj_ins, uint32& slot, nanojit::LIns*& v_ins);
-    bool elem(jsval& l, jsval& r, jsval*& vp, nanojit::LIns*& v_ins, nanojit::LIns*& addr_ins);
+    bool elem(jsval& oval, jsval& idx, jsval*& vp, nanojit::LIns*& v_ins, nanojit::LIns*& addr_ins);
 
     bool getProp(JSObject* obj, nanojit::LIns* obj_ins);
     bool getProp(jsval& v);
@@ -325,9 +326,10 @@ class TraceRecorder {
     bool guardDenseArray(JSObject* obj, nanojit::LIns* obj_ins);
     bool guardDenseArrayIndex(JSObject* obj, jsint idx, nanojit::LIns* obj_ins,
                               nanojit::LIns* dslots_ins, nanojit::LIns* idx_ins);
+    bool guardElemOp(JSObject* obj, nanojit::LIns* obj_ins, jsid id, size_t op_offset, jsval* vp);
     void clearFrameSlotsFromCache();
     bool guardShapelessCallee(jsval& callee);
-    bool interpretedFunctionCall(jsval& fval, JSFunction* fun, uintN argc);
+    bool interpretedFunctionCall(jsval& fval, JSFunction* fun, uintN argc, bool constructing);
     bool forInLoop(jsval* vp);
 
     void trackCfgMerges(jsbytecode* pc);
@@ -360,7 +362,8 @@ public:
     bool record_LeaveFrame();
     bool record_SetPropHit(JSPropCacheEntry* entry, JSScopeProperty* sprop);
     bool record_SetPropMiss(JSPropCacheEntry* entry);
-
+    bool record_DefLocalFunSetSlot(uint32 slot, JSObject* obj);
+    
     void deepAbort() { deepAborted = true; }
     bool wasDeepAborted() { return deepAborted; }
 
@@ -400,6 +403,7 @@ public:
     JS_END_MACRO
 
 #define RECORD(x)               RECORD_ARGS(x, ())
+#define TRACE_0(x)              TRACE_ARGS(x, ())
 #define TRACE_1(x,a)            TRACE_ARGS(x, (a))
 #define TRACE_2(x,a,b)          TRACE_ARGS(x, (a, b))
 
@@ -424,12 +428,10 @@ js_FlushJITCache(JSContext* cx);
 extern void
 js_FlushJITOracle(JSContext* cx);
 
-extern void
-js_ShutDownJIT();
-
 #else  /* !JS_TRACER */
 
 #define RECORD(x)               ((void)0)
+#define TRACE_0(x)              ((void)0)
 #define TRACE_1(x,a)            ((void)0)
 #define TRACE_2(x,a,b)          ((void)0)
 
