@@ -2572,6 +2572,7 @@ js_Interpret(JSContext *cx)
 #ifdef JS_TRACER
     /* We had better not be entering the interpreter from JIT-compiled code. */
     TraceRecorder *tr = NULL;
+    uint32 jitCacheGen = JS_TRACE_MONITOR(cx).jitCacheGen;
     if (JS_ON_TRACE(cx)) {
         tr = TRACE_RECORDER(cx);
         SET_TRACE_RECORDER(cx, NULL);
@@ -2738,12 +2739,17 @@ js_Interpret(JSContext *cx)
 
     LOAD_INTERRUPT_HANDLER(cx);
 
-    /* Initialize the pc and pc registers unless we're resuming a generator. */
+#if !JS_HAS_GENERATORS
+    JS_ASSERT(!fp->regs);
+#else
+    /* Initialize the pc and sp registers unless we're resuming a generator. */
     if (JS_LIKELY(!fp->regs)) {
+#endif
         ASSERT_NOT_THROWING(cx);
         regs.pc = script->code;
         regs.sp = StackBase(fp);
         fp->regs = &regs;
+#if JS_HAS_GENERATORS
     } else {
         JSGenerator *gen;
 
@@ -2771,6 +2777,7 @@ js_Interpret(JSContext *cx)
             goto error;
         }
     }
+#endif /* JS_HAS_GENERATORS */
 
     /*
      * It is important that "op" be initialized before calling DO_OP because
@@ -2851,7 +2858,6 @@ js_Interpret(JSContext *cx)
 
           /* No-ops for ease of decompilation. */
           ADD_EMPTY_CASE(JSOP_NOP)
-          ADD_EMPTY_CASE(JSOP_GROUP)
           ADD_EMPTY_CASE(JSOP_CONDSWITCH)
           ADD_EMPTY_CASE(JSOP_TRY)
           ADD_EMPTY_CASE(JSOP_FINALLY)
@@ -4780,9 +4786,7 @@ js_Interpret(JSContext *cx)
                 goto error;
             regs.sp = vp + 1;
             LOAD_INTERRUPT_HANDLER(cx);
-            JS_ASSERT(regs.pc[JSOP_NEW_LENGTH] == JSOP_RESUME);
-            len = JSOP_NEW_LENGTH + JSOP_RESUME_LENGTH;
-          END_VARLEN_CASE
+          END_CASE(JSOP_NEW)
 
           BEGIN_CASE(JSOP_CALL)
           BEGIN_CASE(JSOP_EVAL)
@@ -5049,13 +5053,7 @@ js_Interpret(JSContext *cx)
                 cx->rval2set = JS_FALSE;
             }
 #endif /* JS_HAS_LVALUE_RETURN */
-            JS_ASSERT(regs.pc[JSOP_CALL_LENGTH] == JSOP_RESUME);
-            len = JSOP_CALL_LENGTH + JSOP_RESUME_LENGTH;
-            END_VARLEN_CASE
-
-          BEGIN_CASE(JSOP_RESUME)
-            /* This case is not truly empty. The tracer is invoked transparently. */
-          END_CASE(JSOP_RESUME)
+          END_CASE(JSOP_CALL)
 
 #if JS_HAS_LVALUE_RETURN
           BEGIN_CASE(JSOP_SETCALL)
@@ -5066,10 +5064,8 @@ js_Interpret(JSContext *cx)
             LOAD_INTERRUPT_HANDLER(cx);
             if (!ok)
                 goto error;
-            JS_ASSERT(regs.pc[JSOP_SETCALL_LENGTH] == JSOP_RESUME);
-            len = JSOP_SETCALL_LENGTH + JSOP_RESUME_LENGTH;
             if (!cx->rval2set) {
-                op2 = (JSOp) regs.pc[len];
+                op2 = (JSOp) regs.pc[JSOP_SETCALL_LENGTH];
                 if (op2 != JSOP_DELELEM) {
                     JS_ASSERT(!(js_CodeSpec[op2].format & JOF_DEL));
                     JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
@@ -5083,7 +5079,7 @@ js_Interpret(JSContext *cx)
                  * it doesn't seem worth the code for this obscure case.
                  */
                 *vp = JSVAL_TRUE;
-                regs.pc += len + JSOP_DELELEM_LENGTH;
+                regs.pc += JSOP_SETCALL_LENGTH + JSOP_DELELEM_LENGTH;
                 op = (JSOp) *regs.pc;
                 DO_OP();
             }
@@ -5131,15 +5127,11 @@ js_Interpret(JSContext *cx)
             if (!prop) {
                 /* Kludge to allow (typeof foo == "undefined") tests. */
                 endpc = script->code + script->length;
-                for (pc2 = regs.pc + JSOP_NAME_LENGTH; pc2 < endpc; pc2++) {
-                    op2 = (JSOp)*pc2;
-                    if (op2 == JSOP_TYPEOF) {
-                        PUSH_OPND(JSVAL_VOID);
-                        len = JSOP_NAME_LENGTH;
-                        DO_NEXT_OP(len);
-                    }
-                    if (op2 != JSOP_GROUP)
-                        break;
+                op2 = (JSOp) regs.pc[JSOP_NAME_LENGTH];
+                if (op2 == JSOP_TYPEOF) {
+                    PUSH_OPND(JSVAL_VOID);
+                    len = JSOP_NAME_LENGTH;
+                    DO_NEXT_OP(len);
                 }
                 goto atom_not_defined;
             }
@@ -6831,10 +6823,12 @@ js_Interpret(JSContext *cx)
           L_JSOP_DEFXMLNS:
 # endif
 
+          L_JSOP_UNUSED74:
           L_JSOP_UNUSED76:
           L_JSOP_UNUSED77:
           L_JSOP_UNUSED78:
           L_JSOP_UNUSED79:
+          L_JSOP_UNUSED131:
           L_JSOP_UNUSED201:
           L_JSOP_UNUSED202:
           L_JSOP_UNUSED203:
@@ -7053,6 +7047,7 @@ js_Interpret(JSContext *cx)
     if (TRACE_RECORDER(cx))
         js_AbortRecording(cx, "recording out of js_Interpret");
 #endif
+#if JS_HAS_GENERATORS
     if (JS_UNLIKELY(fp->flags & JSFRAME_YIELDING)) {
         JSGenerator *gen;
 
@@ -7061,7 +7056,9 @@ js_Interpret(JSContext *cx)
         gen->frame.regs = &gen->savedRegs;
         JS_PROPERTY_CACHE(cx).disabled -= js_CountWithBlocks(cx, fp);
         JS_ASSERT(JS_PROPERTY_CACHE(cx).disabled >= 0);
-    } else {
+    } else
+#endif /* JS_HAS_GENERATORS */
+    {
         JS_ASSERT(!fp->blockChain);
         JS_ASSERT(!js_IsActiveWithOrBlock(cx, fp->scopeChain, 0));
         fp->regs = NULL;
@@ -7080,6 +7077,8 @@ js_Interpret(JSContext *cx)
         JS_TRACE_MONITOR(cx).onTrace = JS_TRUE;
         SET_TRACE_RECORDER(cx, tr);
         tr->deepAbort();
+        if (jitCacheGen != JS_TRACE_MONITOR(cx).jitCacheGen)
+            tr->safeCleanup();
     }
 #endif
     return ok;
