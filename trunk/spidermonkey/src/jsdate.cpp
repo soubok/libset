@@ -920,8 +920,8 @@ date_now(JSContext *cx, uintN argc, jsval *vp)
 }
 
 #ifdef JS_TRACER
-jsdouble FASTCALL
-js_Date_now(JSContext*)
+static jsdouble FASTCALL
+date_now_tn(JSContext*)
 {
     return PRMJ_Now() / PRMJ_USEC_PER_MSEC;
 }
@@ -1992,22 +1992,11 @@ date_valueOf(JSContext *cx, uintN argc, jsval *vp)
     return date_toString(cx, argc, vp);
 }
 
-/*
- * creation and destruction
- */
-
-#ifdef JS_TRACER
+JS_DEFINE_CALLINFO_2(extern, OBJECT, js_FastNewDate, CONTEXT, OBJECT, 0, 0)
 
 // Don't really need an argument here, but we don't support arg-less builtins
-JS_DEFINE_CALLINFO_1(DOUBLE, Date_now, CONTEXT, 0, 0)
-
-JS_DEFINE_CALLINFO_2(OBJECT, FastNewDate, CONTEXT, OBJECT, 0, 0)
-
-static JSTraceableNative date_now_trcinfo[] = {
-    { date_now, &ci_Date_now, "C", "", INFALLIBLE }
-};
-
-#endif /* JS_TRACER */
+JS_DEFINE_TRCINFO_1(date_now,
+    (1, (static, DOUBLE, date_now_tn, CONTEXT, 0, 0)))
 
 static JSFunctionSpec date_static_methods[] = {
     JS_FN("UTC",                 date_UTC,                MAXARGS,0),
@@ -2169,10 +2158,12 @@ js_FastNewDate(JSContext* cx, JSObject* proto)
     jsdouble* date = js_NewWeaklyRootedDouble(cx, 0.0);
     if (!date)
         return NULL;
-    *date = js_Date_now(cx);
+    *date = date_now_tn(cx);
     obj->fslots[JSSLOT_UTC_TIME] = DOUBLE_TO_JSVAL(date);
-    obj->fslots[JSSLOT_LOCAL_TIME] = DOUBLE_TO_JSVAL(cx->runtime->jsNaN);;
-
+    obj->fslots[JSSLOT_LOCAL_TIME] = DOUBLE_TO_JSVAL(cx->runtime->jsNaN);
+    for (unsigned i = JSSLOT_LOCAL_TIME + 1; i != JS_INITIAL_NSLOTS; ++i)
+        obj->fslots[i] = JSVAL_VOID;
+    
     JS_ASSERT(!clasp->getObjectOps);
     JS_ASSERT(proto->map->ops == &js_ObjectOps);
     obj->map = js_HoldObjectMap(cx, proto->map);

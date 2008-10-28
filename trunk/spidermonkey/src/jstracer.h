@@ -179,6 +179,7 @@ public:
     unsigned                mismatchCount;
     Queue<nanojit::Fragment*> dependentTrees;
     unsigned                branchCount;
+    Queue<nanojit::SideExit*> sideExits;
 
     TreeInfo(nanojit::Fragment* _fragment) { 
         fragment = _fragment;
@@ -207,7 +208,7 @@ class TraceRecorder : public GCObject {
     char*                   entryTypeMap;
     unsigned                callDepth;
     JSAtom**                atoms;
-    nanojit::GuardRecord*   anchor;
+    nanojit::SideExit*      anchor;
     nanojit::Fragment*      fragment;
     TreeInfo*               treeInfo;
     nanojit::LirBuffer*     lirbuf;
@@ -226,7 +227,6 @@ class TraceRecorder : public GCObject {
     nanojit::LIns*          eor_ins;
     nanojit::LIns*          rval_ins;
     nanojit::LIns*          inner_sp_ins;
-    nanojit::SideExit       exit;
     bool                    deepAborted;
     bool                    applyingArguments;
     bool                    trashTree;
@@ -235,6 +235,7 @@ class TraceRecorder : public GCObject {
     jsval*                  global_dslots;
     JSTraceableNative*      pendingTraceableNative;
     bool                    terminate;
+    bool                    isRootFragment;
 
     bool isGlobal(jsval* p) const;
     ptrdiff_t nativeGlobalOffset(jsval* p) const;
@@ -321,7 +322,8 @@ class TraceRecorder : public GCObject {
     bool guardClass(JSObject* obj, nanojit::LIns* obj_ins, JSClass* clasp);
     bool guardDenseArray(JSObject* obj, nanojit::LIns* obj_ins);
     bool guardDenseArrayIndex(JSObject* obj, jsint idx, nanojit::LIns* obj_ins,
-                              nanojit::LIns* dslots_ins, nanojit::LIns* idx_ins);
+                              nanojit::LIns* dslots_ins, nanojit::LIns* idx_ins, 
+                              nanojit::ExitType exitType);
     bool guardElemOp(JSObject* obj, nanojit::LIns* obj_ins, jsid id, size_t op_offset, jsval* vp);
     void clearFrameSlotsFromCache();
     bool guardShapelessCallee(jsval& callee);
@@ -336,13 +338,13 @@ class TraceRecorder : public GCObject {
 public:
     friend bool js_MonitorRecording(TraceRecorder* tr);
 
-    TraceRecorder(JSContext* cx, nanojit::GuardRecord*, nanojit::Fragment*, TreeInfo*,
+    TraceRecorder(JSContext* cx, nanojit::SideExit*, nanojit::Fragment*, TreeInfo*,
             unsigned ngslots, uint8* globalTypeMap, uint8* stackTypeMap, 
-            nanojit::GuardRecord* expectedInnerExit);
+            nanojit::SideExit* expectedInnerExit);
     ~TraceRecorder();
 
     uint8 determineSlotType(jsval* vp) const;
-    nanojit::SideExit* snapshot(nanojit::ExitType exitType);
+    nanojit::LIns* snapshot(nanojit::ExitType exitType);
     nanojit::Fragment* getFragment() const { return fragment; }
     bool isLoopHeader(JSContext* cx) const;
     void compile(nanojit::Fragmento* fragmento);
@@ -352,8 +354,9 @@ public:
     bool adjustCallerTypes(nanojit::Fragment* f);
     bool selectCallablePeerFragment(nanojit::Fragment** first);
     void prepareTreeCall(nanojit::Fragment* inner);
-    void emitTreeCall(nanojit::Fragment* inner, nanojit::GuardRecord* lr);
+    void emitTreeCall(nanojit::Fragment* inner, nanojit::SideExit* exit);
     unsigned getCallDepth() const;
+    void safeCleanup();
     
     bool record_EnterFrame();
     bool record_LeaveFrame();
