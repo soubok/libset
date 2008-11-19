@@ -62,6 +62,26 @@ namespace nanojit
 			_max_pages(1 << (calcSaneCacheSize(cacheSizeLog2) - NJ_LOG2_PAGE_SIZE)),
 			_pagesGrowth(1)
 	{
+#ifdef _DEBUG
+		{
+			// XXX These belong somewhere else, but I can't find the
+			//     right location right now.
+			NanoStaticAssert((LIR_lt ^ 3) == LIR_ge);
+			NanoStaticAssert((LIR_le ^ 3) == LIR_gt);
+			NanoStaticAssert((LIR_ult ^ 3) == LIR_uge);
+			NanoStaticAssert((LIR_ule ^ 3) == LIR_ugt);
+
+			/* Opcodes must be strictly increasing without holes. */
+			uint32_t count = 0;
+			#define OPDEF(op, number, operands) \
+				NanoAssertMsg(LIR_##op == count++, "misnumbered opcode");
+			#define OPDEF64(op, number, operands) OPDEF(op, number, operands)
+			#include "LIRopcode.tbl"
+			#undef OPDEF
+			#undef OPDEF64
+		}
+#endif
+
 #ifdef MEMORY_INFO
 		_allocList.set_meminfo_name("Fragmento._allocList");
 #endif
@@ -188,23 +208,36 @@ namespace nanojit
 		}
 	}
 	
+	// Clear the fragment. This *does not* remove the fragment from the
+	// map--the caller must take care of this.
+	void Fragmento::clearFragment(Fragment* f)
+	{
+		Fragment *peer = f->peer;
+		while (peer) {
+			Fragment *next = peer->peer;
+			peer->releaseTreeMem(this);
+			delete peer;
+			peer = next;
+		}
+		f->releaseTreeMem(this);
+		delete f;
+	}
+
+	void Fragmento::clearFrag(const void* ip)
+	{
+		if (_frags->containsKey(ip)) {
+			clearFragment(_frags->remove(ip));
+		}
+	}
+
 	void Fragmento::clearFrags()
 	{
 		// reclaim any dangling native pages
 		_assm->pageReset();
 
         while (!_frags->isEmpty()) {
-            Fragment *f = _frags->removeLast();
-            Fragment *peer = f->peer;
-            while (peer) {
-                Fragment *next = peer->peer;
-                peer->releaseTreeMem(this);
-                delete peer;
-                peer = next;
-            }
-            f->releaseTreeMem(this);
-            delete f;
-		}			
+            clearFragment(_frags->removeLast());
+		}
 
 		verbose_only( enterCounts->clear();)
 		verbose_only( mergeCounts->clear();)
@@ -273,7 +306,6 @@ namespace nanojit
 		Fragment *f = newBranch(anchor, ip);
 		f->root = f;
 		f->kind = MergeTrace;
-		f->calldepth = lr->exit->calldepth;
 		verbose_only(
 			int mergeid = 1;
 			for (Fragment *g = anchor->branches; g != 0; g = g->nextbranch)
@@ -288,7 +320,6 @@ namespace nanojit
     {
         Fragment *f = newBranch(exit->from, ip);
 		f->kind = BranchTrace;
-		f->calldepth = exit->calldepth;
 		f->treeBranches = f->root->treeBranches;
 		f->root->treeBranches = f;
         return f;
@@ -511,6 +542,12 @@ namespace nanojit
 		NanoAssert(_pages == 0);
     }
 
+    void Fragment::resetHits()
+    {
+        blacklistLevel >>= 1;
+        _hits = 0;
+    }
+	
     void Fragment::blacklist()
     {
         blacklistLevel++;
@@ -522,6 +559,7 @@ namespace nanojit
 		GC *gc = _core->gc;
         Fragment *f = new (gc) Fragment(ip);
 		f->blacklistLevel = 5;
+        f->recordAttempts = 0;
         return f;
     }
 
@@ -545,6 +583,24 @@ namespace nanojit
 			p->nextbranch = f;
 		}
 		return f;
+	}
+
+	void Fragmento::disconnectLoops()
+	{
+		for (int i = 0; i < _frags->size(); ++i) {
+			Fragment* frag = _frags->at(i);
+			if (frag->lastIns->isop(LIR_loop))
+				_assm->disconnectLoop(frag->lastIns->record());
+		}
+	}
+
+	void Fragmento::reconnectLoops()
+	{
+		for (int i = 0; i < _frags->size(); ++i) {
+			Fragment* frag = _frags->at(i);
+			if (frag->lastIns->isop(LIR_loop))
+				_assm->reconnectLoop(frag->lastIns->record());
+		}
 	}
 
 	void Fragment::releaseLirBuffer()

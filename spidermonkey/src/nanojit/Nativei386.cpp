@@ -110,7 +110,7 @@ namespace nanojit
             STACK_GRANULARITY + // returnaddr
             STACK_GRANULARITY; // ebp
 		
-		if (!_thisfrag->lirbuf->explicitSavedParams)
+		if (!_thisfrag->lirbuf->explicitSavedRegs)
 			stackPushed += NumSavedRegs * STACK_GRANULARITY;
 		
 		uint32_t aligned = alignUp(stackNeeded + stackPushed, NJ_ALIGN_STACK);
@@ -128,23 +128,23 @@ namespace nanojit
 		}
 
 		verbose_only( verbose_outputf("        %p:",_nIns); )
-		verbose_only( verbose_output("        patch entry:"); )
-        NIns *patchEntry = _nIns;
+		verbose_only( verbose_output("        frag entry:"); )
+        NIns *fragEntry = _nIns;
 		MR(FP, SP); // Establish our own FP.
         PUSHr(FP); // Save caller's FP.
 
-		if (!_thisfrag->lirbuf->explicitSavedParams) 
+		if (!_thisfrag->lirbuf->explicitSavedRegs) 
 			for (int i = 0; i < NumSavedRegs; ++i)
 				PUSHr(savedRegs[i]);
 
         // align the entry point
         asm_align_code();
 
-		return patchEntry;
+		return fragEntry;
 	}
 
     void Assembler::asm_align_code() {
-        static char nop[][9] = {
+        static uint8_t nop[][9] = {
                 {0x90},
                 {0x66,0x90},
                 {0x0f,0x1f,0x00},
@@ -173,7 +173,7 @@ namespace nanojit
         Fragment *frag = exit->target;
         GuardRecord *lr = 0;
 		bool destKnown = (frag && frag->fragEntry);
-		if (destKnown && !trees)
+		if (destKnown && !trees && !guard->isop(LIR_loop))
 		{
 			// already exists, emit jump now.  no patching required.
 			JMP(frag->fragEntry);
@@ -188,28 +188,15 @@ namespace nanojit
             underrunProtect(14);
             _nIns -= 8;
             *(intptr_t *)_nIns = intptr_t(_epilogue);
-            lr->jmp = _nIns;
+            lr->jmpToTarget = _nIns;
             JMPm_nochk(0);
 #else
             JMP_long(_epilogue);
-			lr->jmp = _nIns;
+            lr->jmpToTarget = _nIns;
 #endif
 		}
 		// first restore ESP from EBP, undoing SUBi(SP,amt) from genPrologue
         MR(SP,FP);
-
-        #ifdef NJ_VERBOSE
-        if (_frago->core()->config.show_stats) {
-			// load EDX (arg1) with Fragment *fromFrag, target fragment
-			// will make use of this when calling fragenter().
-		#if defined NANOJIT_IA32
-            int fromfrag = int((Fragment*)_thisfrag);
-            LDi(argRegs[1], fromfrag);
-		#elif defined NANOJIT_AMD64
-			LDQi(argRegs[1], intptr_t(_thisfrag));
-		#endif
-        }
-        #endif
 
 		// return value is GuardRecord*
 	#if defined NANOJIT_IA32
@@ -223,7 +210,7 @@ namespace nanojit
     {
         RET();
 
-		if (!_thisfrag->lirbuf->explicitSavedParams) 
+		if (!_thisfrag->lirbuf->explicitSavedRegs) 
 			for (int i = NumSavedRegs - 1; i >= 0; --i)
 				POPr(savedRegs[i]);
 
@@ -416,24 +403,30 @@ namespace nanojit
 		debug_only( a.managed = a.free; )
 	}
 
-	void Assembler::nPatchBranch(NIns* branch, NIns* location)
+	NIns* Assembler::nPatchBranch(NIns* branch, NIns* targ)
 	{
 #if defined NANOJIT_IA32
-		intptr_t offset = intptr_t(location) - intptr_t(branch);
-		if (branch[0] == JMPc)
-			*(uint32_t*)&branch[1] = offset - 5;
-		else
-			*(uint32_t*)&branch[2] = offset - 6;
+        NIns* was = 0;
+		intptr_t offset = intptr_t(targ) - intptr_t(branch);
+		if (branch[0] == JMP32) {
+            was = branch + *(int32_t*)&branch[1] + 5;
+		    *(int32_t*)&branch[1] = offset - 5;
+		} else if (branch[0] == JCC32) {
+            was = branch + *(int32_t*)&branch[2] + 6;
+		    *(int32_t*)&branch[2] = offset - 6;
+		} else
+		    NanoAssertMsg(0, "Unknown branch type in nPatchBranch");
 #else
         if (branch[0] == 0xFF && branch[1] == 0x25) {
             NIns *mem;
-
             mem = &branch[6] + *(int32_t *)&branch[2];
-            *(intptr_t *)mem = intptr_t(location);
+            was = *(intptr_t*)mem;
+            *(intptr_t *)mem = intptr_t(targ);
         } else {
             NanoAssertMsg(0, "Unknown branch type in nPatchBranch");
         }
 #endif
+        return was;
 	}
 
 	RegisterMask Assembler::hint(LIns* i, RegisterMask allow)
@@ -832,7 +825,7 @@ namespace nanojit
 #endif
     }
 
-	NIns* Assembler::asm_branch(bool branchOnFalse, LInsp cond, NIns* targ)
+	NIns* Assembler::asm_branch(bool branchOnFalse, LInsp cond, NIns* targ, bool isfar)
 	{
 		NIns* at = 0;
 		LOpcode condop = cond->opcode();
@@ -847,52 +840,52 @@ namespace nanojit
 		if (branchOnFalse)
 		{
 			if (condop == LIR_eq)
-				JNE(targ);
+				JNE(targ, isfar);
 			else if (condop == LIR_ov)
-				JNO(targ);
+				JNO(targ, isfar);
 			else if (condop == LIR_cs)
-				JNC(targ);
+				JNC(targ, isfar);
 			else if (condop == LIR_lt)
-				JNL(targ);
+				JNL(targ, isfar);
 			else if (condop == LIR_le)
-				JNLE(targ);
+				JNLE(targ, isfar);
 			else if (condop == LIR_gt)
-				JNG(targ);
+				JNG(targ, isfar);
 			else if (condop == LIR_ge)
-				JNGE(targ);
+				JNGE(targ, isfar);
 			else if (condop == LIR_ult)
-				JNB(targ);
+				JNB(targ, isfar);
 			else if (condop == LIR_ule)
-				JNBE(targ);
+				JNBE(targ, isfar);
 			else if (condop == LIR_ugt)
-				JNA(targ);
+				JNA(targ, isfar);
 			else //if (condop == LIR_uge)
-				JNAE(targ);
+				JNAE(targ, isfar);
 		}
 		else // op == LIR_xt
 		{
 			if (condop == LIR_eq)
-				JE(targ);
+				JE(targ, isfar);
 			else if (condop == LIR_ov)
-				JO(targ);
+				JO(targ, isfar);
 			else if (condop == LIR_cs)
-				JC(targ);
+				JC(targ, isfar);
 			else if (condop == LIR_lt)
-				JL(targ);
+				JL(targ, isfar);
 			else if (condop == LIR_le)
-				JLE(targ);
+				JLE(targ, isfar);
 			else if (condop == LIR_gt)
-				JG(targ);
+				JG(targ, isfar);
 			else if (condop == LIR_ge)
-				JGE(targ);
+				JGE(targ, isfar);
 			else if (condop == LIR_ult)
-				JB(targ);
+				JB(targ, isfar);
 			else if (condop == LIR_ule)
-				JBE(targ);
+				JBE(targ, isfar);
 			else if (condop == LIR_ugt)
-				JA(targ);
+				JA(targ, isfar);
 			else //if (condop == LIR_uge)
-				JAE(targ);
+				JAE(targ, isfar);
 		}
 		at = _nIns;
 		asm_cmp(cond);
@@ -955,31 +948,23 @@ namespace nanojit
 
 	void Assembler::asm_loop(LInsp ins, NInsList& loopJumps)
 	{
+		GuardRecord* guard = ins->record();
+		SideExit* exit = guard->exit;
+
+		// Emit an exit stub that the loop may be patched to jump to (for example if we
+		// want to terminate the loop because a timeout fires).
+		asm_exit(ins);
+
+		// Emit the patchable jump itself.
 		JMP_long(0);
 
         loopJumps.add(_nIns);
+		guard->jmpToStub = _nIns;
 
 		// If the target we are looping to is in a different fragment, we have to restore
-		// SP since we will target fragEntry and not SOT.
-		Fragment* target = ins->record()->exit->target;
-		if (target != _thisfrag)
+		// SP since we will target fragEntry and not loopEntry.
+		if (exit->target != _thisfrag)
 	        MR(SP,FP);
-		
-		#ifdef NJ_VERBOSE
-		// branching from this frag to ourself.
-		if (_frago->core()->config.show_stats)
-		#if defined NANOJIT_AMD64
-			LDQi(argRegs[1], intptr_t((Fragment*)_thisfrag));
-		#else
-			LDi(argRegs[1], int((Fragment*)_thisfrag));
-		#endif
-		#endif
-
-		assignSavedParams();
-
-		// restore first parameter, the only one we use
-		LInsp state = _thisfrag->lirbuf->state;
-		findSpecificRegFor(state, argRegs[state->imm8()]); 
 	}	
 
 	void Assembler::asm_fcond(LInsp ins)
@@ -1039,18 +1024,8 @@ namespace nanojit
 		RegisterMask allow = GpRegs;
 		bool forceReg = (op == LIR_mul || !rhs->isconst());
 
-#ifdef NANOJIT_ARM
-		// Arm can't do an immediate op with immediates
-		// outside of +/-255 (for AND) r outside of
-		// 0..255 for others.
-		if (!forceReg)
-		{
-			if (rhs->isconst() && !isU8(rhs->constval()))
-				forceReg = true;
-		}
-#endif
-
-		if (lhs != rhs && forceReg)
+        /* Even if lhs == rhs && forceReg, shift instructions require ECX on the rhs. */
+		if ((lhs != rhs || (op == LIR_lsh || op == LIR_rsh || op == LIR_ush)) && forceReg)
 		{
 			if ((rb = asm_binop_rhs_reg(ins)) == UnknownReg) {
 				rb = findRegFor(rhs, allow);
@@ -1171,10 +1146,76 @@ namespace nanojit
 		LIns* disp = ins->oprnd2();
 		Register rr = prepResultReg(ins, GpRegs);
 		int d = disp->constval();
+
+#ifdef NANOJIT_IA32
+		/* Can't use this on AMD64, no 64-bit immediate addresses. */
+		if (base->isconst()) {
+			intptr_t addr = base->constval();
+			addr += d;
+			if (op == LIR_ldcb)
+				LD8Zdm(rr, addr);
+			else if (op == LIR_ldcs)
+				LD16Zdm(rr, addr);
+			else
+				LDdm(rr, addr);
+			return;
+		}
+
+		/* :TODO: Use this on AMD64 as well. */
+		/* Search for add(X,Y) */
+		if (base->opcode() == LIR_piadd) {
+			int scale = 0;
+			LIns *lhs = base->oprnd1();
+			LIns *rhs = base->oprnd2();
+
+			/* See if we can bypass any SHLs, by searching for 
+			 * add(X, shl(Y,Z)) -> mov r, [X+Y*Z]
+			 */
+			if (rhs->opcode() == LIR_pilsh && rhs->oprnd2()->isconst()) {
+				scale = rhs->oprnd2()->constval();
+				if (scale >= 1 && scale <= 3)
+					rhs = rhs->oprnd1();
+				else
+					scale = 0;
+			}
+
+			Register rleft;
+			Reservation *rL = getresv(lhs);
+
+			/* Does LHS have a register yet? If not, re-use the result reg.
+			 * :TODO: If LHS is const, we could eliminate a register use.  
+			 */
+			if (rL == NULL || rL->reg == UnknownReg)
+				rleft = findSpecificRegFor(lhs, rr);
+			else
+				rleft = rL->reg;
+
+			Register rright = UnknownReg;
+			Reservation *rR = getresv(rhs);
+
+			/* Does RHS have a register yet? If not, try to re-use the result reg. */
+			if (rr != rleft && (rR == NULL || rR->reg == UnknownReg))
+				rright = findSpecificRegFor(rhs, rr);
+			if (rright == UnknownReg)
+				rright = findRegFor(rhs, GpRegs & ~(rmask(rleft)));
+
+			if (op == LIR_ldcb)
+				LD8Zsib(rr, d, rleft, rright, scale);
+			else if (op == LIR_ldcs)
+				LD16Zsib(rr, d, rleft, rright, scale);
+			else
+				LDsib(rr, d, rleft, rright, scale);
+
+			return;
+		}
+#endif
+
 		Register ra = getBaseReg(base, d, GpRegs);
 		if (op == LIR_ldcb)
 			LD8Z(rr, d, ra);
-		else
+		else if (op == LIR_ldcs)
+		    LD16Z(rr, d, ra);
+		else 
 			LD(rr, d, ra); 
 	}
 
@@ -1813,10 +1854,10 @@ namespace nanojit
             }
 
             if (c == LIR_fgt) {
-                if (branchOnFalse) { JNA(targ); } else { JA(targ); }
+                if (branchOnFalse) { JNA(targ, false); } else { JA(targ, false); }
             }
             else { // if (c == LIR_fge)
-                if (branchOnFalse) { JNAE(targ); } else { JAE(targ); }
+                if (branchOnFalse) { JNAE(targ, false); } else { JAE(targ, false); }
             }
             NIns *at = _nIns;
             Reservation *rA, *rB;
@@ -1826,9 +1867,9 @@ namespace nanojit
         }
 
     	if (branchOnFalse)
-			JP(targ);
+			JP(targ, false);
 		else
-			JNP(targ);
+			JNP(targ, false);
 		NIns *at = _nIns;
 		asm_fcmp(cond);
         return at;
@@ -1955,24 +1996,6 @@ namespace nanojit
 		    }
         }
 #endif
-	}
-	
-	NIns* Assembler::asm_adjustBranch(NIns* at, NIns* target)
-	{
-        NIns* was;
-#if defined NANOJIT_AMD64
-		was = (NIns*)( *(intptr_t*)(at) );
-        *(intptr_t *)(at) = intptr_t(target);
-#else
-		NIns* save = _nIns;
-		was = (NIns*)( (intptr_t)*(int32_t*)(at+1)+(intptr_t)(at+5) );
-		_nIns = at +5; // +5 is size of JMP
-		intptr_t tt = (intptr_t)target - (intptr_t)_nIns;
-		IMM32(tt);
-		*(--_nIns) = JMPc;
-        _nIns = save;
-#endif
-		return was;
 	}
 	
 	void Assembler::nativePageReset()

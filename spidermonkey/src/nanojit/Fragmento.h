@@ -62,7 +62,7 @@ namespace nanojit
             NIns code[(NJ_PAGE_SIZE-sizeof(PageHeader))/sizeof(NIns)];
         };
     };
-    struct AllocEntry : public GCObject
+    struct AllocEntry : public avmplus::GCObject
     {
         Page *page;
         uint32_t allocSize;
@@ -73,7 +73,7 @@ namespace nanojit
 	class BlockHist: public BlockSortedMap
 	{
 	public:
-		BlockHist(GC*gc) : BlockSortedMap(gc)
+		BlockHist(avmplus::GC*gc) : BlockSortedMap(gc)
 		{
 		}
 		uint32_t count(const void *p) {
@@ -88,7 +88,7 @@ namespace nanojit
 	 *
 	 * This is the main control center for creating and managing fragments.
 	 */
-	class Fragmento : public GCFinalizedObject
+	class Fragmento : public avmplus::GCFinalizedObject
 	{
 		public:
 			Fragmento(AvmCore* core, uint32_t cacheSizeLog2);
@@ -102,11 +102,18 @@ namespace nanojit
 			
             Fragment*   getLoop(const void* ip);
             Fragment*   getAnchor(const void* ip);
+		    // Remove one fragment. The caller is responsible for making sure
+			// that this does not destroy any resources shared with other
+			// fragments (such as a LirBuffer or this fragment itself as a
+			// jump target).
+    		void        clearFrag(const void* ip);
 			void        clearFrags();	// clear all fragments from the cache
             Fragment*   getMerge(GuardRecord *lr, const void* ip);
             Fragment*   createBranch(SideExit *exit, const void* ip);
             Fragment*   newFrag(const void* ip);
             Fragment*   newBranch(Fragment *from, const void* ip);
+            void        disconnectLoops();
+            void        reconnectLoops();
 
             verbose_only ( uint32_t pageCount(); )
 			verbose_only ( void dumpStats(); )
@@ -137,6 +144,7 @@ namespace nanojit
 			uint32_t cacheUsed() const { return (_stats.pages-_stats.freePages)<<NJ_LOG2_PAGE_SIZE; }
 			uint32_t cacheUsedMax() const { return (_stats.maxPageUse)<<NJ_LOG2_PAGE_SIZE; }
 		private:
+		    void        clearFragment(Fragment *f);
 			void		pagesGrow(int32_t count);
 			void		trackFree(int32_t delta);
 
@@ -147,7 +155,7 @@ namespace nanojit
 
 			/* unmanaged mem */
 			AllocList	_allocList;
-			GCHeap*		_gcHeap;
+			avmplus::GCHeap* _gcHeap;
 
 			const uint32_t _max_pages;
 			uint32_t _pagesGrowth;
@@ -166,7 +174,7 @@ namespace nanojit
 	 * It may turn out that that this arrangement causes too much traffic
 	 * between d and i-caches and that we need to carve up the structure differently.
 	 */
-	class Fragment : public GCFinalizedObject
+	class Fragment : public avmplus::GCFinalizedObject
 	{
 		public:
 			Fragment(const void*);
@@ -176,6 +184,7 @@ namespace nanojit
 			void			setCode(NIns* codee, Page* pages) { _code = codee; _pages = pages; }
 			GuardRecord*	links()							{ return _links; }
 			int32_t&		hits()							{ return _hits; }
+            void            resetHits();
             void            blacklist();
 			bool			isBlacklisted()		{ return _hits < 0; }
 			debug_only( bool hasOnlyTreeLinks(); )
@@ -215,9 +224,10 @@ namespace nanojit
 			const void* ip;
 			uint32_t guardCount;
             uint32_t xjumpCount;
+            uint32_t recordAttempts;
             int32_t blacklistLevel;
             NIns* fragEntry;
-			int32_t calldepth;
+            NIns* loopEntry;
 			void* vmprivate;
 			
 		private:

@@ -543,6 +543,18 @@ js_CompileScript(JSContext *cx, JSObject *scopeChain, JSStackFrame *callerFrame,
     cg.treeContext.u.scopeChain = scopeChain;
     cg.staticDepth = TCF_GET_STATIC_DEPTH(tcflags);
 
+    if ((tcflags & TCF_COMPILE_N_GO) && callerFrame && callerFrame->fun) {
+        /*
+         * An eval script in a caller frame needs to have its enclosing function
+         * captured in case it uses an upvar reference, and someone wishes to
+         * decompile it while running.
+         */
+        JSParsedObjectBox *pob = js_NewParsedObjectBox(cx, &pc, callerFrame->callee);
+        pob->emitLink = cg.objectList.lastPob;
+        cg.objectList.lastPob = pob;
+        cg.objectList.length++;
+    }
+
     /* Inline Statements() to emit as we go to save space. */
     for (;;) {
         pc.tokenStream.flags |= TSF_OPERAND;
@@ -1669,7 +1681,7 @@ MakeSetCall(JSContext *cx, JSParseNode *pn, JSTreeContext *tc, uintN msg)
     JSParseNode *pn2;
 
     JS_ASSERT(pn->pn_arity == PN_LIST);
-    JS_ASSERT(pn->pn_op == JSOP_CALL || pn->pn_op == JSOP_EVAL);
+    JS_ASSERT(pn->pn_op == JSOP_CALL || pn->pn_op == JSOP_EVAL || pn->pn_op == JSOP_APPLY);
     pn2 = pn->pn_head;
     if (pn2->pn_type == TOK_FUNCTION && (pn2->pn_flags & TCF_GENEXP_LAMBDA)) {
         js_ReportCompileErrorNumber(cx, TS(tc->parseContext), pn,
@@ -3979,7 +3991,7 @@ SetLvalKid(JSContext *cx, JSTokenStream *ts, JSParseNode *pn, JSParseNode *kid,
         kid->pn_type != TOK_DOT &&
 #if JS_HAS_LVALUE_RETURN
         (kid->pn_type != TOK_LP ||
-         (kid->pn_op != JSOP_CALL && kid->pn_op != JSOP_EVAL)) &&
+         (kid->pn_op != JSOP_CALL && kid->pn_op != JSOP_EVAL && kid->pn_op != JSOP_APPLY)) &&
 #endif
 #if JS_HAS_XML_SUPPORT
         (kid->pn_type != TOK_UNARYOP || kid->pn_op != JSOP_XMLNAME) &&
@@ -4615,13 +4627,18 @@ MemberExpr(JSContext *cx, JSTokenStream *ts, JSTreeContext *tc,
             if (!pn2)
                 return NULL;
 
-            /* Pick JSOP_EVAL and flag tc as heavyweight if eval(...). */
             pn2->pn_op = JSOP_CALL;
             if (pn->pn_op == JSOP_NAME &&
                 pn->pn_atom == cx->runtime->atomState.evalAtom) {
+                /* Pick JSOP_EVAL and flag tc as heavyweight if eval(...). */
                 pn2->pn_op = JSOP_EVAL;
                 tc->flags |= TCF_FUN_HEAVYWEIGHT;
-            }
+            } else if (pn->pn_op == JSOP_GETPROP &&
+                       (pn->pn_atom == cx->runtime->atomState.applyAtom ||
+                        pn->pn_atom == cx->runtime->atomState.callAtom)) {
+                /* Pick JSOP_APPLY if apply(...). */
+                pn2->pn_op = JSOP_APPLY;
+            } 
 
             PN_INIT_LIST_1(pn2, pn);
             pn2->pn_pos.begin = pn->pn_pos.begin;
@@ -6339,12 +6356,17 @@ js_FoldConstants(JSContext *cx, JSParseNode *pn, JSTreeContext *tc, bool inCond)
       }
 
       case PN_LIST:
+      {
+        /* Propagate inCond through logical connectives. */
+        bool cond = inCond && (pn->pn_type == TOK_OR || pn->pn_type == TOK_AND);
+
         /* Save the list head in pn1 for later use. */
         for (pn1 = pn2 = pn->pn_head; pn2; pn2 = pn2->pn_next) {
-            if (!js_FoldConstants(cx, pn2, tc))
+            if (!js_FoldConstants(cx, pn2, tc, cond))
                 return JS_FALSE;
         }
         break;
+      }
 
       case PN_TERNARY:
         /* Any kid may be null (e.g. for (;;)). */
