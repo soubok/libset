@@ -164,7 +164,7 @@ else
 endif
 CLASSPATH    = $(JDK)/lib/classes.zip$(SEP)$(CLASSDIR)/$(OBJDIR)
 
-include $(DEPTH)/config/$(OS_CONFIG).mk
+include $(DEPTH)/ref-config/$(OS_CONFIG).mk
 
 ifndef OBJ_SUFFIX
 ifdef USE_MSVC

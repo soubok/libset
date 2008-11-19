@@ -550,6 +550,13 @@ JS_ValueToString(JSContext *cx, jsval v)
     return js_ValueToString(cx, v);
 }
 
+JS_PUBLIC_API(JSString *)
+JS_ValueToSource(JSContext *cx, jsval v)
+{
+    CHECK_REQUEST(cx);
+    return js_ValueToSource(cx, v);
+}
+
 JS_PUBLIC_API(JSBool)
 JS_ValueToNumber(JSContext *cx, jsval v, jsdouble *dp)
 {
@@ -663,7 +670,7 @@ JS_TypeOfValue(JSContext *cx, jsval v)
 
                     if (!OBJ_GET_PROPERTY(cx, obj,
                                           ATOM_TO_JSID(cx->runtime->atomState
-                                                       .callAtom),
+                                                       .__call__Atom),
                                           &v)) {
                         JS_ClearPendingException(cx);
                     } else if (VALUE_IS_FUNCTION(cx, v)) {

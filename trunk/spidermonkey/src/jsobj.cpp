@@ -1171,8 +1171,7 @@ js_ComputeFilename(JSContext *cx, JSStackFrame *caller,
         JS_ASSERT(caller->regs->pc[JSOP_EVAL_LENGTH] == JSOP_LINENO);
         *linenop = GET_UINT16(caller->regs->pc + JSOP_EVAL_LENGTH);
     } else {
-        *linenop = js_PCToLineNumber(cx, caller->script,
-                                     caller->regs ? caller->regs->pc : NULL);
+        *linenop = js_FramePCToLineNumber(cx, caller);
     }
     return caller->script->filename;
 }
@@ -3414,7 +3413,7 @@ js_LookupPropertyWithFlags(JSContext *cx, JSObject *obj, jsid id, uintN flags,
                         format = cs->format;
                         if (JOF_MODE(format) != JOF_NAME)
                             flags |= JSRESOLVE_QUALIFIED;
-                        if ((format & JOF_ASSIGNING) ||
+                        if ((format & (JOF_SET | JOF_FOR)) ||
                             (cx->fp->flags & JSFRAME_ASSIGNING)) {
                             flags |= JSRESOLVE_ASSIGNING;
                         } else {
@@ -4621,7 +4620,7 @@ js_Call(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 
         callee = JSVAL_TO_OBJECT(argv[-2]);
         if (!OBJ_GET_PROPERTY(cx, callee,
-                              ATOM_TO_JSID(cx->runtime->atomState.callAtom),
+                              ATOM_TO_JSID(cx->runtime->atomState.__call__Atom),
                               &fval)) {
             return JS_FALSE;
         }
@@ -4664,7 +4663,7 @@ js_Construct(JSContext *cx, JSObject *obj, uintN argc, jsval *argv,
         callee = JSVAL_TO_OBJECT(argv[-2]);
         if (!OBJ_GET_PROPERTY(cx, callee,
                               ATOM_TO_JSID(cx->runtime->atomState
-                                           .constructAtom),
+                                           .__construct__Atom),
                               &cval)) {
             return JS_FALSE;
         }
@@ -4704,7 +4703,7 @@ js_HasInstance(JSContext *cx, JSObject *obj, jsval v, JSBool *bp)
 
         if (!OBJ_GET_PROPERTY(cx, obj,
                               ATOM_TO_JSID(cx->runtime->atomState
-                                           .hasInstanceAtom),
+                                           .__hasInstance__Atom),
                               &fval)) {
             return JS_FALSE;
         }

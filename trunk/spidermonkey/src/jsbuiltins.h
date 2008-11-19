@@ -43,6 +43,7 @@
 #ifdef JS_TRACER
 
 #include "nanojit/nanojit.h"
+#include "jstracer.h"
 
 enum JSTNErrType { INFALLIBLE, FAIL_NULL, FAIL_NEG, FAIL_VOID, FAIL_JSVAL };
 enum { JSTN_ERRTYPE_MASK = 7, JSTN_MORE = 8 };
@@ -160,8 +161,8 @@ struct JSTraceableNative {
 #define _JS_CTYPE_OBJECT_FAIL_VOID _JS_CTYPE(JSObject *,             _JS_PTR, --, --, FAIL_VOID)
 #define _JS_CTYPE_REGEXP           _JS_CTYPE(JSObject *,             _JS_PTR, "","r", INFALLIBLE)
 #define _JS_CTYPE_SCOPEPROP        _JS_CTYPE(JSScopeProperty *,      _JS_PTR, --, --, INFALLIBLE)
-#define _JS_CTYPE_SIDEEXIT         _JS_CTYPE(nanojit::SideExit *,    _JS_PTR, --, --, INFALLIBLE)
-#define _JS_CTYPE_INTERPSTATE      _JS_CTYPE(avmplus::InterpState *, _JS_PTR, --, --, INFALLIBLE)
+#define _JS_CTYPE_SIDEEXIT         _JS_CTYPE(SideExit *,             _JS_PTR, --, --, INFALLIBLE)
+#define _JS_CTYPE_INTERPSTATE      _JS_CTYPE(InterpState *,          _JS_PTR, --, --, INFALLIBLE)
 #define _JS_CTYPE_FRAGMENT         _JS_CTYPE(nanojit::Fragment *,    _JS_PTR, --, --, INFALLIBLE)
 
 #define _JS_EXPAND(tokens)  tokens
@@ -190,10 +191,17 @@ struct JSTraceableNative {
 
 #define _JS_CALLINFO(name) name##_ci
 
+#if defined(JS_NO_FASTCALL) && defined(NANOJIT_IA32)
+#define _JS_DEFINE_CALLINFO(linkage, name, crtype, cargtypes, argtypes, cse, fold)                \
+    _JS_TN_LINKAGE(linkage, crtype) name cargtypes;                                               \
+    _JS_CI_LINKAGE(linkage) const nanojit::CallInfo _JS_CALLINFO(name) =                          \
+        { (intptr_t) &name, argtypes, cse, fold, nanojit::ABI_CDECL _JS_CI_NAME(name) };
+#else
 #define _JS_DEFINE_CALLINFO(linkage, name, crtype, cargtypes, argtypes, cse, fold)                \
     _JS_TN_LINKAGE(linkage, crtype) FASTCALL name cargtypes;                                      \
     _JS_CI_LINKAGE(linkage) const nanojit::CallInfo _JS_CALLINFO(name) =                          \
         { (intptr_t) &name, argtypes, cse, fold, nanojit::ABI_FASTCALL _JS_CI_NAME(name) };
+#endif
 
 /*
  * Declare a C function named <op> and a CallInfo struct named <op>_callinfo so the
@@ -306,6 +314,12 @@ struct JSTraceableNative {
     };
 
 #define _JS_DEFINE_CALLINFO_n(n, args)  JS_DEFINE_CALLINFO_##n args
+
+jsdouble FASTCALL
+js_StringToNumber(JSContext* cx, JSString* str);
+
+jsdouble FASTCALL
+js_BooleanOrUndefinedToNumber(JSContext* cx, int32 unboxed);
 
 #else
 
