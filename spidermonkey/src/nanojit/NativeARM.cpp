@@ -66,6 +66,13 @@ const Register Assembler::argRegs[] = { R0, R1, R2, R3 };
 const Register Assembler::retRegs[] = { R0, R1 };
 const Register Assembler::savedRegs[] = { R4, R5, R6, R7, R8, R9, R10 };
 
+const char *ccName(ConditionCode cc)
+{
+    const char *ccNames[] = { "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",
+                              "hi", "ls", "ge", "lt", "gt", "le", "al", "nv" };
+    return ccNames[(int)cc];
+}
+
 void
 Assembler::nInit(AvmCore*)
 {
@@ -128,7 +135,7 @@ Assembler::nFragExit(LInsp guard)
         JMP_far(_epilogue);
 
         // stick the jmp pointer to the start of the sequence
-        lr->jmpToTarget = _nIns;
+        lr->jmp = _nIns;
     }
 
     // pop the stack frame first
@@ -270,18 +277,30 @@ Assembler::asm_call(LInsp ins)
 }
 
 void
-Assembler::nMarkExecute(Page* page, int32_t count, bool enable)
+Assembler::nMarkExecute(Page* page, int flags)
 {
+	NanoAssert(sizeof(Page) == NJ_PAGE_SIZE);
 #ifdef UNDER_CE
+	static const DWORD kProtFlags[4] = 
+	{
+		PAGE_READONLY,			// 0
+		PAGE_READWRITE,			// PAGE_WRITE
+		PAGE_EXECUTE_READ,		// PAGE_EXEC
+		PAGE_EXECUTE_READWRITE	// PAGE_EXEC|PAGE_WRITE
+	};
+	DWORD prot = kProtFlags[flags & (PAGE_WRITE|PAGE_EXEC)];
     DWORD dwOld;
-    VirtualProtect(page, NJ_PAGE_SIZE, PAGE_EXECUTE_READWRITE, &dwOld);
+    BOOL res = VirtualProtect(page, NJ_PAGE_SIZE, prot, &dwOld);
+	if (!res)
+	{
+		// todo: we can't abort or assert here, we have to fail gracefully.
+		NanoAssertMsg(false, "FATAL ERROR: VirtualProtect() failed\n");
+	}
 #endif
 #ifdef AVMPLUS_PORTING_API
-    NanoJIT_PortAPI_MarkExecutable(page, (void*)((int32_t)page+count));
+    NanoJIT_PortAPI_MarkExecutable(page, (void*)((char*)page+NJ_PAGE_SIZE), flags);
+    // todo, must add error-handling to the portapi
 #endif
-    (void)page;
-    (void)count;
-    (void)enable;
 }
 
 Register
@@ -503,7 +522,7 @@ Assembler::asm_load64(LInsp ins)
 void
 Assembler::asm_store64(LInsp value, int dr, LInsp base)
 {
-    //asm_output1("<<< store64 (dr: %d)", dr);
+    //asm_output("<<< store64 (dr: %d)", dr);
 
 #ifdef NJ_ARM_VFP
     //Reservation *valResv = getresv(value);
@@ -739,6 +758,7 @@ Assembler::nativePageSetup()
 void
 Assembler::underrunProtect(int bytes)
 {
+	NanoAssertMsg(bytes<=LARGEST_UNDERRUN_PROT, "constant LARGEST_UNDERRUN_PROT is too small"); 
     intptr_t u = bytes + sizeof(PageHeader)/sizeof(NIns) + 8;
     if ( (samepage(_nIns,_nSlot) && (((intptr_t)_nIns-u) <= intptr_t(_nSlot+1))) ||
          (!samepage((intptr_t)_nIns-u,_nIns)) )
@@ -784,7 +804,7 @@ Assembler::JMP_far(NIns* addr)
         BKPT_nochk();
         *(--_nIns) = (NIns)( COND_AL | (0xA<<24) | ((offs>>2) & 0xFFFFFF) );
 
-        asm_output1("b %p", addr);
+        asm_output("b %p", addr);
     } else {
         // the address
         *(--_nIns) = (NIns)((addr));
@@ -792,7 +812,7 @@ Assembler::JMP_far(NIns* addr)
         // the next instruction)
         *(--_nIns) = (NIns)( COND_AL | (0x51<<20) | (PC<<16) | (PC<<12) | (4));
 
-        asm_output1("b %p (32-bit)", addr);
+        asm_output("b %p (32-bit)", addr);
     }
 }
 
@@ -811,7 +831,7 @@ Assembler::BL(NIns* addr)
         offs = PC_OFFSET_FROM(addr,_nIns-1);
         *(--_nIns) = (NIns)( COND_AL | (0xB<<24) | ((offs>>2) & 0xFFFFFF) );
 
-        asm_output1("bl %p", addr);
+        asm_output("bl %p", addr);
     } else {
         underrunProtect(12);
 
@@ -822,7 +842,7 @@ Assembler::BL(NIns* addr)
         // add lr, pc, #4    // set lr to be past the address that we wrote
         *(--_nIns) = (NIns)( COND_AL | OP_IMM | (1<<23) | (PC<<16) | (LR<<12) | (4) );
 
-        asm_output1("bl %p (32-bit)", addr);
+        asm_output("bl %p (32-bit)", addr);
     }
 }
 
@@ -845,7 +865,7 @@ Assembler::LD32_nochk(Register r, int32_t imm)
 
     NanoAssert(isS12(offset) && (offset < 0));
 
-    asm_output2("  (%d(PC) = 0x%x)", offset, imm);
+    asm_output("  (%d(PC) = 0x%x)", offset, imm);
 
     LDR_nochk(r,PC,offset);
 }
@@ -893,7 +913,7 @@ Assembler::B_cond_chk(ConditionCode _c, NIns* _t, bool _chk)
         *(--_nIns) = (NIns)( ((_c)<<28) | (0x51<<20) | (PC<<16) | (PC<<12) | 0x0 );
     }
 
-    asm_output2("%s %p", _c == AL ? "jmp" : "b(cnd)", (void*)(_t));
+    asm_output("%s %p", _c == AL ? "jmp" : "b(cnd)", (void*)(_t));
 }
 
 void
@@ -925,7 +945,7 @@ Assembler::asm_add_imm(Register rd, Register rn, int32_t imm)
             *(--_nIns) = (NIns)( COND_AL | OP_IMM | OP_STAT | (1<<23) | (rn<<16) | (rd<<12) | (rot << 8) | immval );
         else
             *(--_nIns) = (NIns)( COND_AL | OP_IMM | OP_STAT | (1<<22) | (rn<<16) | (rd<<12) | (rot << 8) | immval );
-        asm_output3("add %s,%s,%d",gpn(rd),gpn(rn),imm);
+        asm_output("add %s,%s,%d",gpn(rd),gpn(rn),imm);
     } else {
         // add scratch to rn, after loading the value into scratch.
 
@@ -933,7 +953,7 @@ Assembler::asm_add_imm(Register rd, Register rn, int32_t imm)
         NanoAssert(rn != Scratch);
 
         *(--_nIns) = (NIns)( COND_AL | OP_STAT | (1<<23) | (rn<<16) | (rd<<12) | (Scratch));
-        asm_output3("add %s,%s,%s",gpn(rd),gpn(rn),gpn(Scratch));
+        asm_output("add %s,%s,%s",gpn(rd),gpn(rn),gpn(Scratch));
 
         LD32_nochk(Scratch, imm);
     }
@@ -1026,63 +1046,6 @@ Assembler::asm_fcmp(LInsp ins)
     Register ra = findRegFor(lhs, FpRegs);
     Register rb = findRegFor(rhs, FpRegs);
 
-    // We can't uniquely identify fge/fle via a single bit
-    // pattern (since equality and lt/gt are separate bits);
-    // so convert to the single-bit variant.
-    if (op == LIR_fge) {
-        Register temp = ra;
-        ra = rb;
-        rb = temp;
-        op = LIR_flt;
-    } else if (op == LIR_fle) {
-        Register temp = ra;
-        ra = rb;
-        rb = temp;
-        op = LIR_fgt;
-    }
-
-    // There is no way to test for an unordered result using
-    // the conditional form of an instruction; the encoding (C=1 V=1)
-    // ends up having overlaps with a few other tests.  So, test for
-    // the explicit mask.
-    uint8_t mask = 0x0;
-
-    // NZCV
-    // for a valid ordered result, V is always 0 from VFP
-    if (op == LIR_feq)
-        // ZC // cond EQ (both equal and "not less than"
-        mask = 0x6;
-    else if (op == LIR_flt)
-        // N  // cond MI
-        mask = 0x8;
-    else if (op == LIR_fgt)
-        // C  // cond CS
-        mask = 0x2;
-    else
-        NanoAssert(0);
-/*
-    // these were converted into gt and lt above.
-    if (op == LIR_fle)
-        // NZ // cond LE
-        mask = 0xC;
-    else if (op == LIR_fge)
-        // ZC // cond fail?
-        mask = 0x6;
-*/
-
-    // TODO XXX could do this as fcmpd; fmstat; tstvs rX, #0 the tstvs
-    // would reset the status bits if V (NaN flag) is set, but that
-    // doesn't work for NE.  For NE could teqvs rX, #1.  rX needs to
-    // be any register that has lsb == 0, such as sp/fp/pc.
-
-    // Test explicily with the full mask; if V is set, test will fail.
-    // Assumption is that this will be followed up by a BEQ/BNE
-    CMPi(Scratch, mask);
-    // grab just the condition fields
-    SHRi(Scratch, 28);
-    MRS(Scratch);
-
-    // do the comparison and get results loaded in ARM status register
     FMSTAT();
     FCMPD(ra, rb);
 }
@@ -1095,11 +1058,11 @@ Assembler::asm_prep_fcall(Reservation*, LInsp)
 }
 
 NIns*
-Assembler::asm_branch(bool branchOnFalse, LInsp cond, NIns* targ, bool far)
+Assembler::asm_branch(bool branchOnFalse, LInsp cond, NIns* targ, bool isfar)
 {
-    // ignore far -- we figure this out on our own.
+    // ignore isfar -- we figure this out on our own.
     // XXX noone actually uses the far param in nj anyway... (always false)
-    (void)far;
+    (void)isfar;
 
     NIns* at = 0;
     LOpcode condop = cond->opcode();
@@ -1107,10 +1070,28 @@ Assembler::asm_branch(bool branchOnFalse, LInsp cond, NIns* targ, bool far)
 
     if (condop >= LIR_feq && condop <= LIR_fge)
     {
-        if (branchOnFalse)
-            JNE(targ);
-        else
-            JE(targ);
+        ConditionCode cc = NV;
+
+        if (branchOnFalse) {
+            switch (condop) {
+                case LIR_feq: cc = NE; break;
+                case LIR_flt: cc = PL; break;
+                case LIR_fgt: cc = LE; break;
+                case LIR_fle: cc = HI; break;
+                case LIR_fge: cc = LT; break;
+            }
+        } else {
+            switch (condop) {
+                case LIR_feq: cc = EQ; break;
+                case LIR_flt: cc = MI; break;
+                case LIR_fgt: cc = GT; break;
+                case LIR_fle: cc = LS; break;
+                case LIR_fge: cc = GE; break;
+            }
+        }
+
+        B_cond(cc, targ);
+        asm_output("b(%d) 0x%08x", cc, (unsigned int) targ);
 
         NIns *at = _nIns;
         asm_fcmp(cond);
@@ -1210,24 +1191,14 @@ Assembler::asm_cmp(LIns *cond)
 void
 Assembler::asm_loop(LInsp ins, NInsList& loopJumps)
 {
-    GuardRecord* guard = ins->record();
-    SideExit* exit = guard->exit;
-
     // XXX asm_loop should be in Assembler.cpp!
 
-    // Emit an exit stub that the loop may be patched to jump to (for example if we
-    // want to terminate the loop because a timeout fires).
-    asm_exit(ins);
-
-    // Emit the patchable jump itself.
     JMP_far(0);
-
     loopJumps.add(_nIns);
-    guard->jmpToStub = _nIns;
 
     // If the target we are looping to is in a different fragment, we have to restore
     // SP since we will target fragEntry and not loopEntry.
-    if (exit->target != _thisfrag)
+    if (ins->record()->exit->target != _thisfrag)
         MR(SP,FP);
 }
 
@@ -1237,7 +1208,14 @@ Assembler::asm_fcond(LInsp ins)
     // only want certain regs
     Register r = prepResultReg(ins, AllowableFlagRegs);
 
-    SETE(r);
+    switch (ins->opcode()) {
+        case LIR_feq: SET(r,EQ,NE); break;
+        case LIR_flt: SET(r,MI,PL); break;
+        case LIR_fgt: SET(r,GT,LE); break;
+        case LIR_fle: SET(r,LS,HI); break;
+        case LIR_fge: SET(r,GE,LT); break;
+    }
+
     asm_fcmp(ins);
 }
 

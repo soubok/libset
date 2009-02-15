@@ -64,6 +64,7 @@
 #include "jsscan.h"
 #include "jsscope.h"
 #include "jsscript.h"
+#include "jsstaticcheck.h"
 #include "jsstr.h"
 #include "jstracer.h"
 
@@ -77,6 +78,9 @@
  */
 static PRUintn threadTPIndex;
 static JSBool  tpIndexInited = JS_FALSE;
+
+static void
+InitOperationLimit(JSContext *cx);
 
 JS_BEGIN_EXTERN_C
 JSBool
@@ -92,6 +96,16 @@ js_InitThreadPrivateIndex(void (*ptr)(void *))
     if (status == PR_SUCCESS)
         tpIndexInited = JS_TRUE;
     return status == PR_SUCCESS;
+}
+JS_END_EXTERN_C
+
+JS_BEGIN_EXTERN_C
+JSBool
+js_CleanupThreadPrivateData()
+{
+    if (!tpIndexInited)
+        return JS_TRUE;
+    return PR_SetThreadPrivate(threadTPIndex, NULL) == PR_SUCCESS;
 }
 JS_END_EXTERN_C
 
@@ -155,7 +169,7 @@ js_GetCurrentThread(JSRuntime *rt)
         memset(&thread->traceMonitor, 0, sizeof(thread->traceMonitor));
         js_InitJIT(&thread->traceMonitor);
 #endif
-        thread->scriptsToGC = NULL;
+        memset(thread->scriptsToGC, 0, sizeof thread->scriptsToGC);
 
         /*
          * js_SetContextThread initializes the remaining fields as necessary.
@@ -184,8 +198,11 @@ js_SetContextThread(JSContext *cx)
      * current thread. See bug 425828.
      */
     if (JS_CLIST_IS_EMPTY(&thread->contextList)) {
-        memset(&thread->gsnCache, 0, sizeof(thread->gsnCache));
-        memset(&thread->propertyCache, 0, sizeof(thread->propertyCache));
+        memset(&thread->gsnCache, 0, sizeof thread->gsnCache);
+        memset(&thread->propertyCache, 0, sizeof thread->propertyCache);
+#ifdef DEBUG
+        memset(&thread->evalCacheMeter, 0, sizeof thread->evalCacheMeter);
+#endif
     }
 
     /* Assert that the previous cx->thread called JS_ClearContextThread(). */
@@ -241,7 +258,7 @@ js_NewContext(JSRuntime *rt, size_t stackChunkSize)
     memset(cx, 0, sizeof *cx);
 
     cx->runtime = rt;
-    JS_ClearOperationCallback(cx);
+    js_InitOperationLimit(cx);
     cx->debugHooks = &rt->globalDebugHooks;
 #if JS_STACK_GROWTH_DIRECTION > 0
     cx->stackLimit = (jsuword)-1;
@@ -267,7 +284,7 @@ js_NewContext(JSRuntime *rt, size_t stackChunkSize)
         }
         JS_WAIT_CONDVAR(rt->stateChange, JS_NO_TIMEOUT);
     }
-    JS_APPEND_LINK(&cx->links, &rt->contextList);
+    JS_APPEND_LINK(&cx->link, &rt->contextList);
     JS_UNLOCK_GC(rt);
 
     /*
@@ -278,6 +295,7 @@ js_NewContext(JSRuntime *rt, size_t stackChunkSize)
      * done by js_DestroyContext).
      */
     cx->version = JSVERSION_DEFAULT;
+    VOUCH_DOES_NOT_REQUIRE_STACK();
     JS_INIT_ARENA_POOL(&cx->stackPool, "stack", stackChunkSize, sizeof(jsval),
                        &cx->scriptStackQuota);
 
@@ -285,21 +303,7 @@ js_NewContext(JSRuntime *rt, size_t stackChunkSize)
                        1024,  /* FIXME: bug 421435 */
                        sizeof(jsdouble), &cx->scriptStackQuota);
 
-    /*
-     * To avoid multiple allocations in InitMatch() (in jsregexp.c), the arena
-     * size parameter should be at least as big as:
-     *   INITIAL_BACKTRACK
-     *   + (sizeof(REProgState) * INITIAL_STATESTACK)
-     *   + (offsetof(REMatchState, parens) + avgParanSize * sizeof(RECapture))
-     */
-    JS_INIT_ARENA_POOL(&cx->regexpPool, "regexp",
-                       12 * 1024 - 40,  /* FIXME: bug 421435 */
-                       sizeof(void *), &cx->scriptStackQuota);
-
-    if (!js_InitRegExpStatics(cx, &cx->regExpStatics)) {
-        js_DestroyContext(cx, JSDCM_NEW_FAILED);
-        return NULL;
-    }
+    js_InitRegExpStatics(cx);
 
     cx->resolveFlags = 0;
 
@@ -351,6 +355,49 @@ js_NewContext(JSRuntime *rt, size_t stackChunkSize)
     return cx;
 }
 
+#if defined DEBUG && defined XP_UNIX
+# include <stdio.h>
+
+static void
+DumpEvalCacheMeter(JSContext *cx)
+{
+    struct {
+        const char *name;
+        ptrdiff_t  offset;
+    } table[] = {
+#define frob(x) { #x, offsetof(JSEvalCacheMeter, x) }
+        EVAL_CACHE_METER_LIST(frob)
+#undef frob
+    };
+    JSEvalCacheMeter *ecm = &JS_CACHE_LOCUS(cx)->evalCacheMeter;
+
+    static FILE *fp;
+    if (!fp) {
+        fp = fopen("/tmp/evalcache.stats", "w");
+        if (!fp)
+            return;
+    }
+
+    fprintf(fp, "eval cache meter (%p):\n",
+#ifdef JS_THREADSAFE
+            cx->thread
+#else
+            cx->runtime
+#endif
+            );
+    for (uintN i = 0; i < JS_ARRAY_LENGTH(table); ++i) {
+        fprintf(fp, "%-8.8s  %llu\n",
+                table[i].name, *(uint64 *)((uint8 *)ecm + table[i].offset));
+    }
+    fprintf(fp, "hit ratio %g%%\n", ecm->hit * 100. / ecm->probe);
+    fprintf(fp, "avg steps %g\n", double(ecm->step) / ecm->probe);
+    fflush(fp);
+}
+# define DUMP_EVAL_CACHE_METER(cx) DumpEvalCacheMeter(cx)
+#else
+# define DUMP_EVAL_CACHE_METER(cx) ((void) 0)
+#endif
+
 void
 js_DestroyContext(JSContext *cx, JSDestroyContextMode mode)
 {
@@ -381,7 +428,7 @@ js_DestroyContext(JSContext *cx, JSDestroyContextMode mode)
     /* Remove cx from context list first. */
     JS_LOCK_GC(rt);
     JS_ASSERT(rt->state == JSRTS_UP || rt->state == JSRTS_LAUNCHING);
-    JS_REMOVE_LINK(&cx->links);
+    JS_REMOVE_LINK(&cx->link);
     last = (rt->contextList.next == &rt->contextList);
     if (last)
         rt->state = JSRTS_LANDING;
@@ -418,13 +465,8 @@ js_DestroyContext(JSContext *cx, JSDestroyContextMode mode)
         JS_ClearAllWatchPoints(cx);
     }
 
-    /*
-     * Remove more GC roots in regExpStatics, then collect garbage.
-     * XXX anti-modularity alert: we rely on the call to js_RemoveRoot within
-     * XXX this function call to wait for any racing GC to complete, in the
-     * XXX case where JS_DestroyContext is called outside of a request on cx
-     */
-    js_FreeRegExpStatics(cx, &cx->regExpStatics);
+    /* Remove more GC roots in regExpStatics, then collect garbage. */
+    JS_ClearRegExpRoots(cx);
 
 #ifdef JS_THREADSAFE
     /*
@@ -444,6 +486,7 @@ js_DestroyContext(JSContext *cx, JSDestroyContextMode mode)
 
     if (last) {
         js_GC(cx, GC_LAST_CONTEXT);
+        DUMP_EVAL_CACHE_METER(cx);
 
         /*
          * Free the script filename table if it exists and is empty. Do this
@@ -465,9 +508,10 @@ js_DestroyContext(JSContext *cx, JSDestroyContextMode mode)
     }
 
     /* Free the stuff hanging off of cx. */
+    js_FreeRegExpStatics(cx);
+    VOUCH_DOES_NOT_REQUIRE_STACK();
     JS_FinishArenaPool(&cx->stackPool);
     JS_FinishArenaPool(&cx->tempPool);
-    JS_FinishArenaPool(&cx->regexpPool);
 
     if (cx->lastMessage)
         free(cx->lastMessage);
@@ -509,7 +553,7 @@ js_ValidContextPointer(JSRuntime *rt, JSContext *cx)
     JSCList *cl;
 
     for (cl = rt->contextList.next; cl != &rt->contextList; cl = cl->next) {
-        if (cl == &cx->links)
+        if (cl == &cx->link)
             return JS_TRUE;
     }
     JS_RUNTIME_METER(rt, deadContexts);
@@ -523,8 +567,8 @@ js_ContextIterator(JSRuntime *rt, JSBool unlocked, JSContext **iterp)
 
     if (unlocked)
         JS_LOCK_GC(rt);
-    cx = (JSContext *) (cx ? cx->links.next : rt->contextList.next);
-    if (&cx->links == &rt->contextList)
+    cx = js_ContextFromLinkField(cx ? cx->link.next : rt->contextList.next);
+    if (&cx->link == &rt->contextList)
         cx = NULL;
     *iterp = cx;
     if (unlocked)
@@ -879,13 +923,32 @@ ReportError(JSContext *cx, const char *message, JSErrorReport *reportp)
      * propagates out of scope.  This is needed for compatability
      * with the old scheme.
      */
-    if (!cx->fp || !js_ErrorToException(cx, message, reportp)) {
+    if (!JS_IsRunning(cx) || !js_ErrorToException(cx, message, reportp)) {
         js_ReportErrorAgain(cx, message, reportp);
     } else if (cx->debugHooks->debugErrorHook && cx->errorReporter) {
         JSDebugErrorHook hook = cx->debugHooks->debugErrorHook;
         /* test local in case debugErrorHook changed on another thread */
         if (hook)
             hook(cx, message, reportp, cx->debugHooks->debugErrorHookData);
+    }
+}
+
+/* The report must be initially zeroed. */
+static void
+PopulateReportBlame(JSContext *cx, JSErrorReport *report)
+{
+    JSStackFrame *fp;
+
+    /*
+     * Walk stack until we find a frame that is associated with some script
+     * rather than a native frame.
+     */
+    for (fp = js_GetTopStackFrame(cx); fp; fp = fp->down) {
+        if (fp->regs) {
+            report->filename = fp->script->filename;
+            report->lineno = js_FramePCToLineNumber(cx, fp);
+            break;
+        }
     }
 }
 
@@ -899,7 +962,6 @@ ReportError(JSContext *cx, const char *message, JSErrorReport *reportp)
 void
 js_ReportOutOfMemory(JSContext *cx)
 {
-    JSStackFrame *fp;
     JSErrorReport report;
     JSErrorReporter onError = cx->errorReporter;
 
@@ -912,18 +974,7 @@ js_ReportOutOfMemory(JSContext *cx)
     memset(&report, 0, sizeof (struct JSErrorReport));
     report.flags = JSREPORT_ERROR;
     report.errorNumber = JSMSG_OUT_OF_MEMORY;
-
-    /*
-     * Walk stack until we find a frame that is associated with some script
-     * rather than a native frame.
-     */
-    for (fp = cx->fp; fp; fp = fp->down) {
-        if (fp->regs) {
-            report.filename = fp->script->filename;
-            report.lineno = js_FramePCToLineNumber(cx, fp);
-            break;
-        }
-    }
+    PopulateReportBlame(cx, &report);
 
     /*
      * If debugErrorHook is present then we give it a chance to veto sending
@@ -969,7 +1020,6 @@ js_ReportErrorVA(JSContext *cx, uintN flags, const char *format, va_list ap)
     char *message;
     jschar *ucmessage;
     size_t messagelen;
-    JSStackFrame *fp;
     JSErrorReport report;
     JSBool warning;
 
@@ -985,15 +1035,7 @@ js_ReportErrorVA(JSContext *cx, uintN flags, const char *format, va_list ap)
     report.flags = flags;
     report.errorNumber = JSMSG_USER_DEFINED_ERROR;
     report.ucmessage = ucmessage = js_InflateString(cx, message, &messagelen);
-
-    /* Find the top-most active script frame, for best line number blame. */
-    for (fp = cx->fp; fp; fp = fp->down) {
-        if (fp->regs) {
-            report.filename = fp->script->filename;
-            report.lineno = js_FramePCToLineNumber(cx, fp);
-            break;
-        }
-    }
+    PopulateReportBlame(cx, &report);
 
     warning = JSREPORT_IS_WARNING(report.flags);
     if (warning && JS_HAS_WERROR_OPTION(cx)) {
@@ -1183,7 +1225,6 @@ js_ReportErrorNumberVA(JSContext *cx, uintN flags, JSErrorCallback callback,
                        void *userRef, const uintN errorNumber,
                        JSBool charArgs, va_list ap)
 {
-    JSStackFrame *fp;
     JSErrorReport report;
     char *message;
     JSBool warning;
@@ -1194,18 +1235,7 @@ js_ReportErrorNumberVA(JSContext *cx, uintN flags, JSErrorCallback callback,
     memset(&report, 0, sizeof (struct JSErrorReport));
     report.flags = flags;
     report.errorNumber = errorNumber;
-
-    /*
-     * If we can't find out where the error was based on the current frame,
-     * see if the next frame has a script/pc combo we can use.
-     */
-    for (fp = cx->fp; fp; fp = fp->down) {
-        if (fp->regs) {
-            report.filename = fp->script->filename;
-            report.lineno = js_FramePCToLineNumber(cx, fp);
-            break;
-        }
-    }
+    PopulateReportBlame(cx, &report);
 
     if (!js_ExpandErrorArguments(cx, callback, userRef, errorNumber,
                                  &message, &report, &warning, charArgs, ap)) {
@@ -1372,23 +1402,48 @@ JSBool
 js_ResetOperationCount(JSContext *cx)
 {
     JSScript *script;
+    JSStackFrame *fp;
 
     JS_ASSERT(cx->operationCount <= 0);
     JS_ASSERT(cx->operationLimit > 0);
 
     cx->operationCount = (int32) cx->operationLimit;
-    if (cx->operationCallbackIsSet)
-        return cx->operationCallback(cx);
+    JSOperationCallback cb = cx->operationCallback;
+    if (cb) {
+        if (!cx->branchCallbackWasSet)
+            return cb(cx);
 
-    if (cx->operationCallback) {
         /*
          * Invoke the deprecated branch callback. It may be called only when
          * the top-most frame is scripted or JSOPTION_NATIVE_BRANCH_CALLBACK
          * is set.
          */
-        script = cx->fp ? cx->fp->script : NULL;
+        fp = js_GetTopStackFrame(cx);
+        script = fp ? fp->script : NULL;
         if (script || JS_HAS_OPTION(cx, JSOPTION_NATIVE_BRANCH_CALLBACK))
-            return ((JSBranchCallback) cx->operationCallback)(cx, script);
+            return ((JSBranchCallback) cb)(cx, script);
     }
     return JS_TRUE;
+}
+
+#ifndef JS_TRACER
+/* This is defined in jstracer.cpp in JS_TRACER builds. */
+extern JS_FORCES_STACK JSStackFrame *
+js_GetTopStackFrame(JSContext *cx)
+{
+    return cx->fp;
+}
+#endif
+
+JSStackFrame *
+js_GetScriptedCaller(JSContext *cx, JSStackFrame *fp)
+{
+    if (!fp)
+        fp = js_GetTopStackFrame(cx);
+    while (fp) {
+        if (fp->script)
+            return fp;
+        fp = fp->down;
+    }
+    return NULL;
 }

@@ -416,8 +416,13 @@ DaylightSavingTA(jsdouble t)
     return result;
 }
 
-
-#define AdjustTime(t)   fmod(LocalTZA + DaylightSavingTA(t), msPerDay)
+static jsdouble
+AdjustTime(jsdouble date)
+{
+    jsdouble t = DaylightSavingTA(date) + LocalTZA;
+    t = (LocalTZA > 0) ? fmod(t, msPerDay) : -fmod(msPerDay - t, msPerDay);
+    return t;
+}
 
 #define LocalTime(t)    ((t) + AdjustTime(t))
 
@@ -2026,7 +2031,7 @@ static JSFunctionSpec date_static_methods[] = {
 };
 
 JS_DEFINE_TRCINFO_1(date_valueOf,
-    (3, (static, JSVAL_FAIL, date_valueOf_tn, CONTEXT, THIS, STRING, 0, 0)))
+    (3, (static, JSVAL_RETRY, date_valueOf_tn, CONTEXT, THIS, STRING, 0, 0)))
 
 static JSFunctionSpec date_methods[] = {
     JS_FN("getTime",             date_getTime,            0,0),
@@ -2104,7 +2109,7 @@ js_Date(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
     jsdouble d;
 
     /* Date called as function. */
-    if (!(cx->fp->flags & JSFRAME_CONSTRUCTING)) {
+    if (!JS_IsConstructing(cx)) {
         return date_format(cx, PRMJ_Now() / PRMJ_USEC_PER_MSEC,
                            FORMATSPEC_FULL, rval);
     }

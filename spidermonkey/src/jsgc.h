@@ -211,6 +211,11 @@ js_NewDoubleInRootedValue(JSContext *cx, jsdouble d, jsval *vp);
 extern jsdouble *
 js_NewWeaklyRootedDouble(JSContext *cx, jsdouble d);
 
+#ifdef JS_TRACER
+extern JSBool
+js_ReserveObjects(JSContext *cx, size_t nobjects);
+#endif
+
 extern JSBool
 js_LockGCThingRT(JSRuntime *rt, void *thing);
 
@@ -249,10 +254,10 @@ js_CallValueTracerIfGCThing(JSTracer *trc, jsval v);
 extern void
 js_TraceStackFrame(JSTracer *trc, JSStackFrame *fp);
 
-extern void
+extern JS_REQUIRES_STACK void
 js_TraceRuntime(JSTracer *trc, JSBool allAtoms);
 
-extern JS_FRIEND_API(void)
+extern JS_REQUIRES_STACK JS_FRIEND_API(void)
 js_TraceContext(JSTracer *trc, JSContext *acx);
 
 /*

@@ -79,12 +79,10 @@
 #include "jsscope.h"
 #include "jsscript.h"
 #include "jsstr.h"
+#include "jstracer.h"
+#include "jsdbgapi.h"
 #include "prmjtime.h"
 #include "jsstaticcheck.h"
-
-#if !defined JS_THREADSAFE && defined JS_TRACER
-#include "jstracer.h"
-#endif
 
 #if JS_HAS_FILE_OBJECT
 #include "jsfile.h"
@@ -322,6 +320,7 @@ JS_PushArgumentsVA(JSContext *cx, void **markp, const char *format, va_list ap)
             continue;
         argc++;
     }
+    js_LeaveTrace(cx);
     sp = js_AllocStack(cx, argc, markp);
     if (!sp)
         return NULL;
@@ -418,6 +417,7 @@ JS_PUBLIC_API(void)
 JS_PopArguments(JSContext *cx, void *mark)
 {
     CHECK_REQUEST(cx);
+    JS_ASSERT_NOT_ON_TRACE(cx);
     js_FreeStack(cx, mark);
 }
 
@@ -819,7 +819,7 @@ JS_DestroyRuntime(JSRuntime *rt)
         while ((cx = js_ContextIterator(rt, JS_TRUE, &iter)) != NULL) {
             fprintf(stderr,
 "JS API usage error: found live context at %p\n",
-                    cx);
+                    (void *) cx);
             cxcount++;
         }
         fprintf(stderr,
@@ -881,6 +881,7 @@ JS_ShutDown(void)
 
     js_FinishDtoa();
 #ifdef JS_THREADSAFE
+    js_CleanupThreadPrivateData();  /* Fixes bug 464828. */
     js_CleanupLocks();
 #endif
     PRMJ_NowShutdown();
@@ -1181,6 +1182,10 @@ JS_GetOptions(JSContext *cx)
             (cx)->version |= JSVERSION_HAS_XML;                               \
         else                                                                  \
             (cx)->version &= ~JSVERSION_HAS_XML;                              \
+        if ((cx)->options & JSOPTION_ANONFUNFIX)                              \
+            (cx)->version |= JSVERSION_ANONFUNFIX;                            \
+        else                                                                  \
+            (cx)->version &= ~JSVERSION_ANONFUNFIX;                           \
     JS_END_MACRO
 
 JS_PUBLIC_API(uint32)
@@ -1802,7 +1807,7 @@ JS_GetScopeChain(JSContext *cx)
     JSStackFrame *fp;
 
     CHECK_REQUEST(cx);
-    fp = cx->fp;
+    fp = js_GetTopStackFrame(cx);
     if (!fp) {
         /*
          * There is no code active on this context. In place of an actual
@@ -2061,6 +2066,7 @@ JS_TraceRuntime(JSTracer *trc)
 {
     JSBool allAtoms = trc->context->runtime->gcKeepAtoms != 0;
 
+    js_LeaveTrace(trc->context);
     js_TraceRuntime(trc, allAtoms);
 }
 
@@ -2477,6 +2483,8 @@ JS_IsGCMarkingTracer(JSTracer *trc)
 JS_PUBLIC_API(void)
 JS_GC(JSContext *cx)
 {
+    js_LeaveTrace(cx);
+
     /* Don't nuke active arenas if executing or compiling. */
     if (cx->stackPool.current == &cx->stackPool.first)
         JS_FinishArenaPool(&cx->stackPool);
@@ -2593,6 +2601,31 @@ JS_SetGCParameter(JSRuntime *rt, JSGCParamKey key, uint32 value)
       case JSGC_STACKPOOL_LIFESPAN:
         rt->gcEmptyArenaPoolLifespan = value;
         break;
+      default:
+        JS_ASSERT(key == JSGC_TRIGGER_FACTOR);
+        JS_ASSERT(value >= 100);
+        rt->gcTriggerFactor = value;
+        return;
+    }
+}
+
+JS_PUBLIC_API(uint32)
+JS_GetGCParameter(JSRuntime *rt, JSGCParamKey key)
+{
+    switch (key) {
+      case JSGC_MAX_BYTES:
+        return rt->gcMaxBytes;
+      case JSGC_MAX_MALLOC_BYTES:
+        return rt->gcMaxMallocBytes;
+      case JSGC_STACKPOOL_LIFESPAN:
+        return rt->gcEmptyArenaPoolLifespan;
+      case JSGC_TRIGGER_FACTOR:
+        return rt->gcTriggerFactor;
+      case JSGC_BYTES:
+        return rt->gcBytes;
+      default:
+        JS_ASSERT(key == JSGC_NUMBER);
+        return rt->gcNumber;
     }
 }
 
@@ -3043,6 +3076,9 @@ JS_SealObject(JSContext *cx, JSObject *obj, JSBool deep)
     uint32 nslots, i;
     jsval v;
 
+    if (OBJ_IS_DENSE_ARRAY(cx, obj) && !js_MakeArraySlow(cx, obj))
+        return JS_FALSE;
+
     if (!OBJ_IS_NATIVE(obj)) {
         JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
                              JSMSG_CANT_SEAL_OBJECT,
@@ -3359,17 +3395,15 @@ LookupResult(JSContext *cx, JSObject *obj, JSObject *obj2, JSProperty *prop)
 }
 
 static JSBool
-GetPropertyAttributes(JSContext *cx, JSObject *obj, JSAtom *atom,
-                      uintN *attrsp, JSBool *foundp,
-                      JSPropertyOp *getterp, JSPropertyOp *setterp)
+GetPropertyAttributesById(JSContext *cx, JSObject *obj, jsid id,
+                          uintN *attrsp, JSBool *foundp,
+                          JSPropertyOp *getterp, JSPropertyOp *setterp)
 {
     JSObject *obj2;
     JSProperty *prop;
     JSBool ok;
 
-    if (!atom)
-        return JS_FALSE;
-    if (!LookupPropertyById(cx, obj, ATOM_TO_JSID(atom), JSRESOLVE_QUALIFIED,
+    if (!LookupPropertyById(cx, obj, id, JSRESOLVE_QUALIFIED,
                             &obj2, &prop)) {
         return JS_FALSE;
     }
@@ -3387,7 +3421,7 @@ GetPropertyAttributes(JSContext *cx, JSObject *obj, JSAtom *atom,
     }
 
     *foundp = JS_TRUE;
-    ok = OBJ_GET_ATTRIBUTES(cx, obj, ATOM_TO_JSID(atom), prop, attrsp);
+    ok = OBJ_GET_ATTRIBUTES(cx, obj, id, prop, attrsp);
     if (ok && OBJ_IS_NATIVE(obj)) {
         JSScopeProperty *sprop = (JSScopeProperty *) prop;
 
@@ -3398,6 +3432,17 @@ GetPropertyAttributes(JSContext *cx, JSObject *obj, JSAtom *atom,
     }
     OBJ_DROP_PROPERTY(cx, obj, prop);
     return ok;
+}
+
+static JSBool
+GetPropertyAttributes(JSContext *cx, JSObject *obj, JSAtom *atom,
+                      uintN *attrsp, JSBool *foundp,
+                      JSPropertyOp *getterp, JSPropertyOp *setterp)
+{
+    if (!atom)
+        return JS_FALSE;
+    return GetPropertyAttributesById(cx, obj, ATOM_TO_JSID(atom),
+                                     attrsp, foundp, getterp, setterp);
 }
 
 static JSBool
@@ -3448,6 +3493,18 @@ JS_GetPropertyAttrsGetterAndSetter(JSContext *cx, JSObject *obj,
     return GetPropertyAttributes(cx, obj,
                                  js_Atomize(cx, name, strlen(name), 0),
                                  attrsp, foundp, getterp, setterp);
+}
+
+JS_PUBLIC_API(JSBool)
+JS_GetPropertyAttrsGetterAndSetterById(JSContext *cx, JSObject *obj,
+                                       jsid id,
+                                       uintN *attrsp, JSBool *foundp,
+                                       JSPropertyOp *getterp,
+                                       JSPropertyOp *setterp)
+{
+    CHECK_REQUEST(cx);
+    return GetPropertyAttributesById(cx, obj, id, attrsp, foundp,
+                                     getterp, setterp);
 }
 
 JS_PUBLIC_API(JSBool)
@@ -4574,10 +4631,10 @@ js_generic_native_method_dispatcher(JSContext *cx, JSObject *obj,
      * Follow Function.prototype.apply and .call by using the global object as
      * the 'this' param if no args.
      */
-    JS_ASSERT(cx->fp->argv == argv);
     if (!js_ComputeThis(cx, JS_TRUE, argv))
         return JS_FALSE;
-    cx->fp->thisp = JSVAL_TO_OBJECT(argv[-1]);
+    js_GetTopStackFrame(cx)->thisp = JSVAL_TO_OBJECT(argv[-1]);
+    JS_ASSERT(cx->fp->argv == argv);
 
     /*
      * Protect against argc underflowing. By calling js_ComputeThis, we made
@@ -4724,7 +4781,7 @@ JS_CompileUCScript(JSContext *cx, JSObject *obj,
 
 #define LAST_FRAME_CHECKS(cx,result)                                          \
     JS_BEGIN_MACRO                                                            \
-        if (!(cx)->fp) {                                                      \
+        if (!JS_IsRunning(cx)) {                                              \
             (cx)->weakRoots.lastInternalResult = JSVAL_NULL;                  \
             LAST_FRAME_EXCEPTION_CHECK(cx, result);                           \
         }                                                                     \
@@ -5248,49 +5305,40 @@ JS_PUBLIC_API(void)
 JS_SetOperationCallback(JSContext *cx, JSOperationCallback callback,
                         uint32 operationLimit)
 {
-    JS_ASSERT(callback);
-    JS_ASSERT(operationLimit <= JS_MAX_OPERATION_LIMIT);
-    JS_ASSERT(operationLimit > 0);
-
-    cx->operationCount = (int32) operationLimit;
-    cx->operationLimit = operationLimit;
-    cx->operationCallbackIsSet = 1;
-    cx->operationCallback = callback;
+    JS_SetOperationCallbackFunction(cx, callback);
+    JS_SetOperationLimit(cx, operationLimit);
 }
 
 JS_PUBLIC_API(void)
 JS_ClearOperationCallback(JSContext *cx)
 {
-    cx->operationCount = (int32) JS_MAX_OPERATION_LIMIT;
-    cx->operationLimit = JS_MAX_OPERATION_LIMIT;
-    cx->operationCallbackIsSet = 0;
-    cx->operationCallback = NULL;
-}
-
-JS_PUBLIC_API(JSOperationCallback)
-JS_GetOperationCallback(JSContext *cx)
-{
-    JS_ASSERT(cx->operationCallbackIsSet || !cx->operationCallback);
-    return cx->operationCallback;
-}
-
-JS_PUBLIC_API(uint32)
-JS_GetOperationLimit(JSContext *cx)
-{
-    JS_ASSERT(cx->operationCallbackIsSet);
-    return cx->operationLimit;
+    JS_SetOperationCallbackFunction(cx, NULL);
+    JS_SetOperationLimit(cx, JS_MAX_OPERATION_LIMIT);
 }
 
 JS_PUBLIC_API(void)
 JS_SetOperationLimit(JSContext *cx, uint32 operationLimit)
 {
+    /* Mixed operation and branch callbacks are not supported. */
+    JS_ASSERT(!cx->branchCallbackWasSet);
     JS_ASSERT(operationLimit <= JS_MAX_OPERATION_LIMIT);
     JS_ASSERT(operationLimit > 0);
-    JS_ASSERT(cx->operationCallbackIsSet);
 
+    cx->operationCount = (int32) operationLimit;
     cx->operationLimit = operationLimit;
-    if (cx->operationCount > (int32) operationLimit)
-        cx->operationCount = (int32) operationLimit;
+}
+
+JS_PUBLIC_API(uint32)
+JS_GetOperationLimit(JSContext *cx)
+{
+    JS_ASSERT(!cx->branchCallbackWasSet);
+
+    /*
+     * cx->operationLimit is initialized to JS_MAX_OPERATION_LIMIT + 1 to
+     * detect for optimizations if the embedding has ever set it.
+     */
+    JS_ASSERT(cx->operationLimit <= JS_MAX_OPERATION_LIMIT + 1);
+    return JS_MIN(cx->operationLimit, JS_MAX_OPERATION_LIMIT);
 }
 
 JS_PUBLIC_API(JSBranchCallback)
@@ -5298,14 +5346,16 @@ JS_SetBranchCallback(JSContext *cx, JSBranchCallback cb)
 {
     JSBranchCallback oldcb;
 
-    if (cx->operationCallbackIsSet) {
+    if (!cx->branchCallbackWasSet) {
 #ifdef DEBUG
-        fprintf(stderr,
+        if (cx->operationCallback) {
+            fprintf(stderr,
 "JS API usage error: call to JS_SetOperationCallback is followed by\n"
 "invocation of deprecated JS_SetBranchCallback\n");
-        JS_ASSERT(0);
+            JS_ASSERT(0);
+        }
 #endif
-        cx->operationCallbackIsSet = 0;
+        cx->branchCallbackWasSet = 1;
         oldcb = NULL;
     } else {
         oldcb = (JSBranchCallback) cx->operationCallback;
@@ -5315,21 +5365,48 @@ JS_SetBranchCallback(JSContext *cx, JSBranchCallback cb)
         cx->operationLimit = JSOW_SCRIPT_JUMP;
         cx->operationCallback = (JSOperationCallback) cb;
     } else {
-        JS_ClearOperationCallback(cx);
+        cx->operationCallback = NULL;
     }
     return oldcb;
+}
+
+JS_PUBLIC_API(void)
+JS_SetOperationCallbackFunction(JSContext *cx, JSOperationCallback callback)
+{
+    /* Mixed operation and branch callbacks are not supported. */
+    JS_ASSERT(!cx->branchCallbackWasSet);
+    cx->operationCallback = callback;
+}
+
+JS_PUBLIC_API(JSOperationCallback)
+JS_GetOperationCallback(JSContext *cx)
+{
+    JS_ASSERT(!cx->branchCallbackWasSet);
+    return cx->operationCallback;
+}
+
+JS_PUBLIC_API(void)
+JS_TriggerOperationCallback(JSContext *cx)
+{
+    cx->operationCount = 0;
 }
 
 JS_PUBLIC_API(JSBool)
 JS_IsRunning(JSContext *cx)
 {
-    return cx->fp != NULL;
+    /* The use of cx->fp below is safe: if we're on trace, it is skipped. */
+    VOUCH_DOES_NOT_REQUIRE_STACK();
+
+    return JS_ON_TRACE(cx) || cx->fp != NULL;
 }
 
 JS_PUBLIC_API(JSBool)
 JS_IsConstructing(JSContext *cx)
 {
-    return cx->fp && (cx->fp->flags & JSFRAME_CONSTRUCTING);
+    JSStackFrame *fp;
+
+    fp = js_GetTopStackFrame(cx);
+    return fp && (fp->flags & JSFRAME_CONSTRUCTING);
 }
 
 JS_FRIEND_API(JSBool)
@@ -5337,8 +5414,7 @@ JS_IsAssigning(JSContext *cx)
 {
     JSStackFrame *fp;
 
-    for (fp = cx->fp; fp && !fp->script; fp = fp->down)
-        continue;
+    fp = js_GetScriptedCaller(cx, NULL);
     if (!fp || !fp->regs)
         return JS_FALSE;
     return (js_CodeSpec[*fp->regs->pc].format & JOF_ASSIGNING) != 0;
@@ -5358,7 +5434,7 @@ JS_SaveFrameChain(JSContext *cx)
 {
     JSStackFrame *fp;
 
-    fp = cx->fp;
+    fp = js_GetTopStackFrame(cx);
     if (!fp)
         return fp;
 
@@ -5372,6 +5448,7 @@ JS_SaveFrameChain(JSContext *cx)
 JS_PUBLIC_API(void)
 JS_RestoreFrameChain(JSContext *cx, JSStackFrame *fp)
 {
+    JS_ASSERT_NOT_ON_TRACE(cx);
     JS_ASSERT(!cx->fp);
     if (!fp)
         return;
@@ -5983,7 +6060,7 @@ JS_PUBLIC_API(JSBool)
 JS_ThrowReportedError(JSContext *cx, const char *message,
                       JSErrorReport *reportp)
 {
-    return cx->fp && js_ErrorToException(cx, message, reportp);
+    return JS_IsRunning(cx) && js_ErrorToException(cx, message, reportp);
 }
 
 JS_PUBLIC_API(JSBool)
