@@ -157,18 +157,26 @@ UpdateDepth(JSContext *cx, JSCodeGenerator *cg, ptrdiff_t target)
     jsbytecode *pc;
     JSOp op;
     const JSCodeSpec *cs;
-    uintN depth;
+    uintN extra, depth;
     intN nuses, ndefs;
 
     pc = CG_CODE(cg, target);
     op = (JSOp) *pc;
     cs = &js_CodeSpec[op];
-    if (cs->format & JOF_TMPSLOT_MASK) {
+#ifdef JS_TRACER
+    extern uint8 js_opcode2extra[];
+    extra = js_opcode2extra[op];
+#else
+    extra = 0;
+#endif
+    if ((cs->format & JOF_TMPSLOT_MASK) || extra) {
         depth = (uintN) cg->stackDepth +
-                ((cs->format & JOF_TMPSLOT_MASK) >> JOF_TMPSLOT_SHIFT);
+                ((cs->format & JOF_TMPSLOT_MASK) >> JOF_TMPSLOT_SHIFT) +
+                extra;
         if (depth > cg->maxStackDepth)
             cg->maxStackDepth = depth;
     }
+
     nuses = cs->nuses;
     if (nuses < 0)
         nuses = js_GetVariableStackUseLength(op, pc);
@@ -1697,7 +1705,6 @@ EmitIndexOp(JSContext *cx, JSOp op, uintN index, JSCodeGenerator *cg)
             return JS_FALSE;                                                  \
     JS_END_MACRO
 
-
 static JSBool
 EmitAtomOp(JSContext *cx, JSParseNode *pn, JSOp op, JSCodeGenerator *cg)
 {
@@ -1884,10 +1891,17 @@ BindNameToSlot(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
              * Optimize access to function's arguments and variable and the
              * arguments object.
              */
-            if (PN_OP(pn) != JSOP_NAME || cg->staticDepth > JS_DISPLAY_SIZE)
+            if (PN_OP(pn) != JSOP_NAME || cg->staticDepth >= JS_DISPLAY_SIZE)
                 goto arguments_check;
             localKind = js_LookupLocal(cx, caller->fun, atom, &index);
             if (localKind == JSLOCAL_NONE)
+                goto arguments_check;
+
+            /*
+             * Don't generate upvars on the left side of a for loop. See
+             * bug 470758.
+             */
+            if (tc->flags & TCF_IN_FOR_INIT)
                 goto arguments_check;
 
             ATOM_LIST_SEARCH(ale, &cg->upvarList, atom);
@@ -2325,11 +2339,40 @@ EmitXMLName(JSContext *cx, JSParseNode *pn, JSOp op, JSCodeGenerator *cg)
 #endif
 
 static JSBool
+EmitSpecialPropOp(JSContext *cx, JSParseNode *pn, JSOp op, JSCodeGenerator *cg)
+{
+    /*
+     * Special case for obj.__proto__, obj.__parent__, obj.__count__ to
+     * deoptimize away from fast paths in the interpreter and trace recorder,
+     * which skip dense array instances by going up to Array.prototype before
+     * looking up the property name.
+     */
+    JSAtomListElement *ale = js_IndexAtom(cx, pn->pn_atom, &cg->atomList);
+    if (!ale)
+        return JS_FALSE;
+    if (!EmitIndexOp(cx, JSOP_QNAMEPART, ALE_INDEX(ale), cg))
+        return JS_FALSE;
+    if (js_Emit1(cx, cg, op) < 0)
+        return JS_FALSE;
+    return JS_TRUE;
+}
+
+static JSBool
 EmitPropOp(JSContext *cx, JSParseNode *pn, JSOp op, JSCodeGenerator *cg,
            JSBool callContext)
 {
     JSParseNode *pn2, *pndot, *pnup, *pndown;
     ptrdiff_t top;
+    
+    /* Special case deoptimization on __proto__, __count__ and __parent__. */
+    if (pn->pn_arity == PN_NAME && 
+        (pn->pn_atom == cx->runtime->atomState.protoAtom || 
+         pn->pn_atom == cx->runtime->atomState.countAtom ||
+         pn->pn_atom == cx->runtime->atomState.parentAtom)) {
+        if (pn->pn_expr && !js_EmitTree(cx, cg, pn->pn_expr))
+            return JS_FALSE;
+        return EmitSpecialPropOp(cx, pn, callContext ? JSOP_CALLELEM : JSOP_GETELEM, cg);
+    }
 
     pn2 = pn->pn_expr;
     if (callContext) {
@@ -2410,8 +2453,20 @@ EmitPropOp(JSContext *cx, JSParseNode *pn, JSOp op, JSCodeGenerator *cg,
                                CG_OFFSET(cg) - pndown->pn_offset) < 0) {
                 return JS_FALSE;
             }
-            if (!EmitAtomOp(cx, pndot, PN_OP(pndot), cg))
+
+            /* 
+             * Special case deoptimization on __proto__, __count__ and
+             * __parent__, as above. 
+             */
+            if (pndot->pn_arity == PN_NAME && 
+                (pndot->pn_atom == cx->runtime->atomState.protoAtom || 
+                 pndot->pn_atom == cx->runtime->atomState.countAtom ||
+                 pndot->pn_atom == cx->runtime->atomState.parentAtom)) {                
+                if (!EmitSpecialPropOp(cx, pndot, JSOP_GETELEM, cg))
+                    return JS_FALSE;
+            } else if (!EmitAtomOp(cx, pndot, PN_OP(pndot), cg)) {
                 return JS_FALSE;
+            }
 
             /* Reverse the pn_expr link again. */
             pnup = pndot->pn_expr;
@@ -2725,6 +2780,8 @@ EmitSwitch(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn,
                 continue;
 
             pn4 = pn3->pn_left;
+            while (pn4->pn_type == TOK_RP)
+                pn4 = pn4->pn_kid;
             switch (pn4->pn_type) {
               case TOK_NUMBER:
                 d = pn4->pn_dval;
@@ -5321,6 +5378,11 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
                 if (pn2->pn_atom == cx->runtime->atomState.lengthAtom) {
                     if (js_Emit1(cx, cg, JSOP_LENGTH) < 0)
                         return JS_FALSE;
+                } else if (pn2->pn_atom == cx->runtime->atomState.protoAtom) {
+                    if (!EmitIndexOp(cx, JSOP_QNAMEPART, atomIndex, cg))
+                        return JS_FALSE;
+                    if (js_Emit1(cx, cg, JSOP_GETELEM) < 0)
+                        return JS_FALSE;
                 } else {
                     EMIT_INDEX_OP(JSOP_GETPROP, atomIndex);
                 }
@@ -5977,7 +6039,7 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
          * array comprehension, use JSOP_NEWARRAY.
          */
         pn2 = pn->pn_head;
-        op = JSOP_NEWINIT;      // FIXME: 260106 patch disabled for now
+        op = JSOP_NEWARRAY;
 
 #if JS_HAS_SHARP_VARS
         if (pn2 && pn2->pn_type == TOK_DEFSHARP)
@@ -6622,7 +6684,7 @@ js_SetSrcNoteOffset(JSContext *cx, JSCodeGenerator *cg, uintN index,
 
             /*
              * Simultaneously test to see if the source note array must grow to
-             * accomodate either the first or second byte of additional storage
+             * accommodate either the first or second byte of additional storage
              * required by this 3-byte offset.
              */
             if (((CG_NOTE_COUNT(cg) + 1) & CG_NOTE_MASK(cg)) <= 1) {

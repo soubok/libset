@@ -187,79 +187,6 @@ js_StringToInt32(JSContext* cx, JSString* str)
     return js_DoubleToECMAInt32(d);
 }
 
-static inline JSBool
-js_Int32ToId(JSContext* cx, int32 index, jsid* id)
-{
-    if (index <= JSVAL_INT_MAX) {
-        *id = INT_TO_JSID(index);
-        return JS_TRUE;
-    }
-    JSString* str = js_NumberToString(cx, index);
-    if (!str)
-        return JS_FALSE;
-    return js_ValueToStringId(cx, STRING_TO_JSVAL(str), id);
-}
-
-jsval FASTCALL
-js_Any_getprop(JSContext* cx, JSObject* obj, JSString* idstr)
-{
-    jsval v;
-    jsid id;
-
-    if (!js_ValueToStringId(cx, STRING_TO_JSVAL(idstr), &id))
-        return JSVAL_ERROR_COOKIE;
-    if (!OBJ_GET_PROPERTY(cx, obj, id, &v))
-        return JSVAL_ERROR_COOKIE;
-    return v;
-}
-
-JSBool FASTCALL
-js_Any_setprop(JSContext* cx, JSObject* obj, JSString* idstr, jsval v)
-{
-    jsid id;
-    if (!js_ValueToStringId(cx, STRING_TO_JSVAL(idstr), &id))
-        return JS_FALSE;
-    return OBJ_SET_PROPERTY(cx, obj, id, &v);
-}
-
-jsval FASTCALL
-js_Any_getelem(JSContext* cx, JSObject* obj, int32 index)
-{
-    jsval v;
-    jsid id;
-    if (!js_Int32ToId(cx, index, &id))
-        return JSVAL_ERROR_COOKIE;
-    if (!OBJ_GET_PROPERTY(cx, obj, id, &v))
-        return JSVAL_ERROR_COOKIE;
-    return v;
-}
-
-JSBool FASTCALL
-js_Any_setelem(JSContext* cx, JSObject* obj, int32 index, jsval v)
-{
-    jsid id;
-    if (!js_Int32ToId(cx, index, &id))
-        return JSVAL_ERROR_COOKIE;
-    return OBJ_SET_PROPERTY(cx, obj, id, &v);
-}
-
-JSObject* FASTCALL
-js_FastValueToIterator(JSContext* cx, jsuint flags, jsval v)
-{
-    if (!js_ValueToIterator(cx, flags, &v))
-        return NULL;
-    return JSVAL_TO_OBJECT(v);
-}
-
-jsval FASTCALL
-js_FastCallIteratorNext(JSContext* cx, JSObject* iterobj)
-{
-    jsval v;
-    if (!js_CallIteratorNext(cx, iterobj, &v))
-        return JSVAL_ERROR_COOKIE;
-    return v;
-}
-
 SideExit* FASTCALL
 js_CallTree(InterpState* state, Fragment* f)
 {
@@ -282,7 +209,7 @@ js_CallTree(InterpState* state, Fragment* f)
            the outer tree the failing call was in starting at that guard. */
         if (!state->lastTreeCallGuard) {
             state->lastTreeCallGuard = lr;
-            FrameInfo* rp = (FrameInfo*)state->rp;
+            FrameInfo** rp = (FrameInfo**)state->rp;
             state->rpAtLastTreeCall = rp + lr->calldepth;
         }
     } else {
@@ -398,13 +325,15 @@ js_AddProperty(JSContext* cx, JSObject* obj, JSScopeProperty* sprop)
     return JS_FALSE;
 }
 
-JSBool FASTCALL
-js_HasNamedProperty(JSContext* cx, JSObject* obj, JSString* idstr)
+static JSBool
+HasProperty(JSContext* cx, JSObject* obj, jsid id)
 {
-    jsid id;
-    if (!obj || !js_ValueToStringId(cx, STRING_TO_JSVAL(idstr), &id))
+    // check whether we know how the resolve op will behave
+    JSClass* clasp = OBJ_GET_CLASS(cx, obj);
+    if (clasp->resolve != JS_ResolveStub && clasp != &js_StringClass)
         return JSVAL_TO_BOOLEAN(JSVAL_VOID);
 
+    JSAutoResolveFlags rf(cx, JSRESOLVE_QUALIFIED);
     JSObject* obj2;
     JSProperty* prop;
     if (!OBJ_LOOKUP_PROPERTY(cx, obj, id, &obj2, &prop))
@@ -415,19 +344,23 @@ js_HasNamedProperty(JSContext* cx, JSObject* obj, JSString* idstr)
 }
 
 JSBool FASTCALL
+js_HasNamedProperty(JSContext* cx, JSObject* obj, JSString* idstr)
+{
+    jsid id;
+    if (!js_ValueToStringId(cx, STRING_TO_JSVAL(idstr), &id))
+        return JSVAL_TO_BOOLEAN(JSVAL_VOID);
+
+    return HasProperty(cx, obj, id);
+}
+
+JSBool FASTCALL
 js_HasNamedPropertyInt32(JSContext* cx, JSObject* obj, int32 index)
 {
     jsid id;
-    if (!obj || !js_Int32ToId(cx, index, &id))
+    if (!js_Int32ToId(cx, index, &id))
         return JSVAL_TO_BOOLEAN(JSVAL_VOID);
 
-    JSObject* obj2;
-    JSProperty* prop;
-    if (!OBJ_LOOKUP_PROPERTY(cx, obj, id, &obj2, &prop))
-        return JSVAL_TO_BOOLEAN(JSVAL_VOID);
-    if (prop)
-        OBJ_DROP_PROPERTY(cx, obj2, prop);
-    return prop != NULL;
+    return HasProperty(cx, obj, id);
 }
 
 jsval FASTCALL
@@ -469,18 +402,6 @@ js_BooleanOrUndefinedToString(JSContext *cx, int32 unboxed)
 {
     JS_ASSERT(uint32(unboxed) <= 2);
     return ATOM_TO_STRING(cx->runtime->atomState.booleanAtoms[unboxed]);
-}
-
-JSString* FASTCALL
-js_ObjectToString(JSContext* cx, JSObject* obj)
-{
-    if (!obj)
-        return ATOM_TO_STRING(cx->runtime->atomState.nullAtom);
-    jsval v;
-    if (!OBJ_DEFAULT_VALUE(cx, obj, JSTYPE_STRING, &v))
-        return NULL;
-    JS_ASSERT(JSVAL_IS_STRING(v));
-    return JSVAL_TO_STRING(v);
 }
 
 JSObject* FASTCALL

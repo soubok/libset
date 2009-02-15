@@ -304,7 +304,7 @@ js_fileBaseName(JSContext *cx, const char *pathname)
 
     index = strlen(pathname)-1;
 
-    /* Chop off trailing seperators. */
+    /* Chop off trailing separators. */
     while (index > 0 && (pathname[index]==FILESEPARATOR ||
                          pathname[index]==FILESEPARATOR2)) {
         --index;
@@ -2181,7 +2181,7 @@ file_constructor(JSContext *cx, JSObject *obj, uintN argc, jsval *argv,
     JSString *str;
     JSFile   *file;
 
-    if (!(cx->fp->flags & JSFRAME_CONSTRUCTING)) {
+    if (!JS_IsConstructing(cx)) {
         /* Replace obj with a new File object. */
         obj = JS_NewObject(cx, &js_FileClass, NULL, NULL);
         if (!obj)

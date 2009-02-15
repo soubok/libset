@@ -595,6 +595,11 @@ JS_StringToVersion(const char *string);
                                                    that a null rval out-param
                                                    will be passed to each call
                                                    to JS_ExecuteScript. */
+#define JSOPTION_UNROOTED_GLOBAL JS_BIT(13)     /* The GC will not root the
+                                                   contexts' global objects
+                                                   (see JS_GetGlobalObject),
+                                                   leaving that up to the
+                                                   embedding. */
 
 extern JS_PUBLIC_API(uint32)
 JS_GetOptions(JSContext *cx);
@@ -1134,11 +1139,30 @@ typedef enum JSGCParamKey {
     JSGC_MAX_MALLOC_BYTES   = 1,
 
     /* Hoard stackPools for this long, in ms, default is 30 seconds. */
-    JSGC_STACKPOOL_LIFESPAN = 2
+    JSGC_STACKPOOL_LIFESPAN = 2,
+
+    /*
+     * The factor that defines when the GC is invoked. The factor is a
+     * percent of the memory allocated by the GC after the last run of
+     * the GC. When the current memory allocated by the GC is more than
+     * this percent then the GC is invoked. The factor cannot be less
+     * than 100 since the current memory allocated by the GC cannot be less
+     * than the memory allocated after the last run of the GC.
+     */
+    JSGC_TRIGGER_FACTOR = 3,
+
+    /* Amount of bytes allocated by the GC. */
+    JSGC_BYTES = 4,
+
+    /* Number of times when GC was invoked. */
+    JSGC_NUMBER = 5
 } JSGCParamKey;
 
 extern JS_PUBLIC_API(void)
 JS_SetGCParameter(JSRuntime *rt, JSGCParamKey key, uint32 value);
+
+extern JS_PUBLIC_API(uint32)
+JS_GetGCParameter(JSRuntime *rt, JSGCParamKey key);
 
 /*
  * Add a finalizer for external strings created by JS_NewExternalString (see
@@ -1406,6 +1430,7 @@ JS_IdToValue(JSContext *cx, jsid id, jsval *vp);
 #define JSRESOLVE_DETECTING     0x04    /* 'if (o.p)...' or '(o.p) ?...:...' */
 #define JSRESOLVE_DECLARING     0x08    /* var, const, or function prolog op */
 #define JSRESOLVE_CLASSNAME     0x10    /* class name used when constructing */
+#define JSRESOLVE_WITH          0x20    /* resolve inside a with statement */
 
 extern JS_PUBLIC_API(JSBool)
 JS_PropertyStub(JSContext *cx, JSObject *obj, jsval id, jsval *vp);
@@ -1598,6 +1623,13 @@ JS_GetPropertyAttrsGetterAndSetter(JSContext *cx, JSObject *obj,
                                    uintN *attrsp, JSBool *foundp,
                                    JSPropertyOp *getterp,
                                    JSPropertyOp *setterp);
+
+extern JS_PUBLIC_API(JSBool)
+JS_GetPropertyAttrsGetterAndSetterById(JSContext *cx, JSObject *obj,
+                                       jsid id,
+                                       uintN *attrsp, JSBool *foundp,
+                                       JSPropertyOp *getterp,
+                                       JSPropertyOp *setterp);
 
 /*
  * Set the attributes of a property on a given object.
@@ -2170,13 +2202,26 @@ JS_CallFunctionValue(JSContext *cx, JSObject *obj, jsval fval, uintN argc,
  * The maximum value of the operation limit to pass to JS_SetOperationCallback
  * and JS_SetOperationLimit.
  */
-#define JS_MAX_OPERATION_LIMIT ((uint32) 0x7FFFFFFF)
+#define JS_MAX_OPERATION_LIMIT ((uint32) 0x7FFFFFFF - (uint32) 1)
 
 #define JS_OPERATION_WEIGHT_BASE 4096
 
+extern JS_PUBLIC_API(void)
+JS_SetOperationCallbackFunction(JSContext *cx, JSOperationCallback callback);
+
+extern JS_PUBLIC_API(JSOperationCallback)
+JS_GetOperationCallback(JSContext *cx);
+
 /*
- * Set the operation callback that the engine calls periodically after
- * the internal operation count reaches the specified limit.
+ * Force a call to operation callback at some later moment. The function can be
+ * called from an arbitrary thread for any context.
+ */
+extern JS_PUBLIC_API(void)
+JS_TriggerOperationCallback(JSContext *cx);
+
+/*
+ * Set the limit for the internal operation counter. The engine calls the
+ * operation callback When the limit is reached.
  *
  * When operationLimit is JS_OPERATION_WEIGHT_BASE, the callback will be
  * called at least after each backward jump in the interpreter. To minimize
@@ -2187,14 +2232,7 @@ JS_CallFunctionValue(JSContext *cx, JSObject *obj, jsval fval, uintN argc,
  * as a value for operationLimit.
  */
 extern JS_PUBLIC_API(void)
-JS_SetOperationCallback(JSContext *cx, JSOperationCallback callback,
-                        uint32 operationLimit);
-
-extern JS_PUBLIC_API(void)
-JS_ClearOperationCallback(JSContext *cx);
-
-extern JS_PUBLIC_API(JSOperationCallback)
-JS_GetOperationCallback(JSContext *cx);
+JS_SetOperationLimit(JSContext *cx, uint32 operationLimit);
 
 /*
  * Get the operation limit associated with the operation callback. This API
@@ -2204,13 +2242,12 @@ JS_GetOperationCallback(JSContext *cx);
 extern JS_PUBLIC_API(uint32)
 JS_GetOperationLimit(JSContext *cx);
 
-/*
- * Change the operation limit associated with the operation callback. This API
- * function may be called only when the result of JS_GetOperationCallback(cx)
- * is not null.
- */
 extern JS_PUBLIC_API(void)
-JS_SetOperationLimit(JSContext *cx, uint32 operationLimit);
+JS_SetOperationCallback(JSContext *cx, JSOperationCallback callback,
+                        uint32 operationLimit);
+
+extern JS_PUBLIC_API(void)
+JS_ClearOperationCallback(JSContext *cx);
 
 /*
  * Note well: JS_SetBranchCallback is deprecated. It is similar to
@@ -2586,6 +2623,7 @@ JS_SetErrorReporter(JSContext *cx, JSErrorReporter er);
 #define JSREG_GLOB      0x02    /* global exec, creates array of matches */
 #define JSREG_MULTILINE 0x04    /* treat ^ and $ as begin and end of line */
 #define JSREG_STICKY    0x08    /* only match starting at lastIndex */
+#define JSREG_FLAT      0x10    /* parse as a flat regexp */
 
 extern JS_PUBLIC_API(JSObject *)
 JS_NewRegExpObject(JSContext *cx, char *bytes, size_t length, uintN flags);

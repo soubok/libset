@@ -53,6 +53,7 @@
 #include "jscntxt.h"
 #include "jsversion.h"
 #include "jsdbgapi.h"
+#include "jsemit.h"
 #include "jsfun.h"
 #include "jsgc.h"
 #include "jsinterp.h"
@@ -713,7 +714,7 @@ call_enumerate(JSContext *cx, JSObject *obj)
     JSProperty *prop;
 
     fun = js_GetCallObjectFunction(obj);
-    n = JS_GET_LOCAL_NAME_COUNT(fun);
+    n = fun ? JS_GET_LOCAL_NAME_COUNT(fun) : 0;
     if (n == 0)
         return JS_TRUE;
 
@@ -1004,7 +1005,8 @@ fun_getProperty(JSContext *cx, JSObject *obj, jsval id, jsval *vp)
     }
 
     /* Find fun's top-most activation record. */
-    for (fp = cx->fp; fp && (fp->fun != fun || (fp->flags & JSFRAME_SPECIAL));
+    for (fp = js_GetTopStackFrame(cx);
+         fp && (fp->fun != fun || (fp->flags & JSFRAME_SPECIAL));
          fp = fp->down) {
         continue;
     }
@@ -1585,7 +1587,7 @@ fun_toSource(JSContext *cx, uintN argc, jsval *vp)
 }
 #endif
 
-JSBool
+JS_REQUIRES_STACK JSBool
 js_fun_call(JSContext *cx, uintN argc, jsval *vp)
 {
     JSObject *obj;
@@ -1644,7 +1646,7 @@ js_fun_call(JSContext *cx, uintN argc, jsval *vp)
     return ok;
 }
 
-JSBool
+JS_REQUIRES_STACK JSBool
 js_fun_apply(JSContext *cx, uintN argc, jsval *vp)
 {
     JSObject *obj, *aobj;
@@ -1735,7 +1737,7 @@ out:
 }
 
 #ifdef NARCISSUS
-static JSBool
+static JS_REQUIRES_STACK JSBool
 fun_applyConstructor(JSContext *cx, uintN argc, jsval *vp)
 {
     JSObject *aobj;
@@ -1796,9 +1798,9 @@ static JSFunctionSpec function_methods[] = {
 static JSBool
 Function(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 {
-    JSStackFrame *fp, *caller;
     JSFunction *fun;
     JSObject *parent;
+    JSStackFrame *fp, *caller;
     uintN i, n, lineno;
     JSAtom *atom;
     const char *filename;
@@ -1811,8 +1813,7 @@ Function(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
     size_t arg_length, args_length, old_args_length;
     JSTokenType tt;
 
-    fp = cx->fp;
-    if (!(fp->flags & JSFRAME_CONSTRUCTING)) {
+    if (!JS_IsConstructing(cx)) {
         obj = js_NewObject(cx, &js_FunctionClass, NULL, NULL, 0);
         if (!obj)
             return JS_FALSE;
@@ -1851,8 +1852,9 @@ Function(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
      * are built for Function.prototype.call or .apply activations that invoke
      * Function indirectly from a script.
      */
+    fp = js_GetTopStackFrame(cx);
     JS_ASSERT(!fp->script && fp->fun && fp->fun->u.n.native == Function);
-    caller = JS_GetScriptedCaller(cx, fp);
+    caller = js_GetScriptedCaller(cx, fp);
     if (caller) {
         principals = JS_EvalFramePrincipals(cx, fp, caller);
         filename = js_ComputeFilename(cx, caller, principals, &lineno);
@@ -2037,10 +2039,11 @@ js_InitFunctionClass(JSContext *cx, JSObject *obj)
     fun = js_NewFunction(cx, proto, NULL, 0, JSFUN_INTERPRETED, obj, NULL);
     if (!fun)
         goto bad;
-    fun->u.i.script = js_NewScript(cx, 1, 0, 0, 0, 0, 0, 0);
+    fun->u.i.script = js_NewScript(cx, 1, 1, 0, 0, 0, 0, 0);
     if (!fun->u.i.script)
         goto bad;
     fun->u.i.script->code[0] = JSOP_STOP;
+    *SCRIPT_NOTES(fun->u.i.script) = SRC_NULL;
 #ifdef CHECK_SCRIPT_OWNER
     fun->u.i.script->owner = NULL;
 #endif
@@ -2200,7 +2203,7 @@ js_ValueToFunctionObject(JSContext *cx, jsval *vp, uintN flags)
         return NULL;
     *vp = OBJECT_TO_JSVAL(FUN_OBJECT(fun));
 
-    caller = JS_GetScriptedCaller(cx, cx->fp);
+    caller = js_GetScriptedCaller(cx, NULL);
     if (caller) {
         principals = JS_StackFramePrincipals(cx, caller);
     } else {
@@ -2242,7 +2245,7 @@ js_ReportIsNotFunction(JSContext *cx, jsval *vp, uintN flags)
     const char *name, *source;
     JSTempValueRooter tvr;
 
-    for (fp = cx->fp; fp && !fp->regs; fp = fp->down)
+    for (fp = js_GetTopStackFrame(cx); fp && !fp->regs; fp = fp->down)
         continue;
     name = source = NULL;
     JS_PUSH_TEMP_ROOT_STRING(cx, NULL, &tvr);
