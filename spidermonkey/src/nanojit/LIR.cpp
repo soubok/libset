@@ -88,7 +88,13 @@ namespace nanojit
 	
 	// LCompressedBuffer
 	LirBuffer::LirBuffer(Fragmento* frago, const CallInfo* functions)
-		: _frago(frago), _functions(functions), abi(ABI_FASTCALL), _pages(frago->core()->GetGC())
+		: _frago(frago),
+#ifdef NJ_VERBOSE
+		  names(NULL),
+#endif
+		  _functions(functions), abi(ABI_FASTCALL),
+		  state(NULL), param1(NULL), sp(NULL), rp(NULL),
+		  _pages(frago->core()->GetGC())
 	{
 		rewind();
 	}
@@ -496,7 +502,7 @@ namespace nanojit
 	}
 
 	bool FASTCALL isCmp(LOpcode c) {
-		return c >= LIR_eq && c <= LIR_uge || c >= LIR_feq && c <= LIR_fge;
+		return (c >= LIR_eq && c <= LIR_uge) || (c >= LIR_feq && c <= LIR_fge);
 	}
     
 	bool FASTCALL isCond(LOpcode c) {
@@ -564,7 +570,7 @@ namespace nanojit
 
     bool LIns::isCse(const CallInfo *functions) const
     { 
-		return nanojit::isCse(u.code) || isCall() && callInfo()->_cse;
+		return nanojit::isCse(u.code) || (isCall() && callInfo()->_cse);
     }
 
 	void LIns::setimm16(int32_t x)
@@ -683,8 +689,13 @@ namespace nanojit
         return *(const uint64_t*)ptr;
     #else
         union { uint64_t tmp; int32_t dst[2]; } u;
+		#ifdef AVMPLUS_BIG_ENDIAN
+        u.dst[0] = l->v[1];
+        u.dst[1] = l->v[0];
+		#else
         u.dst[0] = l->v[0];
         u.dst[1] = l->v[1];
+		#endif
         return u.tmp;
     #endif
 	}
@@ -698,8 +709,13 @@ namespace nanojit
 		return *(const double*)ptr;
 	#else
 		union { uint32_t dst[2]; double tmpf; } u;
+		#ifdef AVMPLUS_BIG_ENDIAN
+		u.dst[0] = l->v[1];
+		u.dst[1] = l->v[0];
+		#else
 		u.dst[0] = l->v[0];
 		u.dst[1] = l->v[1];
+		#endif
 		return u.tmpf;
 	#endif
 	}
@@ -944,7 +960,7 @@ namespace nanojit
 					return insImm(0);
 				}
 			}
-			else if (c == -1 || c == 1 && oprnd1->isCmp()) {
+			else if (c == -1 || (c == 1 && oprnd1->isCmp())) {
 				if (v == LIR_or) {
 					// x | -1 = -1, cmp | 1 = 1
 					return oprnd2;
@@ -970,14 +986,18 @@ namespace nanojit
 	{
 		if (v == LIR_xt || v == LIR_xf) {
 			if (c->isconst()) {
-				if (v == LIR_xt && !c->constval() || v == LIR_xf && c->constval()) {
+				if ((v == LIR_xt && !c->constval()) || (v == LIR_xf && c->constval())) {
 					return 0; // no guard needed
 				}
 				else {
-					// need a way to EOT now, since this is trace end.
 #ifdef JS_TRACER
-				    NanoAssertMsg(0, "need a way to EOT now, since this is trace end");
-#endif				    
+					// We're emitting a guard that will always fail. Any code
+					// emitted after this guard is dead code. We could
+					// silently optimize out the rest of the emitted code, but
+					// this could indicate a performance problem or other bug,
+					// so assert in debug builds.
+					NanoAssertMsg(0, "Constantly false guard detected");
+#endif
 					return out->insGuard(LIR_x, out->insImm(1), x);
 				}
 			}
@@ -1883,6 +1903,7 @@ namespace nanojit
 			case LIR_xt:
 			case LIR_xf:
 			case LIR_xbarrier:
+			case LIR_xtbl:
 				formatGuard(i, s);
 				break;
 

@@ -45,7 +45,6 @@
 #ifdef JS_TRACER
 
 #include "jscntxt.h"
-#include "jsstddef.h"
 #include "jstypes.h"
 #include "jslock.h"
 #include "jsnum.h"
@@ -171,26 +170,18 @@ extern bool js_verboseDebug;
 #define ORACLE_SIZE 4096
 
 class Oracle {
-    uint32_t hits[ORACLE_SIZE];
-    uint32_t blacklistLevels[ORACLE_SIZE];
     avmplus::BitSet _stackDontDemote;
     avmplus::BitSet _globalDontDemote;
 public:
     Oracle();
-    int32_t hit(const void* ip);
-    int32_t getHits(const void* ip);
-    void resetHits(const void* ip);
-    void blacklist(const void* ip);
 
     JS_REQUIRES_STACK void markGlobalSlotUndemotable(JSContext* cx, unsigned slot);
     JS_REQUIRES_STACK bool isGlobalSlotUndemotable(JSContext* cx, unsigned slot) const;
     JS_REQUIRES_STACK void markStackSlotUndemotable(JSContext* cx, unsigned slot);
     JS_REQUIRES_STACK bool isStackSlotUndemotable(JSContext* cx, unsigned slot) const;
-    void clearHitCounts();
     void clearDemotability();
     void clear() {
         clearDemotability();
-        clearHitCounts();
     }
 };
 
@@ -206,10 +197,40 @@ public:
 };
 
 enum ExitType {
+    /*
+     * An exit at a possible branch-point in the trace at which to attach a
+     * future secondary trace. Therefore the recorder must generate different
+     * code to handle the other outcome of the branch condition from the
+     * primary trace's outcome.
+     */
     BRANCH_EXIT,
+
+    /*
+     * Exit at a tableswitch via a numbered case.
+     */
+    CASE_EXIT,
+
+    /*
+     * Exit at a tableswitch via the default case.
+     */
+    DEFAULT_EXIT,
+
     LOOP_EXIT,
     NESTED_EXIT,
+
+    /*
+     * An exit from a trace because a condition relied upon at recording time
+     * no longer holds, where the alternate path of execution is so rare or
+     * difficult to address in native code that it is not traced at all, e.g.
+     * negative array index accesses, which differ from positive indexes in
+     * that they require a string-based property lookup rather than a simple
+     * memory access.
+     */
     MISMATCH_EXIT,
+
+    /*
+     * A specialization of MISMATCH_EXIT to handle allocation failures.
+     */
     OOM_EXIT,
     OVERFLOW_EXIT,
     UNSTABLE_LOOP_EXIT,
@@ -221,7 +242,8 @@ enum ExitType {
 struct VMSideExit : public nanojit::SideExit
 {
     JSObject* block;
-    intptr_t ip_adj;
+    jsbytecode* pc;
+    jsbytecode* imacpc;
     intptr_t sp_adj;
     intptr_t rp_adj;
     int32_t calldepth;
@@ -249,7 +271,8 @@ static inline uint8* getFullTypeMap(nanojit::SideExit* exit)
 struct FrameInfo {
     JSObject*       callee;     // callee function object
     JSObject*       block;      // caller block chain head
-    intptr_t        ip_adj;     // caller script-based pc index and imacro pc
+    jsbytecode*     pc;         // caller fp->regs->pc
+    jsbytecode*     imacpc;     // caller fp->imacpc
     union {
         struct {
             uint16  spdist;     // distance from fp->slots to fp->regs->sp at JSOP_CALL
@@ -277,10 +300,18 @@ public:
     unsigned                nStackTypes;
     uint32                  globalShape;
     SlotList*               globalSlots;
+    /* Dependent trees must be trashed if this tree dies, and updated on missing global types */
     Queue<nanojit::Fragment*> dependentTrees;
+    /* Linked trees must be updated on missing global types, but are not dependent */
+    Queue<nanojit::Fragment*> linkedTrees;
     unsigned                branchCount;
     Queue<VMSideExit*>      sideExits;
     UnstableExit*           unstableExits;
+#ifdef DEBUG
+    const char*             treeFileName;
+    uintN                   treeLineNumber;
+    uintN                   treePCOffset;
+#endif
 
     TreeInfo(nanojit::Fragment* _fragment,
              uint32 _globalShape,
@@ -296,6 +327,7 @@ public:
         branchCount(0),
         unstableExits(NULL)
             {}
+    ~TreeInfo();
 
     inline unsigned nGlobalTypes() {
         return typeMap.length() - nStackTypes;
@@ -382,10 +414,11 @@ class TraceRecorder : public avmplus::GCObject {
     jsval*                  global_dslots;
     JSTraceableNative*      pendingTraceableNative;
     bool                    terminate;
-    intptr_t                terminate_ip_adj;
-    nanojit::Fragment*      outerToBlacklist;
+    jsbytecode*             terminate_pc;
+    jsbytecode*             terminate_imacpc;
     TraceRecorder*          nextRecorderToAbort;
     bool                    wasRootFragment;
+    jsbytecode*             outer;
 
     bool isGlobal(jsval* p) const;
     ptrdiff_t nativeGlobalOffset(jsval* p) const;
@@ -396,6 +429,7 @@ class TraceRecorder : public avmplus::GCObject {
                                   unsigned callDepth, unsigned ngslots, uint8* typeMap);
     void trackNativeStackUse(unsigned slots);
 
+    JS_REQUIRES_STACK bool isValidSlot(JSScope* scope, JSScopeProperty* sprop);
     JS_REQUIRES_STACK bool lazilyImportGlobalSlot(unsigned slot);
 
     JS_REQUIRES_STACK nanojit::LIns* guard(bool expected, nanojit::LIns* cond,
@@ -440,6 +474,9 @@ class TraceRecorder : public avmplus::GCObject {
 
     JS_REQUIRES_STACK bool ifop();
     JS_REQUIRES_STACK bool switchop();
+#ifdef NANOJIT_IA32
+    JS_REQUIRES_STACK nanojit::LIns* tableswitch();
+#endif
     JS_REQUIRES_STACK bool inc(jsval& v, jsint incr, bool pre = true);
     JS_REQUIRES_STACK bool inc(jsval& v, nanojit::LIns*& v_ins, jsint incr, bool pre = true);
     JS_REQUIRES_STACK bool incProp(jsint incr, bool pre = true);
@@ -493,7 +530,7 @@ class TraceRecorder : public avmplus::GCObject {
     JS_REQUIRES_STACK void box_jsval(jsval v, nanojit::LIns*& v_ins);
     JS_REQUIRES_STACK void unbox_jsval(jsval v, nanojit::LIns*& v_ins);
     JS_REQUIRES_STACK bool guardClass(JSObject* obj, nanojit::LIns* obj_ins, JSClass* clasp,
-                                      ExitType exitType = MISMATCH_EXIT);
+                                      nanojit::LIns* exit);
     JS_REQUIRES_STACK bool guardDenseArray(JSObject* obj, nanojit::LIns* obj_ins,
                                            ExitType exitType = MISMATCH_EXIT);
     JS_REQUIRES_STACK bool guardDenseArrayIndex(JSObject* obj, jsint idx, nanojit::LIns* obj_ins,
@@ -520,7 +557,7 @@ public:
     JS_REQUIRES_STACK
     TraceRecorder(JSContext* cx, VMSideExit*, nanojit::Fragment*, TreeInfo*,
                   unsigned stackSlots, unsigned ngslots, uint8* typeMap,
-                  VMSideExit* expectedInnerExit, nanojit::Fragment* outerToBlacklist);
+                  VMSideExit* expectedInnerExit, jsbytecode* outerTree);
     ~TraceRecorder();
 
     static JS_REQUIRES_STACK JSMonitorRecordingStatus monitorRecording(JSContext* cx, TraceRecorder* tr, JSOp op);
@@ -528,6 +565,7 @@ public:
     JS_REQUIRES_STACK uint8 determineSlotType(jsval* vp);
     JS_REQUIRES_STACK nanojit::LIns* snapshot(ExitType exitType);
     nanojit::Fragment* getFragment() const { return fragment; }
+    TreeInfo* getTreeInfo() const { return treeInfo; }
     JS_REQUIRES_STACK bool isLoopHeader(JSContext* cx) const;
     JS_REQUIRES_STACK void compile(JSTraceMonitor* tm);
     JS_REQUIRES_STACK bool closeLoop(JSTraceMonitor* tm, bool& demote);
@@ -552,7 +590,6 @@ public:
     JS_REQUIRES_STACK bool record_DefLocalFunSetSlot(uint32 slot, JSObject* obj);
     JS_REQUIRES_STACK bool record_FastNativeCallComplete();
 
-    nanojit::Fragment* getOuterToBlacklist() { return outerToBlacklist; }
     void deepAbort() { deepAborted = true; }
     bool wasDeepAborted() { return deepAborted; }
     bool walkedOutOfLoop() { return terminate; }
@@ -620,23 +657,5 @@ js_GetBuiltinFunction(JSContext *cx, uintN index);
 #define TRACE_2(x,a,b)          ((void)0)
 
 #endif /* !JS_TRACER */
-
-static JS_INLINE JS_FORCES_STACK void
-js_LeaveTrace(JSContext *cx)
-{
-    if (JS_ON_TRACE(cx))
-        js_GetTopStackFrame(cx);
-}
-
-static JS_INLINE bool
-js_CanLeaveTrace(JSContext *cx)
-{
-    JS_ASSERT(JS_ON_TRACE(cx));
-#ifdef JS_TRACER
-    return cx->bailExit;
-#else
-    return false;
-#endif
-}
 
 #endif /* jstracer_h___ */

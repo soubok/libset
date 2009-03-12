@@ -41,7 +41,6 @@
 /*
  * JS bytecode generation.
  */
-#include "jsstddef.h"
 #ifdef HAVE_MEMORY_H
 #include <memory.h>
 #endif
@@ -126,7 +125,7 @@ EmitCheck(JSContext *cx, JSCodeGenerator *cg, JSOp op, ptrdiff_t delta)
     base = CG_BASE(cg);
     next = CG_NEXT(cg);
     limit = CG_LIMIT(cg);
-    offset = PTRDIFF(next, base, jsbytecode);
+    offset = next - base;
     if (next + delta > limit) {
         length = offset + delta;
         length = (length <= BYTECODE_CHUNK)
@@ -136,7 +135,7 @@ EmitCheck(JSContext *cx, JSCodeGenerator *cg, JSOp op, ptrdiff_t delta)
         if (!base) {
             JS_ARENA_ALLOCATE_CAST(base, jsbytecode *, cg->codePool, incr);
         } else {
-            size = BYTECODE_SIZE(PTRDIFF(limit, base, jsbytecode));
+            size = BYTECODE_SIZE(limit - base);
             incr -= size;
             JS_ARENA_GROW_CAST(base, jsbytecode *, cg->codePool, size, incr);
         }
@@ -557,8 +556,8 @@ AddSpanDep(JSContext *cx, JSCodeGenerator *cg, jsbytecode *pc, jsbytecode *pc2,
 
     cg->numSpanDeps = index + 1;
     sd = cg->spanDeps + index;
-    sd->top = PTRDIFF(pc, CG_BASE(cg), jsbytecode);
-    sd->offset = sd->before = PTRDIFF(pc2, CG_BASE(cg), jsbytecode);
+    sd->top = pc - CG_BASE(cg);
+    sd->offset = sd->before = pc2 - CG_BASE(cg);
 
     if (js_CodeSpec[*pc].format & JOF_BACKPATCH) {
         /* Jump offset will be backpatched if off is a non-zero "bpdelta". */
@@ -673,7 +672,7 @@ GetSpanDep(JSCodeGenerator *cg, jsbytecode *pc)
     if (index != SPANDEP_INDEX_HUGE)
         return cg->spanDeps + index;
 
-    offset = PTRDIFF(pc, CG_BASE(cg), jsbytecode);
+    offset = pc - CG_BASE(cg);
     lo = 0;
     hi = cg->numSpanDeps - 1;
     while (lo <= hi) {
@@ -910,7 +909,7 @@ OptimizeSpanDeps(JSContext *cx, JSCodeGenerator *cg)
         next = base + length;
         if (next > limit) {
             JS_ASSERT(length > BYTECODE_CHUNK);
-            size = BYTECODE_SIZE(PTRDIFF(limit, base, jsbytecode));
+            size = BYTECODE_SIZE(limit - base);
             incr = BYTECODE_SIZE(length) - size;
             JS_ARENA_GROW_CAST(base, jsbytecode *, cg->codePool, size, incr);
             if (!base) {
@@ -1429,7 +1428,7 @@ BackPatch(JSContext *cx, JSCodeGenerator *cg, ptrdiff_t last,
     stop = CG_CODE(cg, -1);
     while (pc != stop) {
         delta = GetJumpOffset(cg, pc);
-        span = PTRDIFF(target, pc, jsbytecode);
+        span = target - pc;
         CHECK_AND_SET_JUMP_OFFSET(cx, cg, pc, span);
 
         /*
@@ -4169,6 +4168,8 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
         if (jmp < 0)
             return JS_FALSE;
         top = CG_OFFSET(cg);
+        if (!js_Emit1(cx, cg, JSOP_LOOP))
+            return JS_FALSE;
         if (!js_EmitTree(cx, cg, pn->pn_right))
             return JS_FALSE;
         CHECK_AND_SET_JUMP_OFFSET_AT(cx, cg, jmp);
@@ -4190,6 +4191,8 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
 
         /* Compile the loop body. */
         top = CG_OFFSET(cg);
+        if (!js_Emit1(cx, cg, JSOP_LOOP))
+            return JS_FALSE;
         js_PushStatement(&cg->treeContext, &stmtInfo, STMT_DO_LOOP, top);
         if (!js_EmitTree(cx, cg, pn->pn_left))
             return JS_FALSE;
@@ -4287,6 +4290,8 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
 
             top = CG_OFFSET(cg);
             SET_STATEMENT_TOP(&stmtInfo, top);
+            if (!js_Emit1(cx, cg, JSOP_LOOP))
+                return JS_FALSE;
 
 #ifdef DEBUG
             intN loopDepth = cg->stackDepth;
@@ -4515,6 +4520,8 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
             SET_STATEMENT_TOP(&stmtInfo, top);
 
             /* Emit code for the loop body. */
+            if (!js_Emit1(cx, cg, JSOP_LOOP))
+                return JS_FALSE;
             if (!js_EmitTree(cx, cg, pn->pn_right))
                 return JS_FALSE;
 
@@ -5802,6 +5809,8 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
         if (jmp < 0)
             return JS_FALSE;
         top = CG_OFFSET(cg);
+        if (!js_Emit1(cx, cg, JSOP_LOOP))
+            return JS_FALSE;
         if (!js_EmitTree(cx, cg, pn->pn_right))
             return JS_FALSE;
         CHECK_AND_SET_JUMP_OFFSET_AT(cx, cg, jmp);
@@ -6670,7 +6679,7 @@ js_SetSrcNoteOffset(JSContext *cx, JSCodeGenerator *cg, uintN index,
         /* Maybe this offset was already set to a three-byte value. */
         if (!(*sn & SN_3BYTE_OFFSET_FLAG)) {
             /* Losing, need to insert another two bytes for this offset. */
-            index = PTRDIFF(sn, CG_NOTES(cg), jssrcnote);
+            index = sn - CG_NOTES(cg);
 
             /*
              * Simultaneously test to see if the source note array must grow to

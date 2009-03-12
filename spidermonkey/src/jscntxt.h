@@ -577,15 +577,6 @@ struct JSRuntime {
     jsuword             nativeEnumCache[NATIVE_ENUM_CACHE_SIZE];
 
     /*
-     * Runtime-wide flag set to true when any Array prototype has an indexed
-     * property defined on it, creating a hazard for code reading or writing
-     * over a hole from a dense Array instance that is not prepared to look up
-     * the proto chain (the writing case must involve a check for a read-only
-     * element, which cannot be shadowed).
-     */
-    JSBool              anyArrayProtoHasElement;
-
-    /*
      * Various metering fields are defined at the end of JSRuntime. In this
      * way there is no need to recompile all the code that refers to other
      * fields of JSRuntime after enabling the corresponding metering macro.
@@ -778,12 +769,7 @@ typedef struct JSLocalRootStack {
  * bits. This is how, for example, js_GetGCThingTraceKind uses its |thing|
  * parameter -- it consults GC-thing flags stored separately from the thing to
  * decide the kind of thing.
- *
- * The following checks that this type-punning is possible.
  */
-JS_STATIC_ASSERT(sizeof(JSTempValueUnion) == sizeof(jsval));
-JS_STATIC_ASSERT(sizeof(JSTempValueUnion) == sizeof(void *));
-
 #define JS_PUSH_TEMP_ROOT_COMMON(cx,x,tvr,cnt,kind)                           \
     JS_BEGIN_MACRO                                                            \
         JS_ASSERT((cx)->tempValueRooters != (tvr));                           \
@@ -1003,9 +989,6 @@ struct JSContext {
 
     /* Stored here to avoid passing it around as a parameter. */
     uintN               resolveFlags;
-    
-    /* Current bytecode location (or NULL if no hint was supplied). */
-    jsbytecode         *pcHint;
 
 #ifdef JS_TRACER
     /*
@@ -1024,9 +1007,6 @@ struct JSContext {
     uint32              builtinStatus;
 #endif
 };
-
-#define BEGIN_PC_HINT(pc)       (cx->pcHint = (pc))
-#define END_PC_HINT()           (cx->pcHint = NULL)
 
 #ifdef JS_THREADSAFE
 # define JS_THREAD_ID(cx)       ((cx)->thread ? (cx)->thread->id : 0)
@@ -1050,7 +1030,7 @@ class JSAutoTempValueRooter
         : mContext(cx) {
         JS_PUSH_TEMP_ROOT(mContext, len, vec, &mTvr);
     }
-    JSAutoTempValueRooter(JSContext *cx, jsval v)
+    explicit JSAutoTempValueRooter(JSContext *cx, jsval v = JSVAL_NULL)
         : mContext(cx) {
         JS_PUSH_SINGLE_TEMP_ROOT(mContext, v, &mTvr);
     }
@@ -1063,6 +1043,9 @@ class JSAutoTempValueRooter
         JS_POP_TEMP_ROOT(mContext, &mTvr);
     }
 
+    jsval value() { return mTvr.u.value; }
+    jsval * addr() { return &mTvr.u.value; }
+
   protected:
     JSContext *mContext;
 
@@ -1072,6 +1055,26 @@ class JSAutoTempValueRooter
     static void operator delete(void *, size_t);
 #endif
 
+    JSTempValueRooter mTvr;
+};
+
+class JSAutoTempIdRooter
+{
+public:
+    explicit JSAutoTempIdRooter(JSContext *cx, jsid id = INT_TO_JSID(0))
+        : mContext(cx) {
+        JS_PUSH_SINGLE_TEMP_ROOT(mContext, ID_TO_VALUE(id), &mTvr);
+    }
+
+    ~JSAutoTempIdRooter() {
+        JS_POP_TEMP_ROOT(mContext, &mTvr);
+    }
+
+    jsid id() { return (jsid) mTvr.u.value; }
+    jsid * addr() { return (jsid *) &mTvr.u.value; }
+
+private:
+    JSContext *mContext;
     JSTempValueRooter mTvr;
 };
 
@@ -1378,17 +1381,53 @@ extern JSErrorFormatString js_ErrorFormatString[JSErr_Limit];
 extern JSBool
 js_InvokeOperationCallback(JSContext *cx);
 
+extern JSStackFrame *
+js_GetScriptedCaller(JSContext *cx, JSStackFrame *fp);
+
+#ifdef JS_TRACER
+/*
+ * Reconstruct the JS stack and clear cx->onTrace. We must be currently
+ * executing a _FAIL builtin from trace on cx. The machine code for the trace
+ * remains on the C stack when js_DeepBail returns.
+ *
+ * Implemented in jstracer.cpp.
+ */
+JS_FORCES_STACK JS_FRIEND_API(void)
+js_DeepBail(JSContext *cx);
+#endif
+
+static JS_FORCES_STACK JS_INLINE void
+js_LeaveTrace(JSContext *cx)
+{
+#ifdef JS_TRACER
+    if (JS_ON_TRACE(cx))
+        js_DeepBail(cx);
+#endif
+}
+
+static JS_INLINE JSBool
+js_CanLeaveTrace(JSContext *cx)
+{
+    JS_ASSERT(JS_ON_TRACE(cx));
+#ifdef JS_TRACER
+    return cx->bailExit != NULL;
+#else
+    return JS_FALSE;
+#endif
+}
+
 /*
  * Get the current cx->fp, first lazily instantiating stack frames if needed.
  * (Do not access cx->fp directly except in JS_REQUIRES_STACK code.)
  *
  * Defined in jstracer.cpp if JS_TRACER is defined.
  */
-extern JS_FORCES_STACK JSStackFrame *
-js_GetTopStackFrame(JSContext *cx);
-
-extern JSStackFrame *
-js_GetScriptedCaller(JSContext *cx, JSStackFrame *fp);
+static JS_FORCES_STACK JS_INLINE JSStackFrame *
+js_GetTopStackFrame(JSContext *cx)
+{
+    js_LeaveTrace(cx);
+    return cx->fp;
+}
 
 JS_END_EXTERN_C
 

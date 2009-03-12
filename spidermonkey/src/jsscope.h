@@ -211,10 +211,6 @@ struct JSScope {
     JSScopeProperty *lastProp;          /* pointer to last property added */
 };
 
-#ifdef JS_THREADSAFE
-JS_STATIC_ASSERT(offsetof(JSScope, title) == sizeof(JSObjectMap));
-#endif
-
 #define JS_IS_SCOPE_LOCKED(cx, scope)   JS_IS_TITLE_LOCKED(cx, &(scope)->title)
 
 #define OBJ_SCOPE(obj)                  ((JSScope *)(obj)->map)
@@ -240,10 +236,13 @@ JS_STATIC_ASSERT(offsetof(JSScope, title) == sizeof(JSObjectMap));
 #define SCOPE_MIDDLE_DELETE             0x0001
 #define SCOPE_SEALED                    0x0002
 #define SCOPE_BRANDED                   0x0004
+#define SCOPE_INDEXED_PROPERTIES        0x0008
 
 #define SCOPE_HAD_MIDDLE_DELETE(scope)  ((scope)->flags & SCOPE_MIDDLE_DELETE)
 #define SCOPE_SET_MIDDLE_DELETE(scope)  ((scope)->flags |= SCOPE_MIDDLE_DELETE)
 #define SCOPE_CLR_MIDDLE_DELETE(scope)  ((scope)->flags &= ~SCOPE_MIDDLE_DELETE)
+#define SCOPE_HAS_INDEXED_PROPERTIES(scope)  ((scope)->flags & SCOPE_INDEXED_PROPERTIES)
+#define SCOPE_SET_INDEXED_PROPERTIES(scope)  ((scope)->flags |= SCOPE_INDEXED_PROPERTIES)
 
 #define SCOPE_IS_SEALED(scope)          ((scope)->flags & SCOPE_SEALED)
 #define SCOPE_SET_SEALED(scope)         ((scope)->flags |= SCOPE_SEALED)
@@ -271,6 +270,27 @@ JS_STATIC_ASSERT(offsetof(JSScope, title) == sizeof(JSObjectMap));
 #define SCOPE_LAST_PROP(scope)          ((scope)->lastProp)
 #define SCOPE_REMOVE_LAST_PROP(scope)   ((scope)->lastProp =                  \
                                          (scope)->lastProp->parent)
+/*
+ * Helpers for reinterpreting JSPropertyOp as JSObject* for scripted getters
+ * and setters.
+ */
+static inline JSObject *
+js_CastAsObject(JSPropertyOp op)
+{
+    return JS_FUNC_TO_DATA_PTR(JSObject *, op);
+}
+
+static inline jsval
+js_CastAsObjectJSVal(JSPropertyOp op)
+{
+    return OBJECT_TO_JSVAL(JS_FUNC_TO_DATA_PTR(JSObject *, op));
+}
+
+static inline JSPropertyOp
+js_CastAsPropertyOp(JSObject *object)
+{
+    return JS_DATA_TO_FUNC_PTR(JSPropertyOp, object);
+}
 
 struct JSScopeProperty {
     jsid            id;                 /* int-tagged jsval/untagged JSAtom* */
@@ -329,13 +349,13 @@ struct JSScopeProperty {
 #define SPROP_HAS_STUB_SETTER(sprop)    (!(sprop)->setter)
 
 static JS_INLINE JSBool
-SPROP_GET(JSContext* cx, JSScopeProperty* sprop, JSObject* obj, JSObject* obj2, jsval* vp)
+js_GetSprop(JSContext* cx, JSScopeProperty* sprop, JSObject* obj, jsval* vp)
 {
     JS_ASSERT(!SPROP_HAS_STUB_GETTER(sprop));
 
     if (sprop->attrs & JSPROP_GETTER) {
-        return js_InternalGetOrSet(cx, obj, sprop->id,
-                                   OBJECT_TO_JSVAL((JSObject *) sprop->getter), JSACC_READ,
+        jsval fval = js_CastAsObjectJSVal(sprop->getter);
+        return js_InternalGetOrSet(cx, obj, sprop->id, fval, JSACC_READ,
                                    0, 0, vp);
     }
 
@@ -343,15 +363,15 @@ SPROP_GET(JSContext* cx, JSScopeProperty* sprop, JSObject* obj, JSObject* obj2, 
 }
 
 static JS_INLINE JSBool
-SPROP_SET(JSContext* cx, JSScopeProperty* sprop, JSObject* obj, JSObject* obj2, jsval* vp)
+js_SetSprop(JSContext* cx, JSScopeProperty* sprop, JSObject* obj, jsval* vp)
 {
     JS_ASSERT(!(SPROP_HAS_STUB_SETTER(sprop) &&
                 !(sprop->attrs & JSPROP_GETTER)));
 
     if (sprop->attrs & JSPROP_SETTER) {
-        return js_InternalGetOrSet(cx, obj, (sprop)->id,
-                                   OBJECT_TO_JSVAL((JSObject *) sprop->setter),
-                                   JSACC_WRITE, 1, vp, vp);
+        jsval fval = js_CastAsObjectJSVal(sprop->setter);
+        return js_InternalGetOrSet(cx, obj, (sprop)->id, fval, JSACC_WRITE,
+                                   1, vp, vp);
     }
 
     if (sprop->attrs & JSPROP_GETTER) {

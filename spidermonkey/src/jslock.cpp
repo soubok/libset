@@ -42,7 +42,6 @@
 /*
  * JS locking stubs.
  */
-#include "jsstddef.h"
 #include <stdlib.h>
 #include <string.h>
 #include "jspubtd.h"
@@ -56,6 +55,11 @@
 #include "jslock.h"
 #include "jsscope.h"
 #include "jsstr.h"
+
+/*
+ * Check that we can cast the data after JSObjectMap as JSTitle.
+ */
+JS_STATIC_ASSERT(offsetof(JSScope, title) == sizeof(JSObjectMap));
 
 #define ReadWord(W) (W)
 
@@ -485,7 +489,7 @@ js_NudgeThread(JSContext *cx, JSThread *thread)
     JSContext *acx = NULL;
     
     while ((acx = js_NextActiveContext(rt, acx)) != NULL) {
-        if (cx != acx && cx->thread == thread)
+        if (cx != acx && acx->thread == thread)
             JS_TriggerOperationCallback(acx);
     }
 }
