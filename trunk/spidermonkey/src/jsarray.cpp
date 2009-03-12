@@ -41,7 +41,7 @@
 /*
  * JS array class.
  *
- * Array objects begin as "dense" arrays, optimized for numeric-only property
+ * Array objects begin as "dense" arrays, optimized for index-only property
  * access over a vector of slots (obj->dslots) with high load factor.  Array
  * methods optimize for denseness by testing that the object's class is
  * &js_ArrayClass, and can then directly manipulate the slots for efficiency.
@@ -49,7 +49,7 @@
  * We track these pieces of metadata for arrays in dense mode:
  *  - the array's length property as a uint32, in JSSLOT_ARRAY_LENGTH,
  *  - the number of indices that are filled (non-holes), in JSSLOT_ARRAY_COUNT,
- *  - the net number of slots starting at dslots (DENSELEN), in dslots[-1] if
+ *  - the net number of slots starting at dslots (capacity), in dslots[-1] if
  *    dslots is non-NULL.
  *
  * In dense mode, holes in the array are represented by JSVAL_HOLE.  The final
@@ -58,24 +58,19 @@
  *
  * Arrays are converted to use js_SlowArrayClass when any of these conditions
  * are met:
- *  - the load factor (COUNT / DENSELEN) is less than 0.25, and there are
+ *  - the load factor (COUNT / capacity) is less than 0.25, and there are
  *    more than MIN_SPARSE_INDEX slots total
- *  - a property is set that is non-numeric (and not "length"); or
- *  - a hole is filled below DENSELEN (possibly implicitly through methods like
- *    |reverse| or |splice|).
+ *  - a property is set that is not indexed (and not "length"); or
+ *  - a property is defined that has non-default property attributes.
  *
- * In the latter two cases, property creation order is no longer index order,
- * which necessitates use of a structure that keeps track of property creation
- * order.  (ES4, due to expectations baked into web script, requires that
- * enumeration order be the order in which properties were created.)
- *
- * An alternative in the latter case (out-of-order index set) would be to
- * maintain the scope to track property enumeration order, but still use
- * the fast slot access.  That would have the same memory cost as just using
- * a js_SlowArrayClass, but have the same performance characteristics as
- * a dense array for slot accesses, at some cost in code complexity.
+ * Dense arrays do not track property creation order, so unlike other native
+ * objects and slow arrays, enumerating an array does not necessarily visit the
+ * properties in the order they were created.  We could instead maintain the
+ * scope to track property enumeration order, but still use the fast slot
+ * access.  That would have the same memory cost as just using a
+ * js_SlowArrayClass, but have the same performance characteristics as a dense
+ * array for slot accesses, at some cost in code complexity.
  */
-#include "jsstddef.h"
 #include <stdlib.h>
 #include <string.h>
 #include "jstypes.h"
@@ -105,12 +100,12 @@
 #define MAXSTR   "4294967295"
 
 /* Small arrays are dense, no matter what. */
-#define MIN_SPARSE_INDEX 32
+#define MIN_SPARSE_INDEX 256
 
 #define INDEX_TOO_BIG(index) ((index) > JS_BIT(29) - 1)
 #define INDEX_TOO_SPARSE(array, index)                                         \
     (INDEX_TOO_BIG(index) ||                                                   \
-     ((index) > ARRAY_DENSE_LENGTH(array) && (index) >= MIN_SPARSE_INDEX &&    \
+     ((index) > js_DenseArrayCapacity(array) && (index) >= MIN_SPARSE_INDEX && \
       (index) > (uint32)((array)->fslots[JSSLOT_ARRAY_COUNT] + 1) * 4))
 
 JS_STATIC_ASSERT(sizeof(JSScopeProperty) > 4 * sizeof(jsval));
@@ -312,11 +307,11 @@ BigIndexToId(JSContext *cx, JSObject *obj, jsuint index, JSBool createAtom,
 }
 
 static JSBool
-ResizeSlots(JSContext *cx, JSObject *obj, uint32 oldlen, uint32 len)
+ResizeSlots(JSContext *cx, JSObject *obj, uint32 oldsize, uint32 size)
 {
     jsval *slots, *newslots;
 
-    if (len == 0) {
+    if (size == 0) {
         if (obj->dslots) {
             JS_free(cx, obj->dslots - 1);
             obj->dslots = NULL;
@@ -324,33 +319,66 @@ ResizeSlots(JSContext *cx, JSObject *obj, uint32 oldlen, uint32 len)
         return JS_TRUE;
     }
 
-    if (len > ~(uint32)0 / sizeof(jsval)) {
+    if (size > ~(uint32)0 / sizeof(jsval)) {
         js_ReportAllocationOverflow(cx);
         return JS_FALSE;
     }
 
     slots = obj->dslots ? obj->dslots - 1 : NULL;
-    newslots = (jsval *) JS_realloc(cx, slots, sizeof (jsval) * (len + 1));
+    newslots = (jsval *) JS_realloc(cx, slots, sizeof (jsval) * (size + 1));
     if (!newslots)
         return JS_FALSE;
 
     obj->dslots = newslots + 1;
-    ARRAY_SET_DENSE_LENGTH(obj, len);
+    js_SetDenseArrayCapacity(obj, size);
 
-    for (slots = obj->dslots + oldlen; slots < obj->dslots + len; slots++)
+    for (slots = obj->dslots + oldsize; slots < obj->dslots + size; slots++)
         *slots = JSVAL_HOLE;
 
     return JS_TRUE;
 }
 
-static JSBool
-EnsureLength(JSContext *cx, JSObject *obj, uint32 len)
-{
-    uint32 oldlen = ARRAY_DENSE_LENGTH(obj);
+/*
+ * When a dense array with CAPACITY_DOUBLING_MAX or fewer slots needs to grow,
+ * double its capacity, to push() N elements in amortized O(N) time.
+ *
+ * Above this limit, grow by 12.5% each time. Speed is still amortized O(N),
+ * with a higher constant factor, and we waste less space.
+ */
+#define CAPACITY_DOUBLING_MAX    (1024 * 1024)
 
-    if (len > oldlen) {
-        return ResizeSlots(cx, obj, oldlen,
-                           len + ARRAY_GROWBY - (len % ARRAY_GROWBY));
+/*
+ * Round up all large allocations to a multiple of this (1MB), so as not to
+ * waste space if malloc gives us 1MB-sized chunks (as jemalloc does).
+ */
+#define CAPACITY_CHUNK  (1024 * 1024 / sizeof(jsval))
+
+static JSBool
+EnsureCapacity(JSContext *cx, JSObject *obj, uint32 capacity)
+{
+    uint32 oldsize = js_DenseArrayCapacity(obj);
+
+    if (capacity > oldsize) {
+        /*
+         * If this overflows uint32, capacity is very large. nextsize will end
+         * up being less than capacity, the code below will thus disregard it,
+         * and ResizeSlots will fail.
+         *
+         * The way we use dslots[-1] forces a few +1s and -1s here. For
+         * example, (oldsize * 2 + 1) produces the sequence 7, 15, 31, 63, ...
+         * which makes the total allocation size (with dslots[-1]) a power
+         * of two.
+         */
+        uint32 nextsize = (oldsize <= CAPACITY_DOUBLING_MAX)
+                          ? oldsize * 2 + 1
+                          : oldsize + (oldsize >> 3);
+
+        capacity = JS_MAX(capacity, nextsize);
+        if (capacity >= CAPACITY_CHUNK)
+            capacity = JS_ROUNDUP(capacity + 1, CAPACITY_CHUNK) - 1;  /* -1 for dslots[-1] */
+        else if (capacity < ARRAY_CAPACITY_MIN)
+            capacity = ARRAY_CAPACITY_MIN;
+        return ResizeSlots(cx, obj, oldsize, capacity);
     }
     return JS_TRUE;
 }
@@ -369,7 +397,7 @@ GetArrayElement(JSContext *cx, JSObject *obj, jsuint index, JSBool *hole,
     JSObject *obj2;
     JSProperty *prop;
 
-    if (OBJ_IS_DENSE_ARRAY(cx, obj) && index < ARRAY_DENSE_LENGTH(obj) &&
+    if (OBJ_IS_DENSE_ARRAY(cx, obj) && index < js_DenseArrayCapacity(obj) &&
         (*vp = obj->dslots[index]) != JSVAL_HOLE) {
         *hole = JS_FALSE;
         return JS_TRUE;
@@ -412,7 +440,7 @@ SetArrayElement(JSContext *cx, JSObject *obj, jsuint index, jsval v)
     if (OBJ_IS_DENSE_ARRAY(cx, obj)) {
         /* Predicted/prefeched code should favor the remains-dense case. */
         if (!INDEX_TOO_SPARSE(obj, index)) {
-            if (!EnsureLength(cx, obj, index + 1))
+            if (!EnsureCapacity(cx, obj, index + 1))
                 return JS_FALSE;
             if (index >= (uint32)obj->fslots[JSSLOT_ARRAY_LENGTH])
                 obj->fslots[JSSLOT_ARRAY_LENGTH] = index + 1;
@@ -443,7 +471,7 @@ DeleteArrayElement(JSContext *cx, JSObject *obj, jsuint index)
     jsval junk;
 
     if (OBJ_IS_DENSE_ARRAY(cx, obj)) {
-        if (index < ARRAY_DENSE_LENGTH(obj)) {
+        if (index < js_DenseArrayCapacity(obj)) {
             if (obj->dslots[index] != JSVAL_HOLE)
                 obj->fslots[JSSLOT_ARRAY_COUNT]--;
             obj->dslots[index] = JSVAL_HOLE;
@@ -581,7 +609,7 @@ array_length_setter(JSContext *cx, JSObject *obj, jsval id, jsval *vp)
 
     if (OBJ_IS_DENSE_ARRAY(cx, obj)) {
         /* Don't reallocate if we're not actually shrinking our slots. */
-        jsuint oldsize = ARRAY_DENSE_LENGTH(obj);
+        jsuint oldsize = js_DenseArrayCapacity(obj);
         if (oldsize >= newlen && !ResizeSlots(cx, obj, oldsize, newlen))
             return JS_FALSE;
     } else if (oldlen - newlen < (1 << 24)) {
@@ -640,13 +668,13 @@ array_lookupProperty(JSContext *cx, JSObject *obj, jsid id, JSObject **objp,
         return js_LookupProperty(cx, obj, id, objp, propp);
 
     /*
-     * We have only indexed properties up to DENSELEN (excepting holes), plus
+     * We have only indexed properties up to capacity (excepting holes), plus
      * the length property. For all else, we delegate to the prototype.
      */
     if (id != ATOM_TO_JSID(cx->runtime->atomState.lengthAtom) &&
         (!js_IdIsIndex(id, &i) ||
          obj->fslots[JSSLOT_ARRAY_LENGTH] == 0 ||
-         i >= ARRAY_DENSE_LENGTH(obj) ||
+         i >= js_DenseArrayCapacity(obj) ||
          obj->dslots[i] == JSVAL_HOLE))
     {
         JSObject *proto = STOBJ_GET_PROTO(obj);
@@ -697,7 +725,7 @@ array_getProperty(JSContext *cx, JSObject *obj, jsid id, jsval *vp)
     if (!OBJ_IS_DENSE_ARRAY(cx, obj))
         return js_GetProperty(cx, obj, id, vp);
 
-    if (!js_IdIsIndex(ID_TO_VALUE(id), &i) || i >= ARRAY_DENSE_LENGTH(obj) ||
+    if (!js_IdIsIndex(ID_TO_VALUE(id), &i) || i >= js_DenseArrayCapacity(obj) ||
         obj->dslots[i] == JSVAL_HOLE) {
         JSObject *obj2;
         JSProperty *prop;
@@ -783,7 +811,7 @@ array_setProperty(JSContext *cx, JSObject *obj, jsid id, jsval *vp)
         return js_SetProperty(cx, obj, id, vp);
     }
 
-    if (!EnsureLength(cx, obj, i + 1))
+    if (!EnsureCapacity(cx, obj, i + 1))
         return JS_FALSE;
 
     if (i >= (uint32)obj->fslots[JSSLOT_ARRAY_LENGTH])
@@ -794,27 +822,59 @@ array_setProperty(JSContext *cx, JSObject *obj, jsid id, jsval *vp)
     return JS_TRUE;
 }
 
+JSBool
+js_PrototypeHasIndexedProperties(JSContext *cx, JSObject *obj)
+{
+    /*
+     * Walk up the prototype chain and see if this indexed element already
+     * exists. If we hit the end of the prototype chain, it's safe to set the
+     * element on the original object.
+     */
+   while ((obj = JSVAL_TO_OBJECT(obj->fslots[JSSLOT_PROTO])) != NULL) {
+        /*
+         * If the prototype is a non-native object (possibly a dense array), or
+         * a native object (possibly a slow array) that has indexed properties,
+         * return true.
+         */
+        if (!OBJ_IS_NATIVE(obj))
+            return JS_TRUE;
+        if (SCOPE_HAS_INDEXED_PROPERTIES(OBJ_SCOPE(obj)))
+            return JS_TRUE;
+    }
+    return JS_FALSE;
+}
+
 #ifdef JS_TRACER
 JSBool FASTCALL
 js_Array_dense_setelem(JSContext* cx, JSObject* obj, jsint i, jsval v)
 {
     JS_ASSERT(OBJ_IS_DENSE_ARRAY(cx, obj));
 
-    do {
-        jsuint length = ARRAY_DENSE_LENGTH(obj);
-        if ((jsuint)i < length) {
-            if (obj->dslots[i] == JSVAL_HOLE) {
-                if (cx->runtime->anyArrayProtoHasElement)
-                    break;
-                if (i >= obj->fslots[JSSLOT_ARRAY_LENGTH])
-                    obj->fslots[JSSLOT_ARRAY_LENGTH] = i + 1;
-                obj->fslots[JSSLOT_ARRAY_COUNT]++;
-            }
-            obj->dslots[i] = v;
-            return JS_TRUE;
-        }
-    } while (0);
-    return OBJ_SET_PROPERTY(cx, obj, INT_TO_JSID(i), &v);
+    /*
+     * Let the interpreter worry about negative array indexes.
+     */
+    if (i < 0)
+        return JS_FALSE;
+
+    /*
+     * If needed, grow the array as long it remains dense, otherwise fall off trace.
+     */
+    jsuint u = jsuint(i);
+    jsuint capacity = js_DenseArrayCapacity(obj);
+    if ((u >= capacity) && (INDEX_TOO_SPARSE(obj, u) || !EnsureCapacity(cx, obj, u + 1)))
+        return JS_FALSE;
+
+    if (obj->dslots[u] == JSVAL_HOLE) {
+        if (js_PrototypeHasIndexedProperties(cx, obj))
+            return JS_FALSE;
+
+        if (u >= jsuint(obj->fslots[JSSLOT_ARRAY_LENGTH]))
+            obj->fslots[JSSLOT_ARRAY_LENGTH] = u + 1;
+        ++obj->fslots[JSSLOT_ARRAY_COUNT];
+    }
+
+    obj->dslots[u] = v;
+    return JS_TRUE;
 }
 #endif
 
@@ -870,7 +930,7 @@ array_deleteProperty(JSContext *cx, JSObject *obj, jsval id, jsval *rval)
         return JS_TRUE;
     }
 
-    if (js_IdIsIndex(id, &i) && i < ARRAY_DENSE_LENGTH(obj) &&
+    if (js_IdIsIndex(id, &i) && i < js_DenseArrayCapacity(obj) &&
         obj->dslots[i] != JSVAL_HOLE) {
         obj->fslots[JSSLOT_ARRAY_COUNT]--;
         obj->dslots[i] = JSVAL_HOLE;
@@ -945,34 +1005,34 @@ static JSBool
 array_enumerate(JSContext *cx, JSObject *obj, JSIterateOp enum_op,
                 jsval *statep, jsid *idp)
 {
-    uint32 length, i;
+    uint32 capacity, i;
     JSIndexIterState *ii;
 
     switch (enum_op) {
       case JSENUMERATE_INIT:
         JS_ASSERT(OBJ_IS_DENSE_ARRAY(cx, obj));
-        length = ARRAY_DENSE_LENGTH(obj);
+        capacity = js_DenseArrayCapacity(obj);
         if (idp)
             *idp = INT_TO_JSVAL(obj->fslots[JSSLOT_ARRAY_COUNT]);
         ii = NULL;
-        for (i = 0; i != length; ++i) {
+        for (i = 0; i != capacity; ++i) {
             if (obj->dslots[i] == JSVAL_HOLE) {
                 if (!ii) {
                     ii = (JSIndexIterState *)
                          JS_malloc(cx, offsetof(JSIndexIterState, holes) +
-                                   JS_BITMAP_SIZE(length));
+                                   JS_BITMAP_SIZE(capacity));
                     if (!ii)
                         return JS_FALSE;
                     ii->hasHoles = JS_TRUE;
-                    memset(ii->holes, 0, JS_BITMAP_SIZE(length));
+                    memset(ii->holes, 0, JS_BITMAP_SIZE(capacity));
                 }
                 JS_SET_BIT(ii->holes, i);
             }
         }
         if (!ii) {
             /* Array has no holes. */
-            if (length <= PACKED_UINT_PAIR_MASK) {
-                *statep = UINT_PAIR_TO_BOOLEAN_JSVAL(0, length);
+            if (capacity <= PACKED_UINT_PAIR_MASK) {
+                *statep = UINT_PAIR_TO_BOOLEAN_JSVAL(0, capacity);
                 break;
             }
             ii = (JSIndexIterState *)
@@ -982,17 +1042,17 @@ array_enumerate(JSContext *cx, JSObject *obj, JSIterateOp enum_op,
             ii->hasHoles = JS_FALSE;
         }
         ii->index = 0;
-        ii->length = length;
+        ii->length = capacity;
         *statep = (jsval) ii | INDEX_ITER_TAG;
         JS_ASSERT(*statep & JSVAL_INT);
         break;
 
       case JSENUMERATE_NEXT:
         if (JSVAL_TAG(*statep) == JSVAL_BOOLEAN) {
-            BOOLEAN_JSVAL_TO_UINT_PAIR(*statep, i, length);
-            if (i != length) {
+            BOOLEAN_JSVAL_TO_UINT_PAIR(*statep, i, capacity);
+            if (i != capacity) {
                 *idp = INT_TO_JSID(i);
-                *statep = UINT_PAIR_TO_BOOLEAN_JSVAL(i + 1, length);
+                *statep = UINT_PAIR_TO_BOOLEAN_JSVAL(i + 1, capacity);
                 break;
             }
         } else {
@@ -1055,14 +1115,14 @@ array_finalize(JSContext *cx, JSObject *obj)
 static void
 array_trace(JSTracer *trc, JSObject *obj)
 {
-    uint32 length;
+    uint32 capacity;
     size_t i;
     jsval v;
 
     JS_ASSERT(OBJ_IS_DENSE_ARRAY(cx, obj));
 
-    length = ARRAY_DENSE_LENGTH(obj);
-    for (i = 0; i < length; i++) {
+    capacity = js_DenseArrayCapacity(obj);
+    for (i = 0; i < capacity; i++) {
         v = obj->dslots[i];
         if (JSVAL_IS_TRACEABLE(v)) {
             JS_SET_TRACING_INDEX(trc, "array_dslots", i);
@@ -1153,7 +1213,7 @@ JSBool
 js_MakeArraySlow(JSContext *cx, JSObject *obj)
 {
     JSObjectMap *map, *oldmap;
-    uint32 i, length;
+    uint32 i, capacity;
 
     JS_ASSERT(OBJ_GET_CLASS(cx, obj) == &js_ArrayClass);
 
@@ -1163,16 +1223,16 @@ js_MakeArraySlow(JSContext *cx, JSObject *obj)
     if (!map)
         return JS_FALSE;
 
-    length = ARRAY_DENSE_LENGTH(obj);
-    if (length) {
+    capacity = js_DenseArrayCapacity(obj);
+    if (capacity) {
         map->freeslot = STOBJ_NSLOTS(obj) + JS_INITIAL_NSLOTS;
-        obj->dslots[-1] = JS_INITIAL_NSLOTS + length;
+        obj->dslots[-1] = JS_INITIAL_NSLOTS + capacity;
     } else {
         map->freeslot = STOBJ_NSLOTS(obj);
     }
 
     /* Create new properties pointing to existing values in dslots */
-    for (i = 0; i < length; i++) {
+    for (i = 0; i < capacity; i++) {
         jsid id;
         JSScopeProperty *sprop;
 
@@ -1197,10 +1257,12 @@ js_MakeArraySlow(JSContext *cx, JSObject *obj)
      * we can tell when only named properties have been added to a dense array
      * to make it slow-but-not-sparse.
      */
-    length = obj->fslots[JSSLOT_ARRAY_LENGTH];
-    obj->fslots[JSSLOT_ARRAY_COUNT] = INT_FITS_IN_JSVAL(length)
-                                      ? INT_TO_JSVAL(length)
-                                      : JSVAL_VOID;
+    {
+        uint32 length = obj->fslots[JSSLOT_ARRAY_LENGTH];
+        obj->fslots[JSSLOT_ARRAY_COUNT] = INT_FITS_IN_JSVAL(length)
+                                          ? INT_TO_JSVAL(length)
+                                          : JSVAL_VOID;
+    }
 
     /* Make sure we preserve any flags borrowing bits in classword. */
     obj->classword ^= (jsuword) &js_ArrayClass;
@@ -1488,7 +1550,7 @@ InitArrayElements(JSContext *cx, JSObject *obj, jsuint start, jsuint end,
                   jsval *vector)
 {
     if (OBJ_IS_DENSE_ARRAY(cx, obj)) {
-        if (!EnsureLength(cx, obj, end))
+        if (!EnsureCapacity(cx, obj, end))
             return JS_FALSE;
 
         if (end > (uint32)obj->fslots[JSSLOT_ARRAY_LENGTH])
@@ -1516,7 +1578,7 @@ InitArrayObject(JSContext *cx, JSObject *obj, jsuint length, jsval *vector,
     obj->fslots[JSSLOT_ARRAY_LENGTH] = length;
 
     if (vector) {
-        if (!EnsureLength(cx, obj, length))
+        if (!EnsureCapacity(cx, obj, length))
             return JS_FALSE;
 
         jsuint count = length;
@@ -1540,23 +1602,23 @@ InitArrayObject(JSContext *cx, JSObject *obj, jsuint length, jsval *vector,
 static JSString* FASTCALL
 Array_p_join(JSContext* cx, JSObject* obj, JSString *str)
 {
-    jsval v;
-    if (!array_join_sub(cx, obj, TO_STRING, str, &v)) {
+    JSAutoTempValueRooter tvr(cx);
+    if (!array_join_sub(cx, obj, TO_STRING, str, tvr.addr())) {
         cx->builtinStatus |= JSBUILTIN_ERROR;
         return NULL;
     }
-    JS_ASSERT(JSVAL_IS_STRING(v));
-    return JSVAL_TO_STRING(v);
+    return JSVAL_TO_STRING(tvr.value());
 }
 
 static JSString* FASTCALL
 Array_p_toString(JSContext* cx, JSObject* obj)
 {
-    jsval v;
-    if (!array_join_sub(cx, obj, TO_STRING, NULL, &v))
+    JSAutoTempValueRooter tvr(cx);
+    if (!array_join_sub(cx, obj, TO_STRING, NULL, tvr.addr())) {
+        cx->builtinStatus |= JSBUILTIN_ERROR;
         return NULL;
-    JS_ASSERT(JSVAL_IS_STRING(v));
-    return JSVAL_TO_STRING(v);
+    }
+    return JSVAL_TO_STRING(tvr.value());
 }
 #endif
 
@@ -1843,7 +1905,7 @@ array_sort(JSContext *cx, uintN argc, jsval *vp)
     jsuint len, newlen, i, undefs;
     JSTempValueRooter tvr;
     JSBool hole;
-    bool ok;
+    JSBool ok;
     size_t elemsize;
     JSString *str;
 
@@ -2126,7 +2188,7 @@ array_push1_dense(JSContext* cx, JSObject* obj, jsval v, jsval *rval)
         return array_push_slowly(cx, obj, 1, &v, rval);
     }
 
-    if (!EnsureLength(cx, obj, length + 1))
+    if (!EnsureCapacity(cx, obj, length + 1))
         return JS_FALSE;
     obj->fslots[JSSLOT_ARRAY_LENGTH] = length + 1;
 
@@ -2141,16 +2203,16 @@ js_ArrayCompPush(JSContext *cx, JSObject *obj, jsval v)
 {
     JS_ASSERT(OBJ_IS_DENSE_ARRAY(cx, obj));
     uint32_t length = (uint32_t) obj->fslots[JSSLOT_ARRAY_LENGTH];
-    JS_ASSERT(length <= ARRAY_DENSE_LENGTH(obj));
+    JS_ASSERT(length <= js_DenseArrayCapacity(obj));
 
-    if (length == ARRAY_DENSE_LENGTH(obj)) {
+    if (length == js_DenseArrayCapacity(obj)) {
         if (length >= ARRAY_INIT_LIMIT) {
             JS_ReportErrorNumberUC(cx, js_GetErrorMessage, NULL,
                                    JSMSG_ARRAY_INIT_TOO_BIG);
             return JS_FALSE;
         }
 
-        if (!ResizeSlots(cx, obj, length, length + ARRAY_GROWBY))
+        if (!EnsureCapacity(cx, obj, length + 1))
             return JS_FALSE;
     }
     obj->fslots[JSSLOT_ARRAY_LENGTH] = length + 1;
@@ -2163,10 +2225,11 @@ js_ArrayCompPush(JSContext *cx, JSObject *obj, jsval v)
 static jsval FASTCALL
 Array_p_push1(JSContext* cx, JSObject* obj, jsval v)
 {
+    JSAutoTempValueRooter tvr(cx, v);
     if (OBJ_IS_DENSE_ARRAY(cx, obj)
-        ? array_push1_dense(cx, obj, v, &v)
-        : array_push_slowly(cx, obj, 1, &v, &v)) {
-        return v;
+        ? array_push1_dense(cx, obj, v, tvr.addr())
+        : array_push_slowly(cx, obj, 1, tvr.addr(), tvr.addr())) {
+        return tvr.value();
     }
     cx->builtinStatus |= JSBUILTIN_ERROR;
     return JSVAL_VOID;
@@ -2234,11 +2297,11 @@ array_pop_dense(JSContext *cx, JSObject* obj, jsval *vp)
 static jsval FASTCALL
 Array_p_pop(JSContext* cx, JSObject* obj)
 {
-    jsval v;
+    JSAutoTempValueRooter tvr(cx);
     if (OBJ_IS_DENSE_ARRAY(cx, obj)
-        ? array_pop_dense(cx, obj, &v)
-        : array_pop_slowly(cx, obj, &v)) {
-        return v;
+        ? array_pop_dense(cx, obj, tvr.addr())
+        : array_pop_slowly(cx, obj, tvr.addr())) {
+        return tvr.value();
     }
     cx->builtinStatus |= JSBUILTIN_ERROR;
     return JSVAL_VOID;
@@ -2496,15 +2559,15 @@ array_concat(JSContext *cx, uintN argc, jsval *vp)
     aobj = JS_THIS_OBJECT(cx, vp);
     if (OBJ_IS_DENSE_ARRAY(cx, aobj)) {
         /*
-         * Clone aobj but pass the minimum of its length and capacity (aka
-         * "dense length"), to handle a = [1,2,3]; a.length = 10000 "dense"
-         * cases efficiently. In such a case we'll pass 8 (not 3) due to the
-         * ARRAY_GROWBY over-allocation policy, which will cause nobj to be
-         * over-allocated to 16. But in the normal case where length is <=
-         * capacity, nobj and aobj will have the same dense length.
+         * Clone aobj but pass the minimum of its length and capacity, to
+         * handle a = [1,2,3]; a.length = 10000 "dense" cases efficiently. In
+         * such a case we'll pass 8 (not 3) due to ARRAY_CAPACITY_MIN, which
+         * will cause nobj to be over-allocated to 16. But in the normal case
+         * where length is <= capacity, nobj and aobj will have the same
+         * capacity.
          */
         length = aobj->fslots[JSSLOT_ARRAY_LENGTH];
-        jsuint capacity = ARRAY_DENSE_LENGTH(aobj);
+        jsuint capacity = js_DenseArrayCapacity(aobj);
         nobj = js_NewArrayObject(cx, JS_MIN(length, capacity), aobj->dslots,
                                  aobj->fslots[JSSLOT_ARRAY_COUNT] !=
                                  (jsval) length);
@@ -2636,7 +2699,7 @@ array_slice(JSContext *cx, uintN argc, jsval *vp)
     if (begin > end)
         begin = end;
 
-    if (OBJ_IS_DENSE_ARRAY(cx, obj) && end <= ARRAY_DENSE_LENGTH(obj)) {
+    if (OBJ_IS_DENSE_ARRAY(cx, obj) && end <= js_DenseArrayCapacity(obj)) {
         nobj = js_NewArrayObject(cx, end - begin, obj->dslots + begin,
                                  obj->fslots[JSSLOT_ARRAY_COUNT] !=
                                  obj->fslots[JSSLOT_ARRAY_LENGTH]);
@@ -3127,7 +3190,7 @@ JSObject* FASTCALL
 js_NewUninitializedArray(JSContext* cx, JSObject* proto, uint32 len)
 {
     JSObject *obj = js_FastNewArrayWithLength(cx, proto, len);
-    if (!obj || !ResizeSlots(cx, obj, 0, JS_MAX(len, ARRAY_GROWBY)))
+    if (!obj || !ResizeSlots(cx, obj, 0, JS_MAX(len, ARRAY_CAPACITY_MIN)))
         return NULL;
     return obj;
 }
@@ -3136,11 +3199,11 @@ js_NewUninitializedArray(JSContext* cx, JSObject* proto, uint32 len)
     JS_ASSERT(JS_ON_TRACE(cx));                                               \
     JSObject* obj = js_FastNewArray(cx, proto);                               \
     if (obj) {                                                                \
-        const uint32 len = ARRAY_GROWBY;                                      \
+        const uint32 len = ARRAY_CAPACITY_MIN;                                \
         jsval* newslots = (jsval*) JS_malloc(cx, sizeof (jsval) * (len + 1)); \
         if (newslots) {                                                       \
             obj->dslots = newslots + 1;                                       \
-            ARRAY_SET_DENSE_LENGTH(obj, len);                                 \
+            js_SetDenseArrayCapacity(obj, len);                               \
             {newslots_code}                                                   \
             while (++newslots < obj->dslots + len)                            \
                 *newslots = JSVAL_HOLE;                                       \
@@ -3231,9 +3294,9 @@ js_ArrayInfo(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
                 OBJ_IS_DENSE_ARRAY(cx, array) ? "dense" : "sparse",
                 array->fslots[JSSLOT_ARRAY_LENGTH]);
         if (OBJ_IS_DENSE_ARRAY(cx, array)) {
-            fprintf(stderr, ", count %lu, denselen %lu",
+            fprintf(stderr, ", count %lu, capacity %lu",
                     array->fslots[JSSLOT_ARRAY_COUNT],
-                    ARRAY_DENSE_LENGTH(array));
+                    js_DenseArrayCapacity(array));
         }
         fputs(")\n", stderr);
         JS_free(cx, bytes);

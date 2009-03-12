@@ -115,14 +115,14 @@ JSVAL_TO_STRING(jsval v)
 static JS_ALWAYS_INLINE jsval
 OBJECT_TO_JSVAL(JSObject *obj)
 {
-    JS_STATIC_ASSERT(JSVAL_OBJECT == 0);
-    JS_ASSERT(((jsval) obj & JSVAL_TAGBITS) == JSVAL_OBJECT);
+    JS_ASSERT(((jsval) obj & JSVAL_TAGMASK) == JSVAL_OBJECT);
     return (jsval) obj;
 }
 
 static JS_ALWAYS_INLINE jsval
 DOUBLE_TO_JSVAL(jsdouble *dp)
 {
+    JS_ASSERT(((jsword) dp & JSVAL_TAGMASK) == 0);
     return JSVAL_SETTAG((jsval) dp, JSVAL_DOUBLE);
 }
 
@@ -160,8 +160,8 @@ STRING_TO_JSVAL(JSString *str)
  * SpiderMonkey.
  */
 #define JSVAL_TO_PSEUDO_BOOLEAN(v) ((JSBool) ((v) >> JSVAL_TAGBITS))
-#define PSEUDO_BOOLEAN_TO_JSVAL(b) \
-  JSVAL_SETTAG((jsval) (b) << JSVAL_TAGBITS, JSVAL_BOOLEAN)
+#define PSEUDO_BOOLEAN_TO_JSVAL(b)                                            \
+    JSVAL_SETTAG((jsval) (b) << JSVAL_TAGBITS, JSVAL_BOOLEAN)
 
 /*
  * Well-known JS values.  The extern'd variables are initialized when the
@@ -179,15 +179,15 @@ STRING_TO_JSVAL(JSString *str)
 static JS_ALWAYS_INLINE JSBool
 JSVAL_TO_BOOLEAN(jsval v)
 {
-  JS_ASSERT(v == JSVAL_TRUE || v == JSVAL_FALSE);
-  return JSVAL_TO_PSEUDO_BOOLEAN(v);
+    JS_ASSERT(v == JSVAL_TRUE || v == JSVAL_FALSE);
+    return JSVAL_TO_PSEUDO_BOOLEAN(v);
 }
 
 static JS_ALWAYS_INLINE jsval
 BOOLEAN_TO_JSVAL(JSBool b)
 {
-  JS_ASSERT(b == JS_TRUE || b == JS_FALSE);
-  return PSEUDO_BOOLEAN_TO_JSVAL(b);
+    JS_ASSERT(b == JS_TRUE || b == JS_FALSE);
+    return PSEUDO_BOOLEAN_TO_JSVAL(b);
 }
 
 /* A private data pointer (2-byte-aligned) can be stored as an int jsval. */
@@ -1015,10 +1015,6 @@ JS_MarkGCThing(JSContext *cx, void *thing, const char *name, void *arg);
 #define JSVAL_TO_TRACEABLE(v)   (JSVAL_TO_GCTHING(v))
 #define JSVAL_TRACE_KIND(v)     (JSVAL_TAG(v) >> 1)
 
-JS_STATIC_ASSERT(JSVAL_TRACE_KIND(JSVAL_OBJECT) == JSTRACE_OBJECT);
-JS_STATIC_ASSERT(JSVAL_TRACE_KIND(JSVAL_DOUBLE) == JSTRACE_DOUBLE);
-JS_STATIC_ASSERT(JSVAL_TRACE_KIND(JSVAL_STRING) == JSTRACE_STRING);
-
 struct JSTracer {
     JSContext           *context;
     JSTraceCallback     callback;
@@ -1735,6 +1731,23 @@ extern JS_PUBLIC_API(JSBool)
 JS_LookupPropertyWithFlagsById(JSContext *cx, JSObject *obj, jsid id,
                                uintN flags, JSObject **objp, jsval *vp);
 
+struct JSPropertyDescriptor {
+    JSObject     *obj;
+    uintN        attrs;
+    JSPropertyOp getter;
+    JSPropertyOp setter;
+    jsval        value;
+};
+
+/*
+ * Like JS_GetPropertyAttrsGetterAndSetterById but will return a property on
+ * an object on the prototype chain (returned in objp). If data->obj is null,
+ * then this property was not found on the prototype chain.
+ */
+extern JS_PUBLIC_API(JSBool)
+JS_GetPropertyDescriptorById(JSContext *cx, JSObject *obj, jsid id, uintN flags,
+                             JSPropertyDescriptor *desc);
+
 extern JS_PUBLIC_API(JSBool)
 JS_GetProperty(JSContext *cx, JSObject *obj, const char *name, jsval *vp);
 
@@ -2280,6 +2293,9 @@ JS_GetOperationCallback(JSContext *cx);
 extern JS_PUBLIC_API(void)
 JS_TriggerOperationCallback(JSContext *cx);
 
+extern JS_PUBLIC_API(void)
+JS_TriggerAllOperationCallbacks(JSRuntime *rt);
+
 extern JS_PUBLIC_API(JSBool)
 JS_IsRunning(JSContext *cx);
 
@@ -2487,7 +2503,7 @@ JS_EncodeString(JSContext *cx, JSString *str);
 typedef JSBool (* JSONWriteCallback)(const jschar *buf, uint32 len, void *data);
 
 /*
- * JSON.stringify as specificed by ES3.1 (draft)
+ * JSON.stringify as specified by ES3.1 (draft)
  */
 JS_PUBLIC_API(JSBool)
 JS_Stringify(JSContext *cx, jsval *vp, JSObject *replacer,
@@ -2500,7 +2516,7 @@ JS_PUBLIC_API(JSBool)
 JS_TryJSON(JSContext *cx, jsval *vp);
 
 /*
- * JSON.parse as specificed by ES3.1 (draft)
+ * JSON.parse as specified by ES3.1 (draft)
  */
 JS_PUBLIC_API(JSONParser *)
 JS_BeginJSONParse(JSContext *cx, jsval *vp);
@@ -2509,7 +2525,7 @@ JS_PUBLIC_API(JSBool)
 JS_ConsumeJSONText(JSContext *cx, JSONParser *jp, const jschar *data, uint32 len);
 
 JS_PUBLIC_API(JSBool)
-JS_FinishJSONParse(JSContext *cx, JSONParser *jp);
+JS_FinishJSONParse(JSContext *cx, JSONParser *jp, jsval reviver);
 
 /************************************************************************/
 

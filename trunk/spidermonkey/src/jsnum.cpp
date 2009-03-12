@@ -41,7 +41,6 @@
 /*
  * JS number type and wrapper class.
  */
-#include "jsstddef.h"
 #if defined(XP_WIN) || defined(XP_OS2)
 #include <float.h>
 #endif
@@ -650,7 +649,7 @@ jsdouble js_NaN;
  * to 53 bit mantissa.
  * On Alpha platform this is handled via Compiler option.
  */
-#define FIX_FPU() _control87(MCW_EM | PC_53, MCW_EM | MCW_PC)
+#define FIX_FPU() _control87(_MCW_EM | _PC_53, _MCW_EM | _MCW_PC)
 
 #else
 

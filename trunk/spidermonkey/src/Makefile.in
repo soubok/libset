@@ -196,7 +196,6 @@ INSTALLED_HEADERS = \
 		jsscope.h \
 		jsscript.h \
 		jsstaticcheck.h \
-		jsstddef.h \
 		jsstdint.h \
 		jsstr.h \
 		jstracer.h \
@@ -317,19 +316,22 @@ endif
 MOZILLA_DTRACE_SRC = $(srcdir)/javascript-trace.d
 endif
 
-include $(topsrcdir)/config/rules.mk
+default::
 
+ifneq (,$(CROSS_COMPILE)$(filter-out WINNT OS2,$(OS_ARCH)))
+ifneq ($(OS_ARCH), WINCE)
 # nsinstall doesn't get built until we enter config/ in the exports phase,
 # so we'll have to manually ensure it gets built here if we want to use
 # $(EXPORTS)
-ifneq (,$(CROSS_COMPILE)$(filter-out WINNT OS2,$(OS_ARCH)))
-ifneq ($(OS_ARCH), WINCE)
-$(EXPORTS) $(PUBLIC): config/nsinstall$(HOST_BIN_SUFFIX)
+export:: config/nsinstall$(HOST_BIN_SUFFIX)
+$(PUBLIC) $(SDK_PUBLIC): config/nsinstall$(HOST_BIN_SUFFIX)
 
 config/nsinstall$(HOST_BIN_SUFFIX): $(srcdir)/config/nsinstall.c $(srcdir)/config/pathsub.c
 	$(MAKE) -C config/ nsinstall$(HOST_BIN_SUFFIX)
 endif
 endif
+
+include $(topsrcdir)/config/rules.mk
 
 ifdef MOZ_SYNC_BUILD_FILES
 # Because the SpiderMonkey can be distributed and built independently
@@ -351,6 +353,14 @@ check::
 	$(check-sync-dirs) $(srcdir)/config $(MOZ_SYNC_BUILD_FILES)/config
 	$(check-sync-dirs) $(srcdir)/build $(MOZ_SYNC_BUILD_FILES)/build
 endif
+
+# Temporarily disable - backout of bug 473989.
+#ifdef ENABLE_JIT
+#check::
+#	$(wildcard $(RUN_TEST_PROGRAM)) ./js$(BIN_SUFFIX) -j -e \
+#		"var gSrcdir='$(srcdir)'; var gSkipSlowTests=true; var gReportSummary=false;" \
+#		$(srcdir)/trace-test.js
+#endif
 
 # our build system doesn't handle subdir srcs very gracefully today
 export::
@@ -495,11 +505,9 @@ jsdtoa.o: jsdtoa.cpp Makefile.in
 	$(CXX) -o $@ -c $(filter-out $(MOZ_OPTIMIZE_FLAGS), $(COMPILE_CFLAGS)) $<
 endif
 
-jsopcode.h jsopcode.cpp: jsopcode.tbl
-
 export:: jsautocfg.h
 
-ifeq (,$(CROSS_COMPILE)$(filter-out WINNT,$(OS_ARCH)))
+ifeq (,$(CROSS_COMPILE)$(GNU_CC)$(filter-out WINNT,$(OS_ARCH)))
 jsautocfg.h:
 	touch $@
 else

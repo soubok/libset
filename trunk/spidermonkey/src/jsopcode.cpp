@@ -41,7 +41,6 @@
 /*
  * JS bytecode descriptors, disassemblers, and decompilers.
  */
-#include "jsstddef.h"
 #ifdef HAVE_MEMORY_H
 #include <memory.h>
 #endif
@@ -75,6 +74,11 @@
 #include "jstracer.h"
 
 #include "jsautooplen.h"
+
+/*
+ * Index limit must stay within 32 bits.
+ */
+JS_STATIC_ASSERT(sizeof(uint32) * JS_BITS_PER_BYTE >= INDEX_LIMIT_LOG2 + 1);
 
 /* Verify JSOP_XXX_LENGTH constant definitions. */
 #define OPDEF(op,val,name,token,length,nuses,ndefs,prec,format)               \
@@ -138,9 +142,7 @@ js_GetIndexFromBytecode(JSContext *cx, JSScript *script, jsbytecode *pc,
     JSOp op;
     uintN span, base;
 
-    op = (JSOp)*pc;
-    if (op == JSOP_TRAP)
-        op = JS_GetTrapOpcode(cx, script, pc);
+    op = js_GetOpcode(cx, script, pc);
     JS_ASSERT(js_CodeSpec[op].length >= 1 + pcoff + UINT16_LEN);
 
     /*
@@ -235,13 +237,19 @@ js_Disassemble(JSContext *cx, JSScript *script, JSBool lines, FILE *fp)
         if (pc == script->main)
             fputs("main:\n", fp);
         len = js_Disassemble1(cx, script, pc,
-                              PTRDIFF(pc, script->code, jsbytecode),
+                              pc - script->code,
                               lines, fp);
         if (!len)
             return JS_FALSE;
         pc += len;
     }
     return JS_TRUE;
+}
+
+JSBool
+js_DumpScript(JSContext *cx, JSScript *script)
+{
+    return js_Disassemble(cx, script, true, stdout);
 }
 
 const char *
@@ -618,7 +626,7 @@ QuoteString(Sprinter *sp, JSString *str, uint32 quote)
             if (t == z)
                 break;
         }
-        len = PTRDIFF(t, s, jschar);
+        len = t - s;
 
         /* Allocate space for s, including the '\0' at the end. */
         if (!SprintEnsureBuffer(sp, len))
@@ -1777,7 +1785,7 @@ Decompile(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
 #define POP_STR_PREC(prec)    PopStrPrec(ss, prec)
 
 /*
- * Pop a condition expression for if/for/while. JSOP_IFEQ's precedence forces
+ * Pop a condition expression for if/while. JSOP_IFEQ's precedence forces
  * extra parens around assignment, which avoids a strict-mode warning.
  */
 #define POP_COND_STR()                                                        \
@@ -2678,7 +2686,7 @@ Decompile(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
 
                     len = js_GetSrcNoteOffset(sn, 0);
                     if (len) {
-                        len -= PTRDIFF(pc, pc2, jsbytecode);
+                        len -= pc - pc2;
                         LOCAL_ASSERT_OUT(len > 0);
                         js_printf(jp, " if ");
                         ok = Decompile(ss, pc, len, JSOP_NOP) != NULL;
@@ -3256,7 +3264,7 @@ Decompile(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
                     return NULL;
                 done = pc + GetJumpOffset(pc, pc);
                 pc += len;
-                len = PTRDIFF(done, pc, jsbytecode);
+                len = done - pc;
                 if (!Decompile(ss, pc, len, op)) {
                     JS_free(cx, (char *)lval);
                     return NULL;
@@ -3968,34 +3976,27 @@ Decompile(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
                      *  1. It is the complete expression consumed by a control
                      *     flow bytecode such as JSOP_TABLESWITCH whose syntax
                      *     always parenthesizes the controlling expression.
-                     *  2. It is the condition of a loop other than a for (;;).
-                     *  3. It is the sole argument to a function call.
-                     *  4. It is the condition of an if statement and not of a
-                     *     ?: expression.
+                     *  2. It is the sole argument to a function call.
                      *
-                     * But (first, before anything else) always parenthesize
-                     * if this genexp runs up against endpc and the next op is
-                     * not a loop condition (JSOP_IFNE*) opcode. In such cases,
-                     * this Decompile activation has been recursively called by
-                     * a comma operator, &&, or || bytecode.
+                     * But if this genexp runs up against endpc, parenthesize
+                     * regardless.  (This can happen if we are called from
+                     * DecompileExpression or recursively from case
+                     * JSOP_{NOP,AND,OR}.)
+                     *
+                     * There's no special case for |if (genexp)| because the
+                     * compiler optimizes that to |if (true)|.
                      */
                     pc2 = pc + len;
                     LOCAL_ASSERT(pc2 < endpc ||
                                  endpc < outer->code + outer->length);
                     LOCAL_ASSERT(ss2.top == 1);
                     ss2.opcodes[0] = JSOP_POP;
-                    if (pc2 == endpc &&
-                        (JSOp) *endpc != JSOP_IFNE &&
-                        (JSOp) *endpc != JSOP_IFNEX) {
+                    if (pc2 == endpc) {
                         op = JSOP_SETNAME;
                     } else {
                         op = (JSOp) *pc2;
                         op = ((js_CodeSpec[op].format & JOF_PARENHEAD) ||
-                              ((js_CodeSpec[op].format & JOF_INVOKE) &&
-                               GET_ARGC(pc2) == 1) ||
-                              ((op == JSOP_IFEQ || op == JSOP_IFEQX) &&
-                               (sn2 = js_GetSrcNote(outer, pc2)) &&
-                               SN_TYPE(sn2) != SRC_COND))
+                              ((js_CodeSpec[op].format & JOF_INVOKE) && GET_ARGC(pc2) == 1))
                              ? JSOP_POP
                              : JSOP_SETNAME;
 
@@ -5138,7 +5139,7 @@ DecompileExpression(JSContext *cx, JSScript *script, JSFunction *fun,
         break;
       default:;
     }
-    len = PTRDIFF(end, begin, jsbytecode);
+    len = end - begin;
     if (len <= 0) {
         name = FAILED_EXPRESSION_DECOMPILER;
         goto out;
@@ -5211,9 +5212,7 @@ ReconstructPCStack(JSContext *cx, JSScript *script, jsbytecode *target,
     LOCAL_ASSERT(script->main <= target && target < script->code + script->length);
     pcdepth = 0;
     for (pc = script->main; pc < target; pc += oplen) {
-        op = (JSOp) *pc;
-        if (op == JSOP_TRAP)
-            op = JS_GetTrapOpcode(cx, script, pc);
+        op = js_GetOpcode(cx, script, pc);
         cs = &js_CodeSpec[op];
         oplen = cs->length;
         if (oplen < 0)
@@ -5233,7 +5232,7 @@ ReconstructPCStack(JSContext *cx, JSScript *script, jsbytecode *target,
             jmpoff = js_GetSrcNoteOffset(sn, 0);
             if (pc + jmpoff < target) {
                 pc += jmpoff;
-                op = (JSOp) *pc;
+                op = js_GetOpcode(cx, script, pc);
                 JS_ASSERT(op == JSOP_GOTO || op == JSOP_GOTOX);
                 cs = &js_CodeSpec[op];
                 oplen = cs->length;

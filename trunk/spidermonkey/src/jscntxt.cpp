@@ -41,7 +41,6 @@
 /*
  * JS execution context.
  */
-#include "jsstddef.h"
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -302,16 +301,18 @@ js_NewContext(JSRuntime *rt, size_t stackChunkSize)
 
     JS_LOCK_GC(rt);
     for (;;) {
-        first = (rt->contextList.next == &rt->contextList);
+        /*
+         * Ensure that we don't race with the GC on other threads, bug 478336.
+         */
+        js_WaitForGC(rt);
         if (rt->state == JSRTS_UP) {
-            JS_ASSERT(!first);
-
-            /* Ensure that it is safe to update rt->contextList below. */
-            js_WaitForGC(rt);
+            JS_ASSERT(!JS_CLIST_IS_EMPTY(&rt->contextList));
+            first = JS_FALSE;
             break;
         }
         if (rt->state == JSRTS_DOWN) {
-            JS_ASSERT(first);
+            JS_ASSERT(JS_CLIST_IS_EMPTY(&rt->contextList));
+            first = JS_TRUE;
             rt->state = JSRTS_LAUNCHING;
             break;
         }
@@ -1489,15 +1490,6 @@ js_InvokeOperationCallback(JSContext *cx)
 
     return !cb || cb(cx);
 }
-
-#ifndef JS_TRACER
-/* This is defined in jstracer.cpp in JS_TRACER builds. */
-extern JS_FORCES_STACK JSStackFrame *
-js_GetTopStackFrame(JSContext *cx)
-{
-    return cx->fp;
-}
-#endif
 
 JSStackFrame *
 js_GetScriptedCaller(JSContext *cx, JSStackFrame *fp)

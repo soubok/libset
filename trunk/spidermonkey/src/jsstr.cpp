@@ -48,7 +48,6 @@
  * of rooting things that might lose their newborn root due to subsequent GC
  * allocations in the same native method.
  */
-#include "jsstddef.h"
 #include <stdlib.h>
 #include <string.h>
 #include "jstypes.h"
@@ -166,6 +165,17 @@ js_ConcatStrings(JSContext *cx, JSString *left, JSString *right)
     js_strncpy(s + ln, rs, rn);
     n = ln + rn;
     s[n] = 0;
+
+#ifdef JS_TRACER
+    /*
+     * Lame hack to avoid trying to deep-bail (@js_ReportAllocationOverflow)
+     * when called directly from trace.  Instead, retry from the interpreter.
+     * See bug 477351.
+     */
+    if (n > JSSTRING_LENGTH_MASK && JS_ON_TRACE(cx) && !cx->bailExit)
+        return NULL;
+#endif
+
     str = js_NewString(cx, s, n);
     if (!str) {
         /* Out of memory: clean up any space we (re-)allocated. */
@@ -1025,13 +1035,47 @@ out_of_range:
 }
 
 #ifdef JS_TRACER
+extern jsdouble js_NaN;
+
+jsdouble FASTCALL
+js_String_p_charCodeAt(JSString* str, jsdouble d)
+{
+    d = js_DoubleToInteger(d);
+    if (d < 0 || (int32)JSSTRING_LENGTH(str) <= d)
+        return js_NaN;
+    return jsdouble(JSSTRING_CHARS(str)[jsuint(d)]);
+}
+
 int32 FASTCALL
-js_String_p_charCodeAt(JSString* str, int32 i)
+js_String_p_charCodeAt_int(JSString* str, jsint i)
 {
     if (i < 0 || (int32)JSSTRING_LENGTH(str) <= i)
-        return -1;
+        return 0;
     return JSSTRING_CHARS(str)[i];
 }
+
+jsdouble FASTCALL
+js_String_p_charCodeAt0(JSString* str)
+{
+    if ((int32)JSSTRING_LENGTH(str) == 0)
+        return js_NaN;
+    return jsdouble(JSSTRING_CHARS(str)[0]);
+}
+
+int32 FASTCALL
+js_String_p_charCodeAt0_int(JSString* str)
+{
+    if ((int32)JSSTRING_LENGTH(str) == 0)
+        return 0;
+    return JSSTRING_CHARS(str)[0];
+}
+
+/*
+ * The FuncFilter replaces the generic double version of charCodeAt with the
+ * integer fast path if appropriate.
+ */
+JS_DEFINE_CALLINFO_1(extern, INT32, js_String_p_charCodeAt0_int, STRING,        1, 1)
+JS_DEFINE_CALLINFO_2(extern, INT32, js_String_p_charCodeAt_int,  STRING, INT32, 1, 1)
 #endif
 
 jsint
@@ -1453,6 +1497,7 @@ static jsval FASTCALL
 String_p_match(JSContext* cx, JSString* str, jsbytecode *pc, JSObject* regexp)
 {
     jsval vp[3] = { JSVAL_NULL, STRING_TO_JSVAL(str), OBJECT_TO_JSVAL(regexp) };
+    JSAutoTempValueRooter tvr(cx, 3, vp);
     if (!StringMatchHelper(cx, 1, vp, pc)) {
         cx->builtinStatus |= JSBUILTIN_ERROR;
         return JSVAL_VOID;
@@ -1464,6 +1509,7 @@ static jsval FASTCALL
 String_p_match_obj(JSContext* cx, JSObject* str, jsbytecode *pc, JSObject* regexp)
 {
     jsval vp[3] = { JSVAL_NULL, OBJECT_TO_JSVAL(str), OBJECT_TO_JSVAL(regexp) };
+    JSAutoTempValueRooter tvr(cx, 3, vp);
     if (!StringMatchHelper(cx, 1, vp, pc)) {
         cx->builtinStatus |= JSBUILTIN_ERROR;
         return JSVAL_VOID;
@@ -1778,6 +1824,10 @@ str_replace(JSContext *cx, uintN argc, jsval *vp)
 static JSString* FASTCALL
 String_p_replace_str(JSContext* cx, JSString* str, JSObject* regexp, JSString* repstr)
 {
+    /* Make sure we will not call regexp.toString() later. This is not a _FAIL builtin. */
+    if (OBJ_GET_CLASS(cx, regexp) != &js_RegExpClass)
+        return NULL;
+
     jsval vp[4] = {
         JSVAL_NULL, STRING_TO_JSVAL(str), OBJECT_TO_JSVAL(regexp), STRING_TO_JSVAL(repstr)
     };
@@ -2488,14 +2538,15 @@ JS_DEFINE_CALLINFO_2(extern, BOOL,   js_EqualStrings, STRING, STRING,           
 JS_DEFINE_CALLINFO_2(extern, INT32,  js_CompareStrings, STRING, STRING,                     1, 1)
 
 JS_DEFINE_TRCINFO_1(str_toString,
-    (2, (extern, STRING_FAIL,       String_p_toString, CONTEXT, THIS,                        1, 1)))
+    (2, (extern, STRING_RETRY,      String_p_toString, CONTEXT, THIS,                        1, 1)))
 JS_DEFINE_TRCINFO_2(str_substring,
     (4, (static, STRING_RETRY,      String_p_substring, CONTEXT, THIS_STRING, INT32, INT32,   1, 1)),
     (3, (static, STRING_RETRY,      String_p_substring_1, CONTEXT, THIS_STRING, INT32,        1, 1)))
 JS_DEFINE_TRCINFO_1(str_charAt,
     (3, (extern, STRING_RETRY,      js_String_getelem, CONTEXT, THIS_STRING, INT32,           1, 1)))
-JS_DEFINE_TRCINFO_1(str_charCodeAt,
-    (2, (extern, INT32_RETRY,       js_String_p_charCodeAt, THIS_STRING, INT32,               1, 1)))
+JS_DEFINE_TRCINFO_2(str_charCodeAt,
+    (1, (extern, DOUBLE,            js_String_p_charCodeAt0, THIS_STRING,                     1, 1)),
+    (2, (extern, DOUBLE,            js_String_p_charCodeAt, THIS_STRING, DOUBLE,              1, 1)))
 JS_DEFINE_TRCINFO_4(str_concat,
     (3, (static, STRING_RETRY,      String_p_concat_1int, CONTEXT, THIS_STRING, INT32,        1, 1)),
     (3, (extern, STRING_RETRY,      js_ConcatStrings, CONTEXT, THIS_STRING, STRING,           1, 1)),
@@ -2509,7 +2560,7 @@ JS_DEFINE_TRCINFO_3(str_replace,
     (4, (static, STRING_RETRY,      String_p_replace_str2, CONTEXT, THIS_STRING, STRING, STRING, 1, 1)),
     (5, (static, STRING_RETRY,      String_p_replace_str3, CONTEXT, THIS_STRING, STRING, STRING, STRING, 1, 1)))
 JS_DEFINE_TRCINFO_1(str_split,
-    (3, (static, OBJECT_RETRY_NULL, String_p_split, CONTEXT, THIS_STRING, STRING,             0, 0)))
+    (3, (static, OBJECT_RETRY,      String_p_split, CONTEXT, THIS_STRING, STRING,             0, 0)))
 JS_DEFINE_TRCINFO_1(str_toLowerCase,
     (2, (extern, STRING_RETRY,      js_toLowerCase, CONTEXT, THIS_STRING,                     1, 1)))
 JS_DEFINE_TRCINFO_1(str_toUpperCase,
@@ -2576,8 +2627,8 @@ static JSFunctionSpec string_methods[] = {
     JS_FS_END
 };
 
-static JSBool
-String(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+JSBool
+js_String(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 {
     JSString *str;
 
@@ -2745,6 +2796,10 @@ js_GetUnitStringForChar(JSContext *cx, jschar c)
         JS_LOCK_GC(rt);
         if (!rt->unitStrings[c])
             rt->unitStrings[c] = str;
+#ifdef DEBUG
+        else
+            JSFLATSTR_INIT(str, NULL, 0);  /* avoid later assertion (bug 479381) */
+#endif
         JS_UNLOCK_GC(rt);
     }
     return rt->unitStrings[c];
@@ -2799,7 +2854,7 @@ js_InitStringClass(JSContext *cx, JSObject *obj)
     if (!JS_DefineFunctions(cx, obj, string_functions))
         return NULL;
 
-    proto = JS_InitClass(cx, obj, NULL, &js_StringClass, String, 1,
+    proto = JS_InitClass(cx, obj, NULL, &js_StringClass, js_String, 1,
                          string_props, string_methods,
                          NULL, string_static_methods);
     if (!proto)
