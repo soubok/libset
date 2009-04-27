@@ -62,6 +62,7 @@
 #include "jsemit.h"
 #include "jsfun.h"
 #include "jsgc.h"
+#include "jsiter.h"
 #include "jslock.h"
 #include "jsnum.h"
 #include "jsobj.h"
@@ -110,7 +111,12 @@ size_t gStackChunkSize = 8192;
 
 /* Assume that we can not use more than 5e5 bytes of C stack by default. */
 static size_t gMaxStackSize = 500000;
+
+#ifdef JS_THREADSAFE
+static PRUintn gStackBaseThreadIndex;
+#else
 static jsuword gStackBase;
+#endif
 
 static size_t gScriptStackQuota = JS_DEFAULT_SCRIPT_STACK_QUOTA;
 
@@ -314,7 +320,7 @@ ShellOperationCallback(JSContext *cx)
 }
 
 static void
-SetContextOptions(JSContext *cx)
+SetThreadStackLimit(JSContext *cx)
 {
     jsuword stackLimit;
 
@@ -324,13 +330,27 @@ SetContextOptions(JSContext *cx)
          */
         stackLimit = 0;
     } else {
-#if JS_STACK_GROWTH_DIRECTION > 0
-        stackLimit = gStackBase + gMaxStackSize;
+        jsuword stackBase;
+#ifdef JS_THREADSAFE
+        stackBase = (jsuword) PR_GetThreadPrivate(gStackBaseThreadIndex);
 #else
-        stackLimit = gStackBase - gMaxStackSize;
+        stackBase = gStackBase;
+#endif
+        JS_ASSERT(stackBase != 0);
+#if JS_STACK_GROWTH_DIRECTION > 0
+        stackLimit = stackBase + gMaxStackSize;
+#else
+        stackLimit = stackBase - gMaxStackSize;
 #endif
     }
     JS_SetThreadStackLimit(cx, stackLimit);
+
+}
+
+static void
+SetContextOptions(JSContext *cx)
+{
+    SetThreadStackLimit(cx);
     JS_SetScriptStackQuota(cx, gScriptStackQuota);
     JS_SetOperationCallback(cx, ShellOperationCallback);
 }
@@ -966,22 +986,6 @@ ReadLine(JSContext *cx, uintN argc, jsval *vp)
     return JS_TRUE;
 }
 
-#ifdef JS_TRACER
-static jsval JS_FASTCALL
-Print_tn(JSContext *cx, JSString *str)
-{
-    char *bytes = JS_EncodeString(cx, str);
-    if (!bytes) {
-        cx->builtinStatus |= JSBUILTIN_ERROR;
-        return JSVAL_VOID;
-    }
-    fprintf(gOutFile, "%s\n", bytes);
-    JS_free(cx, bytes);
-    fflush(gOutFile);
-    return JSVAL_VOID;
-}
-#endif
-
 static JSBool
 Print(JSContext *cx, uintN argc, jsval *vp)
 {
@@ -1058,14 +1062,6 @@ AssertEq(JSContext *cx, uintN argc, jsval *vp)
     JS_SET_RVAL(cx, vp, JSVAL_VOID);
     return JS_TRUE;
 }
-
-#ifdef JS_TRACER
-static jsval JS_FASTCALL
-AssertEq_tn(JSContext *cx, jsval v1, jsval v2)
-{
-    return (js_StrictlyEqual(cx, v1, v2)) ? JSVAL_VOID : JSVAL_ERROR_COOKIE;
-}
-#endif
 
 static JSBool
 GC(JSContext *cx, uintN argc, jsval *vp)
@@ -1329,22 +1325,31 @@ CountHeap(JSContext *cx, uintN argc, jsval *vp)
 static JSScript *
 ValueToScript(JSContext *cx, jsval v)
 {
-    JSScript *script;
+    JSScript *script = NULL;
     JSFunction *fun;
 
-    if (!JSVAL_IS_PRIMITIVE(v) &&
-        JS_GET_CLASS(cx, JSVAL_TO_OBJECT(v)) == &js_ScriptClass) {
-        script = (JSScript *) JS_GetPrivate(cx, JSVAL_TO_OBJECT(v));
-    } else {
+    if (!JSVAL_IS_PRIMITIVE(v)) {
+        JSObject *obj = JSVAL_TO_OBJECT(v);
+        JSClass *clasp = JS_GET_CLASS(cx, obj);
+
+        if (clasp == &js_ScriptClass) {
+            script = (JSScript *) JS_GetPrivate(cx, obj);
+        } else if (clasp == &js_GeneratorClass) {
+            JSGenerator *gen = (JSGenerator *) JS_GetPrivate(cx, obj);
+            fun = gen->frame.fun;
+            script = FUN_SCRIPT(fun);
+        }
+    }
+
+    if (!script) {
         fun = JS_ValueToFunction(cx, v);
         if (!fun)
             return NULL;
         script = FUN_SCRIPT(fun);
-    }
-
-    if (!script) {
-        JS_ReportErrorNumber(cx, my_GetErrorMessage, NULL,
-                             JSSMSG_SCRIPTS_ONLY);
+        if (!script) {
+            JS_ReportErrorNumber(cx, my_GetErrorMessage, NULL,
+                                 JSSMSG_SCRIPTS_ONLY);
+        }
     }
 
     return script;
@@ -1687,7 +1692,7 @@ Disassemble(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
             return JS_FALSE;
         if (VALUE_IS_FUNCTION(cx, argv[i])) {
             JSFunction *fun = JS_ValueToFunction(cx, argv[i]);
-            if (fun && (fun->flags & JSFUN_FLAGS_MASK)) {
+            if (fun && (fun->flags & ~7U)) {
                 uint16 flags = fun->flags;
                 fputs("flags:", stdout);
 
@@ -1702,9 +1707,14 @@ Disassemble(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
                 SHOW_FLAG(THISP_NUMBER);
                 SHOW_FLAG(THISP_BOOLEAN);
                 SHOW_FLAG(EXPR_CLOSURE);
-                SHOW_FLAG(INTERPRETED);
+                SHOW_FLAG(TRACEABLE);
 
 #undef SHOW_FLAG
+
+                if (FUN_NULL_CLOSURE(fun))
+                    fputs(" NULL_CLOSURE", stdout);
+                else if (FUN_FLAT_CLOSURE(fun))
+                    fputs(" FLAT_CLOSURE", stdout);
                 putchar('\n');
             }
         }
@@ -1840,13 +1850,8 @@ DisassWithSrc(JSContext *cx, JSObject *obj, uintN argc, jsval *argv,
 static JSBool
 Tracing(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 {
-    JSBool bval;
-    JSString *str;
+    FILE *file;
 
-#if JS_THREADED_INTERP
-    JS_ReportError(cx, "tracing not supported in JS_THREADED_INTERP builds");
-    return JS_FALSE;
-#else
     if (argc == 0) {
         *rval = BOOLEAN_TO_JSVAL(cx->tracefp != 0);
         return JS_TRUE;
@@ -1854,24 +1859,39 @@ Tracing(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 
     switch (JS_TypeOfValue(cx, argv[0])) {
       case JSTYPE_NUMBER:
-        bval = JSVAL_IS_INT(argv[0])
-               ? JSVAL_TO_INT(argv[0])
-               : (jsint) *JSVAL_TO_DOUBLE(argv[0]);
+      case JSTYPE_BOOLEAN: {
+        JSBool bval;
+        if (!JS_ValueToBoolean(cx, argv[0], &bval))
+            goto bad_argument;
+        file = bval ? stderr : NULL;
         break;
-      case JSTYPE_BOOLEAN:
-        bval = JSVAL_TO_BOOLEAN(argv[0]);
-        break;
-      default:
-        str = JS_ValueToString(cx, argv[0]);
-        if (!str)
+      }
+      case JSTYPE_STRING: {
+        char *name = JS_GetStringBytes(JSVAL_TO_STRING(argv[0]));
+        file = fopen(name, "w");
+        if (!file) {
+            JS_ReportError(cx, "tracing: couldn't open output file %s: %s", 
+                           name, strerror(errno));
             return JS_FALSE;
-        JS_ReportError(cx, "tracing: illegal argument %s",
-                       JS_GetStringBytes(str));
-        return JS_FALSE;
+        }
+        break;
+      }
+      default:
+          goto bad_argument;
     }
-    cx->tracefp = bval ? stderr : NULL;
+    if (cx->tracefp && cx->tracefp != stderr)
+      fclose((FILE *)cx->tracefp);
+    cx->tracefp = file;
+    cx->tracePrevPc = NULL;
     return JS_TRUE;
-#endif
+
+ bad_argument:
+    JSString *str = JS_ValueToString(cx, argv[0]);
+    if (!str)
+        return JS_FALSE;
+    JS_ReportError(cx, "tracing: illegal argument %s",
+                   JS_GetStringBytes(str));
+    return JS_FALSE;
 }
 
 static void
@@ -2222,13 +2242,16 @@ Intern(JSContext *cx, uintN argc, jsval *vp)
 static JSBool
 Clone(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 {
-    JSFunction *fun;
     JSObject *funobj, *parent, *clone;
 
-    fun = JS_ValueToFunction(cx, argv[0]);
-    if (!fun)
-        return JS_FALSE;
-    funobj = JS_GetFunctionObject(fun);
+    if (VALUE_IS_FUNCTION(cx, argv[0])) {
+        funobj = JSVAL_TO_OBJECT(argv[0]);
+    } else {
+        JSFunction *fun = JS_ValueToFunction(cx, argv[0]);
+        if (!fun)
+            return JS_FALSE;
+        funobj = JS_GetFunctionObject(fun);
+    }
     if (argc > 1) {
         if (!JS_ValueToObject(cx, argv[1], &parent))
             return JS_FALSE;
@@ -2856,16 +2879,6 @@ out:
     return ok;
 }
 
-static int32 JS_FASTCALL
-ShapeOf_tn(JSObject *obj)
-{
-    if (!obj)
-        return 0;
-    if (!OBJ_IS_NATIVE(obj))
-        return -1;
-    return OBJ_SHAPE(obj);
-}
-
 static JSBool
 ShapeOf(JSContext *cx, uintN argc, jsval *vp)
 {
@@ -2874,7 +2887,16 @@ ShapeOf(JSContext *cx, uintN argc, jsval *vp)
         JS_ReportError(cx, "shapeOf: object expected");
         return JS_FALSE;
     }
-    return JS_NewNumberValue(cx, ShapeOf_tn(JSVAL_TO_OBJECT(v)), vp);
+    JSObject *obj = JSVAL_TO_OBJECT(v);
+    if (!obj) {
+        *vp = JSVAL_ZERO;
+        return JS_TRUE;
+    }
+    if (!OBJ_IS_NATIVE(obj)) {
+        *vp = INT_TO_JSVAL(-1);
+        return JS_TRUE;
+    }
+    return JS_NewNumberValue(cx, OBJ_SHAPE(obj), vp);
 }
 
 #ifdef JS_THREADSAFE
@@ -2974,9 +2996,13 @@ DoScatteredWork(JSContext *cx, ScatterThreadData *td)
 static void
 RunScatterThread(void *arg)
 {
+    int stackDummy;
     ScatterThreadData *td;
     ScatterStatus st;
     JSContext *cx;
+
+    if (PR_FAILURE == PR_SetThreadPrivate(gStackBaseThreadIndex, &stackDummy))
+        return;
 
     td = (ScatterThreadData *)arg;
     cx = td->cx;
@@ -2992,7 +3018,7 @@ RunScatterThread(void *arg)
 
     /* We are good to go. */
     JS_SetContextThread(cx);
-    JS_SetThreadStackLimit(cx, 0);
+    SetThreadStackLimit(cx);
     JS_BeginRequest(cx);
     DoScatteredWork(cx, td);
     JS_EndRequest(cx);
@@ -3412,10 +3438,6 @@ Elapsed(JSContext *cx, uintN argc, jsval *vp)
     return JS_FALSE;
 }
 
-JS_DEFINE_TRCINFO_1(AssertEq, (3, (static, JSVAL_RETRY, AssertEq_tn, CONTEXT, JSVAL, JSVAL, 0, 0)))
-JS_DEFINE_TRCINFO_1(Print, (2, (static, JSVAL_FAIL, Print_tn, CONTEXT, STRING, 0, 0)))
-JS_DEFINE_TRCINFO_1(ShapeOf, (1, (static, INT32, ShapeOf_tn, OBJECT, 0, 0)))
-
 #ifdef XP_UNIX
 
 #include <fcntl.h>
@@ -3542,10 +3564,10 @@ static JSFunctionSpec shell_functions[] = {
     JS_FS("options",        Options,        0,0,0),
     JS_FS("load",           Load,           1,0,0),
     JS_FN("readline",       ReadLine,       0,0),
-    JS_TN("print",          Print,          0,0, Print_trcinfo),
+    JS_FN("print",          Print,          0,0),
     JS_FS("help",           Help,           0,0,0),
     JS_FS("quit",           Quit,           0,0,0),
-    JS_TN("assertEq",       AssertEq,       2,0, AssertEq_trcinfo),
+    JS_FN("assertEq",       AssertEq,       2,0),
     JS_FN("gc",             GC,             0,0),
     JS_FN("gcparam",        GCParameter,    2,0),
     JS_FN("countHeap",      CountHeap,      0,0),
@@ -3581,7 +3603,7 @@ static JSFunctionSpec shell_functions[] = {
     JS_FN("getslx",         GetSLX,         1,0),
     JS_FN("toint32",        ToInt32,        1,0),
     JS_FS("evalcx",         EvalInContext,  1,0,0),
-    JS_TN("shapeOf",        ShapeOf,        1,0, ShapeOf_trcinfo),
+    JS_FN("shapeOf",        ShapeOf,        1,0),
 #ifdef MOZ_SHARK
     JS_FS("startShark",     js_StartShark,      0,0,0),
     JS_FS("stopShark",      js_StopShark,       0,0,0),
@@ -3653,7 +3675,8 @@ static const char *const shell_help_messages[] = {
 "dumpHeap([fileName[, start[, toFind[, maxDepth[, toIgnore]]]]])\n"
 "  Interface to JS_DumpHeap with output sent to file",
 "notes([fun])             Show source notes for functions",
-"tracing([toggle])        Turn tracing on or off",
+"tracing([true|false|filename]) Turn bytecode execution tracing on/off.\n"
+"                         With filename, send to file.\n",
 "stats([string ...])      Dump 'arena', 'atom', 'global' stats",
 #endif
 #ifdef TEST_CVTARGS
@@ -3821,8 +3844,47 @@ split_setup(JSContext *cx)
  * they're being called for tutorial purposes.
  */
 enum its_tinyid {
-    ITS_COLOR, ITS_HEIGHT, ITS_WIDTH, ITS_FUNNY, ITS_ARRAY, ITS_RDONLY
+    ITS_COLOR, ITS_HEIGHT, ITS_WIDTH, ITS_FUNNY, ITS_ARRAY, ITS_RDONLY,
+    ITS_CUSTOM, ITS_CUSTOMRDONLY
 };
+
+static JSBool
+its_getter(JSContext *cx, JSObject *obj, jsval id, jsval *vp)
+{
+  jsval *val = (jsval *) JS_GetPrivate(cx, obj);
+  *vp = val ? *val : JSVAL_VOID;
+  return JS_TRUE;
+}
+
+static JSBool
+its_setter(JSContext *cx, JSObject *obj, jsval id, jsval *vp)
+{
+  jsval *val = (jsval *) JS_GetPrivate(cx, obj);
+  if (val) {
+      *val = *vp;
+      return JS_TRUE;
+  }
+
+  val = new jsval;
+  if (!val) {
+      JS_ReportOutOfMemory(cx);
+      return JS_FALSE;
+  }
+
+  if (!JS_AddRoot(cx, val)) {
+      delete val;
+      return JS_FALSE;
+  }
+
+  if (!JS_SetPrivate(cx, obj, (void*)val)) {
+      JS_RemoveRoot(cx, val);
+      delete val;
+      return JS_FALSE;
+  }
+
+  *val = *vp;
+  return JS_TRUE;
+}
 
 static JSPropertySpec its_props[] = {
     {"color",           ITS_COLOR,      JSPROP_ENUMERATE,       NULL, NULL},
@@ -3831,6 +3893,10 @@ static JSPropertySpec its_props[] = {
     {"funny",           ITS_FUNNY,      JSPROP_ENUMERATE,       NULL, NULL},
     {"array",           ITS_ARRAY,      JSPROP_ENUMERATE,       NULL, NULL},
     {"rdonly",          ITS_RDONLY,     JSPROP_READONLY,        NULL, NULL},
+    {"custom",          ITS_CUSTOM,     JSPROP_ENUMERATE,
+                        its_getter,     its_setter},
+    {"customRdOnly",    ITS_CUSTOMRDONLY, JSPROP_ENUMERATE | JSPROP_READONLY,
+                        its_getter,     its_setter},
     {NULL,0,0,NULL,NULL}
 };
 
@@ -4046,12 +4112,19 @@ its_convert(JSContext *cx, JSObject *obj, JSType type, jsval *vp)
 static void
 its_finalize(JSContext *cx, JSObject *obj)
 {
+    jsval *rootedVal;
     if (its_noisy)
         fprintf(gOutFile, "finalizing it\n");
+    rootedVal = (jsval *) JS_GetPrivate(cx, obj);
+    if (rootedVal) {
+      JS_RemoveRoot(cx, rootedVal);
+      JS_SetPrivate(cx, obj, NULL);
+      delete rootedVal;
+    }
 }
 
 static JSClass its_class = {
-    "It", JSCLASS_NEW_RESOLVE | JSCLASS_NEW_ENUMERATE,
+    "It", JSCLASS_NEW_RESOLVE | JSCLASS_NEW_ENUMERATE | JSCLASS_HAS_PRIVATE,
     its_addProperty,  its_delProperty,  its_getProperty,  its_setProperty,
     (JSEnumerateOp)its_enumerate, (JSResolveOp)its_resolve,
     its_convert,      its_finalize,
@@ -4284,11 +4357,11 @@ global_resolve(JSContext *cx, JSObject *obj, jsval id, uintN flags,
 }
 
 JSClass global_class = {
-    "global", JSCLASS_NEW_RESOLVE | JSCLASS_GLOBAL_FLAGS,
+    "global", JSCLASS_NEW_RESOLVE | JSCLASS_GLOBAL_FLAGS | JSCLASS_HAS_PRIVATE,
     JS_PropertyStub,  JS_PropertyStub,
     JS_PropertyStub,  JS_PropertyStub,
     global_enumerate, (JSResolveOp) global_resolve,
-    JS_ConvertStub,   JS_FinalizeStub,
+    JS_ConvertStub,   its_finalize,
     JSCLASS_NO_OPTIONAL_MEMBERS
 };
 
@@ -4522,7 +4595,15 @@ main(int argc, char **argv, char **envp)
 #ifdef HAVE_SETLOCALE
     setlocale(LC_ALL, "");
 #endif
-    gStackBase = (jsuword)&stackDummy;
+
+#ifdef JS_THREADSAFE
+    if (PR_FAILURE == PR_NewThreadPrivateIndex(&gStackBaseThreadIndex, NULL) ||
+        PR_FAILURE == PR_SetThreadPrivate(gStackBaseThreadIndex, &stackDummy)) {
+        return 1;
+    }
+#else
+    gStackBase = (jsuword) &stackDummy;
+#endif
 
 #ifdef XP_OS2
    /* these streams are normally line buffered on OS/2 and need a \n, *
@@ -4572,6 +4653,13 @@ main(int argc, char **argv, char **envp)
     if (!JS_DefineProperties(cx, it, its_props))
         return 1;
     if (!JS_DefineFunctions(cx, it, its_methods))
+        return 1;
+
+    if (!JS_DefineProperty(cx, glob, "custom", JSVAL_VOID, its_getter,
+                           its_setter, 0))
+        return 1;
+    if (!JS_DefineProperty(cx, glob, "customRdOnly", JSVAL_VOID, its_getter,
+                           its_setter, JSPROP_READONLY))
         return 1;
 
 #ifdef JSDEBUGGER

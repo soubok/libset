@@ -43,6 +43,7 @@
  */
 #include <string.h>
 #include "jstypes.h"
+#include "jsstdint.h"
 #include "jsutil.h" /* Added by JSIFY */
 #include "jsprf.h"
 #include "jsapi.h"
@@ -262,9 +263,9 @@ script_compile_sub(JSContext *cx, JSObject *obj, uintN argc, jsval *argv,
      * jsparse.c to optimize based on identity of run- and compile-time scope.
      */
     tcflags = 0;
-    script = js_CompileScript(cx, scopeobj, NULL, principals, tcflags,
-                              JSSTRING_CHARS(str), JSSTRING_LENGTH(str),
-                              NULL, file, line);
+    script = JSCompiler::compileScript(cx, scopeobj, NULL, principals, tcflags,
+                                      STRING_CHARS(str), JSSTRING_LENGTH(str),
+                                      NULL, file, line);
     if (!script)
         return JS_FALSE;
 
@@ -456,7 +457,7 @@ js_XDRScript(JSXDRState *xdr, JSScript **scriptp, JSBool *hasMagic)
         version = (uint32)script->version | (script->nfixed << 16);
         lineno = (uint32)script->lineno;
         nslots = (uint32)script->nslots;
-        nslots = (uint32)((script->staticDepth << 16) | script->nslots);
+        nslots = (uint32)((script->staticLevel << 16) | script->nslots);
         natoms = (uint32)script->atomMap.length;
 
         /* Count the srcnotes, keeping notes pointing at the first one. */
@@ -581,7 +582,7 @@ js_XDRScript(JSXDRState *xdr, JSScript **scriptp, JSBool *hasMagic)
         }
         script->lineno = (uintN)lineno;
         script->nslots = (uint16)nslots;
-        script->staticDepth = (uint16)(nslots >> 16);
+        script->staticLevel = (uint16)(nslots >> 16);
     }
 
     for (i = 0; i != natoms; ++i) {
@@ -982,7 +983,7 @@ js_alloc_table_space(void *priv, size_t size)
 }
 
 static void
-js_free_table_space(void *priv, void *item)
+js_free_table_space(void *priv, void *item, size_t size)
 {
     free(item);
 }
@@ -1143,6 +1144,14 @@ SaveScriptFilename(JSRuntime *rt, const char *filename, uint32 flags)
         sfe->flags |= flags;
         sfp->flags |= flags;
     }
+
+#ifdef JS_FUNCTION_METERING
+    size_t len = strlen(sfe->filename);
+    if (len >= sizeof rt->lastScriptFilename)
+        len = sizeof rt->lastScriptFilename - 1;
+    memcpy(rt->lastScriptFilename, sfe->filename, len);
+    rt->lastScriptFilename[len] = '\0';
+#endif
 
     return sfe;
 }
@@ -1470,14 +1479,14 @@ js_NewScriptFromCG(JSContext *cx, JSCodeGenerator *cg)
     script->main += prologLength;
     memcpy(script->code, CG_PROLOG_BASE(cg), prologLength * sizeof(jsbytecode));
     memcpy(script->main, CG_BASE(cg), mainLength * sizeof(jsbytecode));
-    nfixed = (cg->treeContext.flags & TCF_IN_FUNCTION)
-             ? cg->treeContext.u.fun->u.i.nvars
-             : cg->treeContext.ngvars + cg->regexpList.length;
+    nfixed = (cg->flags & TCF_IN_FUNCTION)
+             ? cg->fun->u.i.nvars
+             : cg->ngvars + cg->regexpList.length;
     JS_ASSERT(nfixed < SLOTNO_LIMIT);
     script->nfixed = (uint16) nfixed;
     js_InitAtomMap(cx, &script->atomMap, &cg->atomList);
 
-    filename = cg->treeContext.parseContext->tokenStream.filename;
+    filename = cg->compiler->tokenStream.filename;
     if (filename) {
         script->filename = js_SaveScriptFilename(cx, filename);
         if (!script->filename)
@@ -1490,8 +1499,8 @@ js_NewScriptFromCG(JSContext *cx, JSCodeGenerator *cg)
         goto bad;
     }
     script->nslots = script->nfixed + cg->maxStackDepth;
-    script->staticDepth = cg->staticDepth;
-    script->principals = cg->treeContext.parseContext->principals;
+    script->staticLevel = cg->staticLevel;
+    script->principals = cg->compiler->principals;
     if (script->principals)
         JSPRINCIPALS_HOLD(cx, script->principals);
 
@@ -1500,17 +1509,17 @@ js_NewScriptFromCG(JSContext *cx, JSCodeGenerator *cg)
     if (cg->ntrynotes != 0)
         js_FinishTakingTryNotes(cg, JS_SCRIPT_TRYNOTES(script));
     if (cg->objectList.length != 0)
-        FinishParsedObjects(&cg->objectList, JS_SCRIPT_OBJECTS(script));
+        cg->objectList.finish(JS_SCRIPT_OBJECTS(script));
     if (cg->regexpList.length != 0)
-        FinishParsedObjects(&cg->regexpList, JS_SCRIPT_REGEXPS(script));
-    if (cg->treeContext.flags & TCF_NO_SCRIPT_RVAL)
+        cg->regexpList.finish(JS_SCRIPT_REGEXPS(script));
+    if (cg->flags & TCF_NO_SCRIPT_RVAL)
         script->flags |= JSSF_NO_SCRIPT_RVAL;
 
     if (cg->upvarList.count != 0) {
         JS_ASSERT(cg->upvarList.count <= cg->upvarMap.length);
         memcpy(JS_SCRIPT_UPVARS(script)->vector, cg->upvarMap.vector,
                cg->upvarList.count * sizeof(uint32));
-        ATOM_LIST_INIT(&cg->upvarList);
+        cg->upvarList.clear();
         JS_free(cx, cg->upvarMap.vector);
         cg->upvarMap.vector = NULL;
     }
@@ -1520,8 +1529,8 @@ js_NewScriptFromCG(JSContext *cx, JSCodeGenerator *cg)
      * so that the debugger has a valid FUN_SCRIPT(fun).
      */
     fun = NULL;
-    if (cg->treeContext.flags & TCF_IN_FUNCTION) {
-        fun = cg->treeContext.u.fun;
+    if (cg->flags & TCF_IN_FUNCTION) {
+        fun = cg->fun;
         JS_ASSERT(FUN_INTERPRETED(fun) && !FUN_SCRIPT(fun));
         JS_ASSERT_IF(script->upvarsOffset != 0,
                      JS_SCRIPT_UPVARS(script)->length == fun->u.i.nupvars);
@@ -1531,7 +1540,7 @@ js_NewScriptFromCG(JSContext *cx, JSCodeGenerator *cg)
 #ifdef CHECK_SCRIPT_OWNER
         script->owner = NULL;
 #endif
-        if (cg->treeContext.flags & TCF_FUN_HEAVYWEIGHT)
+        if (cg->flags & TCF_FUN_HEAVYWEIGHT)
             fun->flags |= JSFUN_HEAVYWEIGHT;
     }
 
@@ -1578,13 +1587,13 @@ js_DestroyScript(JSContext *cx, JSScript *script)
         JSPRINCIPALS_DROP(cx, script->principals);
 
     if (JS_GSN_CACHE(cx).code == script->code)
-        JS_CLEAR_GSN_CACHE(cx);
+        JS_PURGE_GSN_CACHE(cx);
 
     /*
      * The GC flushes all property caches, so no need to purge just the
      * entries for this script.
      *
-     * JS_THREADSAFE note: js_FlushPropertyCacheForScript flushes only the
+     * JS_THREADSAFE note: js_PurgePropertyCacheForScript purges only the
      * current thread's property cache, so a script not owned by a function
      * or object, which hands off lifetime management for that script to the
      * GC, must be used by only one thread over its lifetime.
@@ -1605,9 +1614,9 @@ js_DestroyScript(JSContext *cx, JSScript *script)
 #ifdef CHECK_SCRIPT_OWNER
             JS_ASSERT(script->owner == cx->thread);
 #endif
-            js_FlushPropertyCacheForScript(cx, script);
+            js_PurgePropertyCacheForScript(cx, script);
 #ifdef JS_TRACER
-            js_FlushScriptFragments(cx, script);
+            js_PurgeScriptFragments(cx, script);
 #endif
         }
     }
@@ -1676,6 +1685,17 @@ typedef struct GSNCacheEntry {
 
 #define GSN_CACHE_THRESHOLD     100
 
+void
+js_PurgeGSNCache(JSGSNCache *cache)
+{
+    cache->code = NULL;
+    if (cache->table.ops) {
+        JS_DHashTableFinish(&cache->table);
+        cache->table.ops = NULL;
+    }
+    GSN_CACHE_METER(cache, purges);
+}
+
 jssrcnote *
 js_GetSrcNoteCached(JSContext *cx, JSScript *script, jsbytecode *pc)
 {
@@ -1713,7 +1733,7 @@ js_GetSrcNoteCached(JSContext *cx, JSScript *script, jsbytecode *pc)
 
     if (JS_GSN_CACHE(cx).code != script->code &&
         script->length >= GSN_CACHE_THRESHOLD) {
-        JS_CLEAR_GSN_CACHE(cx);
+        JS_PURGE_GSN_CACHE(cx);
         nsrcnotes = 0;
         for (sn = SCRIPT_NOTES(script); !SN_IS_TERMINATOR(sn);
              sn = SN_NEXT(sn)) {

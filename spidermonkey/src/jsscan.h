@@ -137,6 +137,10 @@ typedef enum JSTokenType {
     TOK_SEQ = 82,                       /* synthetic sequence of statements,
                                            not a block */
     TOK_FORHEAD = 83,                   /* head of for(;;)-style loop */
+    TOK_ARGSBODY = 84,                  /* formal args in list + body at end */
+    TOK_UPVARS = 85,                    /* lexical dependencies as JSAtomList
+                                           of definitions paired with a parse
+                                           tree full of uses of those names */
     TOK_RESERVED,                       /* reserved keywords */
     TOK_LIMIT                           /* domain size */
 } JSTokenType;
@@ -172,6 +176,39 @@ js_InitStringBuffer(JSStringBuffer *sb);
 extern void
 js_FinishStringBuffer(JSStringBuffer *sb);
 
+static inline void
+js_RewindStringBuffer(JSStringBuffer *sb)
+{
+    JS_ASSERT(STRING_BUFFER_OK(sb));
+    sb->ptr = sb->base;
+}
+
+#define ENSURE_STRING_BUFFER(sb,n) \
+    ((sb)->ptr + (n) <= (sb)->limit || sb->grow(sb, n))
+
+/*
+ * NB: callers are obligated to test STRING_BUFFER_OK(sb) after this returns,
+ * before calling it again -- but not necessarily before calling other sb ops
+ * declared in this header file.
+ *
+ * Thus multiple calls, to ops other than this one that check STRING_BUFFER_OK
+ * and suppress updating sb if true, can consolidate the final STRING_BUFFER_OK
+ * test that conditions a JS_ReportOutOfMemory (if necessary -- the grow hook
+ * can report OOM early, obviating the need for the callers to report).
+ *
+ * This style of error checking is not obviously better, and it could be worse
+ * in efficiency, than the propagated failure return code style used elsewhere
+ * in the engine. I view it as a failed experiment. /be
+ */
+static inline void
+js_FastAppendChar(JSStringBuffer *sb, jschar c)
+{
+    JS_ASSERT(STRING_BUFFER_OK(sb));
+    if (!ENSURE_STRING_BUFFER(sb, 1))
+        return;
+    *sb->ptr++ = c;
+}
+
 extern void
 js_AppendChar(JSStringBuffer *sb, jschar c);
 
@@ -190,11 +227,45 @@ js_AppendJSString(JSStringBuffer *sb, JSString *str);
 struct JSTokenPtr {
     uint16              index;          /* index of char in physical line */
     uint16              lineno;         /* physical line number */
+
+    bool operator <(const JSTokenPtr& bptr) {
+        return lineno < bptr.lineno ||
+               (lineno == bptr.lineno && index < bptr.index);
+    }
+
+    bool operator <=(const JSTokenPtr& bptr) {
+        return lineno < bptr.lineno ||
+               (lineno == bptr.lineno && index <= bptr.index);
+    }
+
+    bool operator >(const JSTokenPtr& bptr) {
+        return !(*this <= bptr);
+    }
+
+    bool operator >=(const JSTokenPtr& bptr) {
+        return !(*this < bptr);
+    }
 };
 
 struct JSTokenPos {
     JSTokenPtr          begin;          /* first character and line of token */
     JSTokenPtr          end;            /* index 1 past last char, last line */
+
+    bool operator <(const JSTokenPos& bpos) {
+        return begin < bpos.begin;
+    }
+
+    bool operator <=(const JSTokenPos& bpos) {
+        return begin <= bpos.begin;
+    }
+
+    bool operator >(const JSTokenPos& bpos) {
+        return !(*this <= bpos);
+    }
+
+    bool operator >=(const JSTokenPos& bpos) {
+        return !(*this < bpos);
+    }
 };
 
 struct JSToken {
@@ -297,6 +368,9 @@ struct JSTokenStream {
 
 /* Ignore keywords and return TOK_NAME instead to the parser. */
 #define TSF_KEYWORD_IS_NAME 0x4000
+
+/* Parsing a destructuring object or array initialiser pattern. */
+#define TSF_DESTRUCTURING   0x8000
 
 /* Unicode separators that are treated as line terminators, in addition to \n, \r */
 #define LINE_SEPARATOR  0x2028

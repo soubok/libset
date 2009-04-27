@@ -44,6 +44,7 @@
 #if JS_HAS_FILE_OBJECT
 
 #include "jsfile.h"
+#include "jsstdint.h"
 
 /* ----------------- Platform-specific includes and defines ----------------- */
 #if defined(XP_WIN) || defined(XP_OS2)
@@ -56,6 +57,17 @@
 #   define CURRENT_DIR          "c:\\"
 #   define POPEN                _popen
 #   define PCLOSE               _pclose
+#elif defined(SYMBIAN)
+#   include <strings.h>
+#   include <stdio.h>
+#   include <stdlib.h>
+#   include <unistd.h>
+#   include <limits.h>
+#   define FILESEPARATOR        '\\'
+#   define FILESEPARATOR2       '/'
+#   define CURRENT_DIR          "c:\\"
+#   define POPEN                popen
+#   define PCLOSE               pclose
 #elif defined(XP_UNIX) || defined(XP_BEOS)
 #   include <strings.h>
 #   include <stdio.h>
@@ -263,7 +275,7 @@ js_filenameHasAPipe(const char *filename)
 static JSBool
 js_isAbsolute(const char *name)
 {
-#if defined(XP_WIN) || defined(XP_OS2)
+#if defined(XP_WIN) || defined(XP_OS2) || defined(SYMBIAN)
     return *name && name[1] == ':';
 #else
     return (name[0]

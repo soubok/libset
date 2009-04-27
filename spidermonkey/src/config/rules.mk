@@ -131,9 +131,15 @@ endif
 testxpcobjdir = $(DEPTH)/_tests/xpcshell
 
 # Test file installation
+ifdef NSINSTALL_BIN
+# nsinstall in moztools can't recursively copy directories, so use nsinstall.py
+TEST_INSTALLER = $(PYTHON) $(topsrcdir)/config/nsinstall.py
+else
+TEST_INSTALLER = $(INSTALL)
+endif
 
 define _INSTALL_TESTS
-$(INSTALL) $(wildcard $(srcdir)/$(dir)/*.js) $(testxpcobjdir)/$(MODULE)/$(dir)
+$(TEST_INSTALLER) $(wildcard $(srcdir)/$(dir)/*) $(testxpcobjdir)/$(MODULE)/$(dir)
 
 endef # do not remove the blank line!
 
@@ -141,36 +147,37 @@ SOLO_FILE ?= $(error Specify a test filename in SOLO_FILE when using check-inter
 
 libs::
 	$(foreach dir,$(XPCSHELL_TESTS),$(_INSTALL_TESTS))
+	$(PERL) -I$(MOZILLA_DIR)/config $(MOZILLA_DIR)/config/build-list.pl \
+          $(testxpcobjdir)/all-test-dirs.list \
+          $(addprefix $(MODULE)/,$(XPCSHELL_TESTS))
 
 testxpcsrcdir = $(topsrcdir)/testing/xpcshell
 
 # Execute all tests in the $(XPCSHELL_TESTS) directories.
-check::
-	$(PYTHON) \
+# See also testsuite-targets.mk 'xpcshell-tests' target for global execution.
+xpcshell-tests:
+	$(PYTHON) -u \
           $(testxpcsrcdir)/runxpcshelltests.py \
           $(DIST)/bin/xpcshell \
-          $(topsrcdir) \
           $(foreach dir,$(XPCSHELL_TESTS),$(testxpcobjdir)/$(MODULE)/$(dir))
 
 # Execute a single test, specified in $(SOLO_FILE), but don't automatically
 # start the test. Instead, present the xpcshell prompt so the user can
 # attach a debugger and then start the test.
-check-interactive::
-	$(PYTHON) \
+check-interactive:
+	$(PYTHON) -u \
           $(testxpcsrcdir)/runxpcshelltests.py \
           --test=$(SOLO_FILE) \
           --interactive \
           $(DIST)/bin/xpcshell \
-          $(topsrcdir) \
           $(foreach dir,$(XPCSHELL_TESTS),$(testxpcobjdir)/$(MODULE)/$(dir))
 
 # Execute a single test, specified in $(SOLO_FILE)
-check-one::
-	$(PYTHON) \
+check-one:
+	$(PYTHON) -u \
           $(testxpcsrcdir)/runxpcshelltests.py \
           --test=$(SOLO_FILE) \
           $(DIST)/bin/xpcshell \
-          $(topsrcdir) \
           $(foreach dir,$(XPCSHELL_TESTS),$(testxpcobjdir)/$(MODULE)/$(dir))
 
 endif # XPCSHELL_TESTS
@@ -2245,7 +2252,9 @@ documentation:
 	@cd $(DEPTH)
 	$(DOXYGEN) $(DEPTH)/config/doxygen.cfg
 
+ifdef ENABLE_TESTS
 check:: $(SUBMAKEFILES) $(MAKE_DIRS)
 	$(LOOP_OVER_PARALLEL_DIRS)
 	$(LOOP_OVER_DIRS)
 	$(LOOP_OVER_TOOL_DIRS)
+endif

@@ -180,6 +180,8 @@ namespace nanojit
 		NanoAssert(samepage(l,l+LIR_FAR_SLOTS)); // must have called ensureRoom()
         if (can24bReach(l,to))
 		{
+		    NanoStaticAssert(LIR_nearskip == LIR_skip - 1);
+		    NanoStaticAssert(LIR_neartramp == LIR_tramp - 1);
             l->initOpcode(LOpcode(op-1)); // nearskip or neartramp
             l->setimm24(to-l);
             _buf->commit(1);
@@ -1002,6 +1004,7 @@ namespace nanojit
 				}
 			}
 			else {
+				NanoStaticAssert((LIR_xt ^ 1) == LIR_xf);
 				while (c->isop(LIR_eq) && c->oprnd1()->isCmp() && 
 					c->oprnd2()->isconstval(0)) {
 				    // xt(eq(cmp,0)) => xf(cmp)   or   xf(eq(cmp,0)) => xt(cmp)
@@ -1099,29 +1102,14 @@ namespace nanojit
         LOpcode op = (ci->isIndirect() ? k_callimap : k_callmap)[argt & 3];
         NanoAssert(op != LIR_skip); // LIR_skip here is just an error condition
 
-        ArgSize sizes[2*MAXARGS];
+        ArgSize sizes[MAXARGS];
         int32_t argc = ci->get_sizes(sizes);
 
-#ifdef NJ_SOFTFLOAT
-		if (op == LIR_fcall)
-			op = LIR_callh;
-		LInsp args2[MAXARGS*2]; // arm could require 2 args per double
-		int32_t j = 0;
-        int32_t i = 0;
-        while (j < argc) {
-			argt >>= 2;
-			ArgSize a = ArgSize(argt&3);
-			if (a == ARGSIZE_F) {
-				LInsp q = args[i++];
-				args2[j++] = ins1(LIR_qhi, q);
-				args2[j++] = ins1(LIR_qlo, q);
-			} else {
-				args2[j++] = args[i++];
-			}
+		if (AvmCore::config.soft_float) {
+			if (op == LIR_fcall)
+				op = LIR_callh;
 		}
-		args = args2;
-        NanoAssert(j == argc);
-#endif
+
 		//
 		// An example of the what we're trying to serialize:
 		//

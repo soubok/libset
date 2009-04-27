@@ -217,7 +217,7 @@ struct JSScope {
 #define OBJ_SHAPE(obj)                  (OBJ_SCOPE(obj)->shape)
 
 #define SCOPE_MAKE_UNIQUE_SHAPE(cx,scope)                                     \
-    ((scope)->shape = js_GenerateShape((cx), JS_FALSE, NULL))
+    ((scope)->shape = js_GenerateShape((cx), JS_FALSE))
 
 #define SCOPE_EXTEND_SHAPE(cx,scope,sprop)                                    \
     JS_BEGIN_MACRO                                                            \
@@ -225,7 +225,7 @@ struct JSScope {
             (scope)->shape == (scope)->lastProp->shape) {                     \
             (scope)->shape = (sprop)->shape;                                  \
         } else {                                                              \
-            (scope)->shape = js_GenerateShape((cx), JS_FALSE, sprop);         \
+            (scope)->shape = js_GenerateShape(cx, JS_FALSE);                  \
         }                                                                     \
     JS_END_MACRO
 
@@ -375,8 +375,7 @@ js_SetSprop(JSContext* cx, JSScopeProperty* sprop, JSObject* obj, jsval* vp)
     }
 
     if (sprop->attrs & JSPROP_GETTER) {
-        JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
-                             JSMSG_GETTER_ONLY, NULL);
+        js_ReportGetterOnlyAssignment(cx);
         return JS_FALSE;
     }
 
