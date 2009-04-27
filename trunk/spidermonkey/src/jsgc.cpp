@@ -52,6 +52,7 @@
 #include <math.h>
 #include <string.h>     /* for memset used when DEBUG */
 #include "jstypes.h"
+#include "jsstdint.h"
 #include "jsutil.h" /* Added by JSIFY */
 #include "jshash.h" /* Added by JSIFY */
 #include "jsbit.h"
@@ -122,6 +123,9 @@ extern "C" {
 /* On Mac OS X MAP_ANONYMOUS is not defined. */
 #   if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 #    define MAP_ANONYMOUS MAP_ANON
+#   endif
+#   if !defined(MAP_ANONYMOUS)
+#    define MAP_ANONYMOUS 0
 #   endif
 #  else
 #   if JS_GC_USE_MMAP
@@ -1715,7 +1719,7 @@ CloseNativeIterators(JSContext *cx)
 #define NGCHIST 64
 
 static struct GCHist {
-    JSBool      lastDitch;
+    bool        lastDitch;
     JSGCThing   *freeList;
 } gchist[NGCHIST];
 
@@ -1790,15 +1794,21 @@ EnsureLocalFreeList(JSContext *cx)
 
 #endif
 
-static JS_INLINE JSBool
+static JS_INLINE bool
 IsGCThresholdReached(JSRuntime *rt)
 {
+#ifdef JS_GC_ZEAL
+    if (rt->gcZeal >= 1)
+        return true;
+#endif
+
     /*
      * Since the initial value of the gcLastBytes parameter is not equal to
      * zero (see the js_InitGC function) the return value is false when
      * the gcBytes value is close to zero at the JS engine start.
      */
-    return rt->gcBytes / rt->gcTriggerFactor >= rt->gcLastBytes / 100;
+    return rt->gcMallocBytes >= rt->gcMaxMallocBytes ||
+           rt->gcBytes / rt->gcTriggerFactor >= rt->gcLastBytes / 100;
 }
 
 void *
@@ -1806,7 +1816,7 @@ js_NewGCThing(JSContext *cx, uintN flags, size_t nbytes)
 {
     JSRuntime *rt;
     uintN flindex;
-    JSBool doGC;
+    bool doGC;
     JSGCThing *thing;
     uint8 *flagp;
     JSGCArenaList *arenaList;
@@ -1867,17 +1877,13 @@ js_NewGCThing(JSContext *cx, uintN flags, size_t nbytes)
         return NULL;
     }
 
-    doGC = (rt->gcMallocBytes >= rt->gcMaxMallocBytes && rt->gcPoke) ||
-           IsGCThresholdReached(rt);
-#ifdef JS_GC_ZEAL
-    doGC = doGC || rt->gcZeal >= 2 || (rt->gcZeal >= 1 && rt->gcPoke);
-# ifdef JS_TRACER
+#if defined JS_GC_ZEAL && defined JS_TRACER
     if (rt->gcZeal >= 1 && JS_TRACE_MONITOR(cx).useReservedObjects)
         goto testReservedObjects;
-# endif
 #endif
 
     arenaList = &rt->gcArenaList[flindex];
+    doGC = IsGCThresholdReached(rt);
     for (;;) {
         if (doGC
 #ifdef JS_TRACER
@@ -1908,9 +1914,9 @@ js_NewGCThing(JSContext *cx, uintN flags, size_t nbytes)
              * Refill the local free list by taking several things from the
              * global free list unless we are still at rt->gcMaxMallocBytes
              * barrier or the free list is already populated. The former
-             * happens when GC is canceled due to !gcCallback(cx, JSGC_BEGIN)
-             * or no gcPoke. The latter is caused via allocating new things
-             * in gcCallback(cx, JSGC_END).
+             * happens when GC is canceled due to gcCallback(cx, JSGC_BEGIN)
+             * returning false. The latter is caused via allocating new
+             * things in gcCallback(cx, JSGC_END).
              */
             if (rt->gcMallocBytes >= rt->gcMaxMallocBytes)
                 break;
@@ -1967,7 +1973,7 @@ testReservedObjects:
             if (!a) {
                 if (doGC || JS_ON_TRACE(cx))
                     goto fail;
-                doGC = JS_TRUE;
+                doGC = true;
                 continue;
             }
             a->list = arenaList;
@@ -2073,8 +2079,7 @@ fail:
         JS_UNLOCK_GC(rt);
 #endif
     METER(astats->fail++);
-    if (!JS_ON_TRACE(cx))
-        JS_ReportOutOfMemory(cx);
+    js_ReportOutOfMemory(cx);
     return NULL;
 }
 
@@ -2100,14 +2105,8 @@ RefillDoubleFreeList(JSContext *cx)
         return NULL;
     }
 
-    if ((rt->gcMallocBytes >= rt->gcMaxMallocBytes && rt->gcPoke) ||
-        IsGCThresholdReached(rt)
-#ifdef JS_GC_ZEAL
-        || rt->gcZeal >= 2 || (rt->gcZeal >= 1 && rt->gcPoke)
-#endif
-        ) {
+    if (IsGCThresholdReached(rt))
         goto do_gc;
-    }
 
     /*
      * Loop until we find a flag bitmap byte with unset bits indicating free
@@ -2126,8 +2125,7 @@ RefillDoubleFreeList(JSContext *cx)
                     if (didGC || JS_ON_TRACE(cx)) {
                         METER(rt->gcStats.doubleArenaStats.fail++);
                         JS_UNLOCK_GC(rt);
-                        if (!JS_ON_TRACE(cx))
-                            JS_ReportOutOfMemory(cx);
+                        js_ReportOutOfMemory(cx);
                         return NULL;
                     }
                     js_GC(cx, GC_LAST_DITCH);
@@ -2302,11 +2300,7 @@ js_AddAsGCBytes(JSContext *cx, size_t sz)
     rt = cx->runtime;
     if (rt->gcBytes >= rt->gcMaxBytes ||
         sz > (size_t) (rt->gcMaxBytes - rt->gcBytes) ||
-        IsGCThresholdReached(rt)
-#ifdef JS_GC_ZEAL
-        || rt->gcZeal >= 2 || (rt->gcZeal >= 1 && rt->gcPoke)
-#endif
-        ) {
+        IsGCThresholdReached(rt)) {
         if (JS_ON_TRACE(cx)) {
             /*
              * If we can't leave the trace, signal OOM condition, otherwise
@@ -3099,8 +3093,8 @@ js_TraceContext(JSTracer *trc, JSContext *acx)
           case JSTVU_WEAK_ROOTS:
             TraceWeakRoots(trc, tvr->u.weakRoots);
             break;
-          case JSTVU_PARSE_CONTEXT:
-            js_TraceParseContext(trc, tvr->u.parseContext);
+          case JSTVU_COMPILER:
+            tvr->u.compiler->trace(trc);
             break;
           case JSTVU_SCRIPT:
             js_TraceScript(trc, tvr->u.script);
@@ -3117,23 +3111,33 @@ js_TraceContext(JSTracer *trc, JSContext *acx)
     js_TraceRegExpStatics(trc, acx);
 }
 
-void
-js_TraceTraceMonitor(JSTracer *trc, JSTraceMonitor *tm)
+#ifdef JS_TRACER
+
+static void
+MarkReservedObjects(JSTraceMonitor *tm)
 {
-    if (IS_GC_MARKING_TRACER(trc)) {
-        tm->reservedDoublePoolPtr = tm->reservedDoublePool;
-
-        tm->needFlush = JS_TRUE;
-
-        /* Keep the reserved objects. */
-        for (JSObject *obj = tm->reservedObjects; obj; obj = JSVAL_TO_OBJECT(obj->fslots[0])) {
-            uint8 *flagp = GetGCThingFlags(obj);
-            JS_ASSERT((*flagp & GCF_TYPEMASK) == GCX_OBJECT);
-            JS_ASSERT(*flagp != GCF_FINAL);
-            *flagp |= GCF_MARK;
-        }
+    /* Keep the reserved objects. */
+    for (JSObject *obj = tm->reservedObjects; obj; obj = JSVAL_TO_OBJECT(obj->fslots[0])) {
+        uint8 *flagp = GetGCThingFlags(obj);
+        JS_ASSERT((*flagp & GCF_TYPEMASK) == GCX_OBJECT);
+        JS_ASSERT(*flagp != GCF_FINAL);
+        *flagp |= GCF_MARK;
     }
 }
+
+#ifdef JS_THREADSAFE
+static JSDHashOperator
+reserved_objects_marker(JSDHashTable *table, JSDHashEntryHdr *hdr,
+                        uint32, void *)
+{
+    JSThread *thread = ((JSThreadsHashEntry *) hdr)->thread;
+
+    MarkReservedObjects(&thread->data.traceMonitor);
+    return JS_DHASH_NEXT;
+}
+#endif
+
+#endif
 
 JS_REQUIRES_STACK void
 js_TraceRuntime(JSTracer *trc, JSBool allAtoms)
@@ -3161,17 +3165,36 @@ js_TraceRuntime(JSTracer *trc, JSBool allAtoms)
             JS_CALL_OBJECT_TRACER(trc, rt->builtinFunctions[i], "builtin function");
     }
 
+    /* Mark the reserved objects unless we are shutting down. */
+    if (IS_GC_MARKING_TRACER(trc) && rt->state != JSRTS_LANDING) {
 #ifdef JS_THREADSAFE
-    /* Trace the loop table(s) which can contain pointers to code objects. */
-   while ((acx = js_ContextIterator(rt, JS_FALSE, &iter)) != NULL) {
-       if (!acx->thread)
-           continue;
-       js_TraceTraceMonitor(trc, &acx->thread->traceMonitor);
-   }
+        JS_DHashTableEnumerate(&rt->threads, reserved_objects_marker, NULL);
 #else
-   js_TraceTraceMonitor(trc, &rt->traceMonitor);
+        MarkReservedObjects(&rt->threadData.traceMonitor);
 #endif
+    }
+
 #endif
+}
+
+void
+js_TriggerGC(JSContext *cx, JSBool gcLocked)
+{
+    JSRuntime *rt = cx->runtime;
+
+#ifdef JS_THREADSAFE
+    JS_ASSERT(cx->requestDepth > 0);
+#endif
+    JS_ASSERT(!rt->gcRunning);
+    if (rt->gcIsNeeded)
+        return;
+
+    /*
+     * Trigger the GC when it is safe to call an operation callback on any
+     * thread.
+     */
+    rt->gcIsNeeded = JS_TRUE;
+    js_TriggerAllOperationCallbacks(rt, gcLocked);
 }
 
 static void
@@ -3249,15 +3272,18 @@ ProcessSetSlotRequest(JSContext *cx, JSSetSlotRequest *ssr)
     STOBJ_SET_DELEGATE(pobj);
 }
 
-static void
-DestroyScriptsToGC(JSContext *cx, JSScript **listp)
+void
+js_DestroyScriptsToGC(JSContext *cx, JSThreadData *data)
 {
-    JSScript *script;
+    JSScript **listp, *script;
 
-    while ((script = *listp) != NULL) {
-        *listp = script->u.nextToGC;
-        script->u.nextToGC = NULL;
-        js_DestroyScript(cx, script);
+    for (size_t i = 0; i != JS_ARRAY_LENGTH(data->scriptsToGC); ++i) {
+        listp = &data->scriptsToGC[i];
+        while ((script = *listp) != NULL) {
+            *listp = script->u.nextToGC;
+            script->u.nextToGC = NULL;
+            js_DestroyScript(cx, script);
+        }
     }
 }
 
@@ -3281,7 +3307,6 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
     JSBool allClear;
 #ifdef JS_THREADSAFE
     uint32 requestDebit;
-    JSContext *acx, *iter;
 #endif
 #ifdef JS_GCMETER
     uint32 nlivearenas, nkilledarenas, nthings;
@@ -3289,7 +3314,14 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
 
     JS_ASSERT_IF(gckind == GC_LAST_DITCH, !JS_ON_TRACE(cx));
     rt = cx->runtime;
+
 #ifdef JS_THREADSAFE
+    /*
+     * We allow js_GC calls outside a request but the context must be bound
+     * to the current thread.
+     */
+    JS_ASSERT(CURRENT_THREAD_IS_ME(cx->thread));
+
     /* Avoid deadlock. */
     JS_ASSERT(!JS_IS_RUNTIME_LOCKED(rt));
 #endif
@@ -3350,69 +3382,25 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
     rt->gcPoke = JS_FALSE;
 
 #ifdef JS_THREADSAFE
-    JS_ASSERT(cx->thread->id == js_CurrentThreadId());
-    
-    /* Bump gcLevel and return rather than nest on this thread. */
-    if (rt->gcThread == cx->thread) {
-        JS_ASSERT(rt->gcLevel > 0);
-        rt->gcLevel++;
-        METER_UPDATE_MAX(rt->gcStats.maxlevel, rt->gcLevel);
-        if (!(gckind & GC_LOCK_HELD))
-            JS_UNLOCK_GC(rt);
-        return;
-    }
-
     /*
-     * If we're in one or more requests (possibly on more than one context)
-     * running on the current thread, indicate, temporarily, that all these
-     * requests are inactive.  If cx->thread is NULL, then cx is not using
-     * the request model, and does not contribute to rt->requestCount.
+     * Check if the GC is already running on this or another thread and
+     * delegate the job to it.
      */
-    requestDebit = 0;
-    if (cx->thread) {
-        JSCList *head, *link;
-
-        /*
-         * Check all contexts on cx->thread->contextList for active requests,
-         * counting each such context against requestDebit.
-         */
-        head = &cx->thread->contextList;
-        for (link = head->next; link != head; link = link->next) {
-            acx = CX_FROM_THREAD_LINKS(link);
-            JS_ASSERT(acx->thread == cx->thread);
-            if (acx->requestDepth)
-                requestDebit++;
-        }
-    } else {
-        /*
-         * We assert, but check anyway, in case someone is misusing the API.
-         * Avoiding the loop over all of rt's contexts is a win in the event
-         * that the GC runs only on request-less contexts with null threads,
-         * in a special thread such as might be used by the UI/DOM/Layout
-         * "mozilla" or "main" thread in Mozilla-the-browser.
-         */
-        JS_ASSERT(cx->requestDepth == 0);
-        if (cx->requestDepth)
-            requestDebit = 1;
-    }
-    if (requestDebit) {
-        JS_ASSERT(requestDebit <= rt->requestCount);
-        rt->requestCount -= requestDebit;
-        if (rt->requestCount == 0)
-            JS_NOTIFY_REQUEST_DONE(rt);
-    }
-
-    /* If another thread is already in GC, don't attempt GC; wait instead. */
     if (rt->gcLevel > 0) {
+        JS_ASSERT(rt->gcThread);
+
         /* Bump gcLevel to restart the current GC, so it finds new garbage. */
         rt->gcLevel++;
         METER_UPDATE_MAX(rt->gcStats.maxlevel, rt->gcLevel);
 
-        /* Wait for the other thread to finish, then resume our request. */
-        while (rt->gcLevel > 0)
-            JS_AWAIT_GC_DONE(rt);
-        if (requestDebit)
-            rt->requestCount += requestDebit;
+        /*
+         * If the GC runs on another thread, temporarily suspend the current
+         * request and wait until the GC is done.
+         */
+        if (rt->gcThread != cx->thread) {
+            requestDebit = js_DiscountRequestsForGC(cx);
+            js_RecountRequestsAfterGC(rt, requestDebit);
+        }
         if (!(gckind & GC_LOCK_HELD))
             JS_UNLOCK_GC(rt);
         return;
@@ -3430,9 +3418,18 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
      */
     js_NudgeOtherContexts(cx);
 
-    /* Wait for all other requests to finish. */
+    /*
+     * Discount all the requests on the current thread from contributing
+     * to rt->requestCount before we wait for all other requests to finish.
+     * JS_NOTIFY_REQUEST_DONE, which will wake us up, is only called on
+     * rt->requestCount transitions to 0.
+     */
+    requestDebit = js_CountThreadRequests(cx);
+    JS_ASSERT_IF(cx->requestDepth != 0, requestDebit >= 1);
+    rt->requestCount -= requestDebit;
     while (rt->requestCount > 0)
         JS_AWAIT_REQUEST_DONE(rt);
+    rt->requestCount += requestDebit;
 
 #else  /* !JS_THREADSAFE */
 
@@ -3472,7 +3469,7 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
          * collect garbage only if a racing thread attempted GC and is waiting
          * for us to finish (gcLevel > 1) or if someone already poked us.
          */
-        if (rt->gcLevel == 1 && !rt->gcPoke)
+        if (rt->gcLevel == 1 && !rt->gcPoke && !rt->gcIsNeeded)
             goto done_running;
 
         rt->gcLevel = 0;
@@ -3480,7 +3477,6 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
         rt->gcRunning = JS_FALSE;
 #ifdef JS_THREADSAFE
         rt->gcThread = NULL;
-        rt->requestCount += requestDebit;
 #endif
         gckind = GC_LOCK_HELD;
         goto restart_at_beginning;
@@ -3494,6 +3490,9 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
 #endif
     VOUCH_HAVE_STACK();
 
+    /* Clear gcIsNeeded now, when we are about to start a normal GC cycle. */
+    rt->gcIsNeeded = JS_FALSE;
+
     /* Reset malloc counter. */
     rt->gcMallocBytes = 0;
 
@@ -3503,43 +3502,10 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
   }
 #endif
 
-    /* Clear property and JIT oracle caches (only for cx->thread if JS_THREADSAFE). */
-    js_FlushPropertyCache(cx);
 #ifdef JS_TRACER
-    js_FlushJITOracle(cx);
+    js_PurgeJITOracle();
 #endif
-
-    /* Destroy eval'ed scripts. */
-    for (i = 0; i < JS_ARRAY_LENGTH(JS_SCRIPTS_TO_GC(cx)); i++)
-        DestroyScriptsToGC(cx, &JS_SCRIPTS_TO_GC(cx)[i]);
-
-#ifdef JS_THREADSAFE
-    /*
-     * Clear thread-based caches. To avoid redundant clearing we unroll the
-     * current thread's step.
-     *
-     * In case a JSScript wrapped within an object was finalized, we null
-     * acx->thread->gsnCache.script and finish the cache's hashtable. Note
-     * that js_DestroyScript, called from script_finalize, will have already
-     * cleared cx->thread->gsnCache above during finalization, so we don't
-     * have to here.
-     */
-    iter = NULL;
-    while ((acx = js_ContextIterator(rt, JS_FALSE, &iter)) != NULL) {
-        if (!acx->thread || acx->thread == cx->thread)
-            continue;
-        GSN_CACHE_CLEAR(&acx->thread->gsnCache);
-        js_FlushPropertyCache(acx);
-#ifdef JS_TRACER
-        js_FlushJITOracle(acx);
-#endif
-        for (i = 0; i < JS_ARRAY_LENGTH(acx->thread->scriptsToGC); i++)
-            DestroyScriptsToGC(cx, &acx->thread->scriptsToGC[i]);
-    }
-#else
-    /* The thread-unsafe case just has to clear the runtime's GSN cache. */
-    GSN_CACHE_CLEAR(&rt->gsnCache);
-#endif
+    js_PurgeThreads(cx);
 
   restart:
     rt->gcNumber++;
@@ -3822,32 +3788,12 @@ out:
         goto restart;
     }
 
-    if (rt->shapeGen >= SHAPE_OVERFLOW_BIT - 1) {
-        /*
-         * FIXME bug 440834: The shape id space has overflowed. Currently we
-         * cope badly with this. Every call to js_GenerateShape does GC, and
-         * we never re-enable the property cache.
-         */
-        js_DisablePropertyCache(cx);
-#ifdef JS_THREADSAFE
-        iter = NULL;
-        while ((acx = js_ContextIterator(rt, JS_FALSE, &iter)) != NULL) {
-            if (!acx->thread || acx->thread == cx->thread)
-                continue;
-            js_DisablePropertyCache(acx);
-        }
-#endif
-    }
-
     rt->gcLastBytes = rt->gcBytes;
   done_running:
     rt->gcLevel = 0;
     rt->gcRunning = JS_FALSE;
 
 #ifdef JS_THREADSAFE
-    /* If we were invoked during a request, pay back the temporary debit. */
-    if (requestDebit)
-        rt->requestCount += requestDebit;
     rt->gcThread = NULL;
     JS_NOTIFY_GC_DONE(rt);
 
@@ -3894,31 +3840,6 @@ out:
         }
     }
 }
-
-#ifdef JS_THREADSAFE
-
-/*
- * If the GC is running and we're called on another thread, wait for this GC
- * activation to finish. We can safely wait here without fear of deadlock (in
- * the case where we are called within a request on another thread's context)
- * because the GC doesn't set rt->gcRunning until after it has waited for all
- * active requests to end.
- *
- * We call here js_CurrentThreadId() after checking for rt->gcRunning to avoid
- * expensive calls when the GC is not running.
- */
-void
-js_WaitForGC(JSRuntime *rt)
-{
-    JS_ASSERT_IF(rt->gcRunning, rt->gcLevel > 0);
-    if (rt->gcRunning && rt->gcThread->id != js_CurrentThreadId()) {
-        do {
-            JS_AWAIT_GC_DONE(rt);
-        } while (rt->gcRunning);
-    }
-}
-
-#endif
 
 void
 js_UpdateMallocCounter(JSContext *cx, size_t nbytes)

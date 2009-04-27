@@ -235,8 +235,8 @@ BOOLEAN_TO_JSVAL(JSBool b)
 #define JSFUN_FAST_NATIVE     0x0800    /* JSFastNative needs no JSStackFrame */
 
 #define JSFUN_FLAGS_MASK      0x0ff8    /* overlay JSFUN_* attributes --
-                                           note that bit #15 is used internally
-                                           to flag interpreted functions */
+                                           bits 12-15 are used internally to
+                                           flag interpreted functions */
 
 #define JSFUN_STUB_GSOPS      0x1000    /* use JS_PropertyStub getter/setter
                                            instead of defaulting to class gsops
@@ -1399,60 +1399,6 @@ struct JSExtendedClass {
 #define JSCLASS_NO_OPTIONAL_MEMBERS     0,0,0,0,0,0,0,0
 #define JSCLASS_NO_RESERVED_MEMBERS     0,0,0
 
-/* For detailed comments on these function pointer types, see jspubtd.h. */
-struct JSObjectOps {
-    /* Mandatory non-null function pointer members. */
-    JSNewObjectMapOp    newObjectMap;
-    JSObjectMapOp       destroyObjectMap;
-    JSLookupPropOp      lookupProperty;
-    JSDefinePropOp      defineProperty;
-    JSPropertyIdOp      getProperty;
-    JSPropertyIdOp      setProperty;
-    JSAttributesOp      getAttributes;
-    JSAttributesOp      setAttributes;
-    JSPropertyIdOp      deleteProperty;
-    JSConvertOp         defaultValue;
-    JSNewEnumerateOp    enumerate;
-    JSCheckAccessIdOp   checkAccess;
-
-    /* Optionally non-null members start here. */
-    JSObjectOp          thisObject;
-    JSPropertyRefOp     dropProperty;
-    JSNative            call;
-    JSNative            construct;
-    JSXDRObjectOp       xdrObject;
-    JSHasInstanceOp     hasInstance;
-    JSSetObjectSlotOp   setProto;
-    JSSetObjectSlotOp   setParent;
-    JSTraceOp           trace;
-    JSFinalizeOp        clear;
-    JSGetRequiredSlotOp getRequiredSlot;
-    JSSetRequiredSlotOp setRequiredSlot;
-};
-
-struct JSXMLObjectOps {
-    JSObjectOps         base;
-    JSGetMethodOp       getMethod;
-    JSSetMethodOp       setMethod;
-    JSEnumerateValuesOp enumerateValues;
-    JSEqualityOp        equality;
-    JSConcatenateOp     concatenate;
-};
-
-/*
- * Classes that expose JSObjectOps via a non-null getObjectOps class hook may
- * derive a property structure from this struct, return a pointer to it from
- * lookupProperty and defineProperty, and use the pointer to avoid rehashing
- * in getAttributes and setAttributes.
- *
- * The jsid type contains either an int jsval (see JSVAL_IS_INT above), or an
- * internal pointer that is opaque to users of this API, but which users may
- * convert from and to a jsval using JS_ValueToId and JS_IdToValue.
- */
-struct JSProperty {
-    jsid id;
-};
-
 struct JSIdArray {
     jsint length;
     jsid  vector[1];    /* actually, length jsid words */
@@ -1554,8 +1500,8 @@ struct JSFunctionSpec {
  * frame when activated.
  */
 #define JS_FN(name,fastcall,nargs,flags)                                      \
-    {name, (JSNative)(fastcall), nargs,                                       \
-     (flags) | JSFUN_FAST_NATIVE | JSFUN_STUB_GSOPS, 0}
+    JS_FS(name, (JSNative)(fastcall), nargs,                                  \
+          (flags) | JSFUN_FAST_NATIVE | JSFUN_STUB_GSOPS, 0)
 
 extern JS_PUBLIC_API(JSObject *)
 JS_InitClass(JSContext *cx, JSObject *obj, JSObject *parent_proto,

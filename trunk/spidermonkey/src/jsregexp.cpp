@@ -45,6 +45,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include "jstypes.h"
+#include "jsstdint.h"
 #include "jsarena.h" /* Added by JSIFY */
 #include "jsutil.h" /* Added by JSIFY */
 #include "jsapi.h"
@@ -70,6 +71,9 @@
 #include "jstracer.h"
 using namespace avmplus;
 using namespace nanojit;
+
+/* Amount of memory in the RE fragmento before flushing. */
+#define MAX_MEM_IN_RE_FRAGMENTO (1 << 20)
 #endif
 
 typedef enum REOp {
@@ -1266,7 +1270,14 @@ ParseTerm(CompilerState *state)
                 /* Treat this as an octal escape. */
                 goto doOctal;
             }
-            JS_ASSERT(1 <= num && num <= 0x10000);
+
+            /*
+             * When FindParenCount calls the regex parser recursively (to find
+             * the number of backrefs) num can be arbitrary and the maximum
+             * supported number of backrefs does not bound it.
+             */
+            JS_ASSERT_IF(!(state->flags & JSREG_FIND_PAREN_COUNT),
+                         1 <= num && num <= 0x10000);
             state->result = NewRENode(state, REOP_BACKREF);
             if (!state->result)
                 return JS_FALSE;
@@ -2024,7 +2035,7 @@ LookupNativeRegExp(JSContext* cx, void* hash, uint16 re_flags,
             RESideExit* exit = (RESideExit*)fragment->lastIns->record()->exit;
             if (exit->re_flags == re_flags && 
                 exit->re_length == re_length &&
-                !memcmp(exit->re_chars, re_chars, re_length)) {
+                !memcmp(exit->re_chars, re_chars, re_length * sizeof(jschar))) {
                 return fragment;
             }
         }
@@ -2349,7 +2360,7 @@ class RegExpNativeCompiler {
     {
         LIns* skip = lirBufWriter->skip(sizeof(GuardRecord) + 
                                         sizeof(RESideExit) + 
-                                        re_length - sizeof(jschar));
+                                        (re_length-1) * sizeof(jschar));
         GuardRecord* guard = (GuardRecord *) skip->payload();
         memset(guard, 0, sizeof(*guard));
         RESideExit* exit = (RESideExit*)(guard+1);
@@ -2357,7 +2368,7 @@ class RegExpNativeCompiler {
         guard->exit->target = fragment;
         exit->re_flags = re->flags;
         exit->re_length = re_length;
-        memcpy(exit->re_chars, re_chars, re_length);
+        memcpy(exit->re_chars, re_chars, re_length * sizeof(jschar));
         fragment->lastIns = lir->insGuard(LIR_loop, lir->insImm(1), skip);
         return guard;
     }
@@ -2430,7 +2441,8 @@ class RegExpNativeCompiler {
 #endif
         return JS_TRUE;
     fail:
-        if (lirbuf->outOMem() || oom) {
+        if (lirbuf->outOMem() || oom || 
+            js_OverfullFragmento(fragmento, MAX_MEM_IN_RE_FRAGMENTO)) {
             fragmento->clearFrags();
             lirbuf->rewind();
         } else {
@@ -4367,6 +4379,22 @@ js_InitRegExpStatics(JSContext *cx)
     JS_ClearRegExpStatics(cx);
 }
 
+JS_FRIEND_API(void)
+js_SaveRegExpStatics(JSContext *cx, JSRegExpStatics *statics,
+                     JSTempValueRooter *tvr)
+{
+  *statics = cx->regExpStatics;
+  JS_PUSH_TEMP_ROOT_STRING(cx, statics->input, tvr);
+}
+
+JS_FRIEND_API(void)
+js_RestoreRegExpStatics(JSContext *cx, JSRegExpStatics *statics,
+                        JSTempValueRooter *tvr)
+{
+  cx->regExpStatics = *statics;
+  JS_POP_TEMP_ROOT(cx, tvr);
+}
+
 void
 js_TraceRegExpStatics(JSTracer *trc, JSContext *acx)
 {
@@ -4894,21 +4922,6 @@ regexp_test(JSContext *cx, uintN argc, jsval *vp)
     return JS_TRUE;
 }
 
-#ifdef JS_TRACER
-static jsint FASTCALL
-Regexp_p_test(JSContext* cx, JSObject* regexp, JSString* str)
-{
-    jsval vp[3] = { JSVAL_NULL, OBJECT_TO_JSVAL(regexp), STRING_TO_JSVAL(str) };
-    if (!regexp_exec_sub(cx, regexp, 1, vp + 2, JS_TRUE, vp))
-        return JSVAL_TO_BOOLEAN(JSVAL_VOID);
-    return *vp == JSVAL_TRUE;
-}
-
-JS_DEFINE_TRCINFO_1(regexp_test,
-    (3, (static, BOOL_RETRY, Regexp_p_test, CONTEXT, THIS, STRING,  1, 1)))
-
-#endif
-
 static JSFunctionSpec regexp_methods[] = {
 #if JS_HAS_TOSOURCE
     JS_FN(js_toSource_str,  regexp_toString,    0,0),
@@ -4916,7 +4929,7 @@ static JSFunctionSpec regexp_methods[] = {
     JS_FN(js_toString_str,  regexp_toString,    0,0),
     JS_FN("compile",        regexp_compile,     2,0),
     JS_FN("exec",           regexp_exec,        1,0),
-    JS_TN("test",           regexp_test,        1,0, regexp_test_trcinfo),
+    JS_FN("test",           regexp_test,        1,0),
     JS_FS_END
 };
 

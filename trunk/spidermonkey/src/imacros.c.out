@@ -279,6 +279,31 @@ static struct {
     },
 };
 static struct {
+    jsbytecode String[39];
+} new_imacros = {
+    {
+/* 0*/  JSOP_DUP,
+/* 1*/  JSOP_DUP,
+/* 2*/  JSOP_GETPROP, 0, COMMON_ATOM_INDEX(toString),
+/* 5*/  JSOP_IFPRIMTOP, 0, 13,
+/* 8*/  JSOP_SWAP,
+/* 9*/  JSOP_CALL, 0, 0,
+/*12*/  JSOP_IFPRIMTOP, 0, 21,
+/*15*/  JSOP_GOTO, 0, 4,
+/*18*/  JSOP_POP,
+/*19*/  JSOP_POP,
+/*20*/  JSOP_CALLPROP, 0, COMMON_ATOM_INDEX(valueOf),
+/*23*/  JSOP_STRING, 0, COMMON_TYPE_ATOM_INDEX(JSTYPE_STRING),
+/*26*/  JSOP_CALL, 0, 1,
+/*29*/  JSOP_PRIMTOP,
+/*30*/  JSOP_GOTO, 0, 5,
+/*33*/  JSOP_SWAP,
+/*34*/  JSOP_POP,
+/*35*/  JSOP_NEW, 0, 1,
+/*38*/  JSOP_STOP,
+    },
+};
+static struct {
     jsbytecode apply0[8];
     jsbytecode apply1[12];
     jsbytecode apply2[16];
@@ -508,7 +533,7 @@ static struct {
     {
 /* 0*/  JSOP_SWAP,
 /* 1*/  JSOP_POP,
-/* 2*/  JSOP_NULLTHIS,
+/* 2*/  JSOP_NULL,
 /* 3*/  JSOP_CALL, 0, 0,
 /* 6*/  JSOP_STOP,
     },
@@ -599,7 +624,7 @@ static struct {
     },
 };
 static struct {
-    jsbytecode custom_iter_next[10];
+    jsbytecode custom_iter_next[12];
     jsbytecode native_iter_next[12];
 } nextiter_imacros = {
     {
@@ -607,8 +632,10 @@ static struct {
 /* 1*/  JSOP_DUP,
 /* 2*/  JSOP_CALLPROP, 0, COMMON_ATOM_INDEX(next),
 /* 5*/  JSOP_CALL, 0, 0,
-/* 8*/  JSOP_TRUE,
-/* 9*/  JSOP_STOP,
+/* 8*/  JSOP_DUP,
+/* 9*/  JSOP_HOLE,
+/*10*/  JSOP_STRICTNE,
+/*11*/  JSOP_STOP,
     },
     {
 /* 0*/  JSOP_POP,
@@ -641,6 +668,29 @@ static struct {
     },
 };
 static struct {
+    jsbytecode callprop[12];
+    jsbytecode callelem[12];
+} callelem_imacros = {
+    {
+/* 0*/  JSOP_SWAP,
+/* 1*/  JSOP_DUP,
+/* 2*/  JSOP_CALLBUILTIN, ((JSBUILTIN_GetProperty) & 0xff00) >> 8, ((JSBUILTIN_GetProperty) & 0xff),
+/* 5*/  JSOP_PICK, 3,
+/* 7*/  JSOP_CALL, 0, 1,
+/*10*/  JSOP_SWAP,
+/*11*/  JSOP_STOP,
+    },
+    {
+/* 0*/  JSOP_SWAP,
+/* 1*/  JSOP_DUP,
+/* 2*/  JSOP_CALLBUILTIN, ((JSBUILTIN_GetElement) & 0xff00) >> 8, ((JSBUILTIN_GetElement) & 0xff),
+/* 5*/  JSOP_PICK, 3,
+/* 7*/  JSOP_CALL, 0, 1,
+/*10*/  JSOP_SWAP,
+/*11*/  JSOP_STOP,
+    },
+};
+static struct {
     jsbytecode setprop[15];
     jsbytecode setelem[15];
 } setelem_imacros = {
@@ -666,8 +716,19 @@ static struct {
     },
 };
 static struct {
+    jsbytecode initprop[15];
     jsbytecode initelem[15];
 } initelem_imacros = {
+    {
+/* 0*/  JSOP_PICK, 2,
+/* 2*/  JSOP_DUP,
+/* 3*/  JSOP_CALLBUILTIN, ((JSBUILTIN_SetProperty) & 0xff00) >> 8, ((JSBUILTIN_SetProperty) & 0xff),
+/* 6*/  JSOP_PICK, 4,
+/* 8*/  JSOP_PICK, 4,
+/*10*/  JSOP_CALL, 0, 2,
+/*13*/  JSOP_POP,
+/*14*/  JSOP_STOP,
+    },
     {
 /* 0*/  JSOP_PICK, 2,
 /* 2*/  JSOP_DUP,
@@ -754,7 +815,7 @@ uint8 js_opcode2extra[JSOP_LIMIT] = {
     0,  /* JSOP_LOOKUPSWITCH */
     0,  /* JSOP_STRICTEQ */
     0,  /* JSOP_STRICTNE */
-    0,  /* JSOP_NULLTHIS */
+    0,  /* JSOP_SETCALL */
     3,  /* JSOP_ITER */
     2,  /* JSOP_NEXTITER */
     0,  /* JSOP_ENDITER */
@@ -762,7 +823,7 @@ uint8 js_opcode2extra[JSOP_LIMIT] = {
     0,  /* JSOP_SWAP */
     0,  /* JSOP_OBJECT */
     0,  /* JSOP_POP */
-    0,  /* JSOP_NEW */
+    2,  /* JSOP_NEW */
     0,  /* JSOP_TRAP */
     0,  /* JSOP_GETARG */
     0,  /* JSOP_SETARG */
@@ -808,14 +869,14 @@ uint8 js_opcode2extra[JSOP_LIMIT] = {
     0,  /* JSOP_DEFFUN */
     0,  /* JSOP_DEFCONST */
     0,  /* JSOP_DEFVAR */
-    0,  /* JSOP_ANONFUNOBJ */
-    0,  /* JSOP_NAMEDFUNOBJ */
+    0,  /* JSOP_LAMBDA */
+    0,  /* JSOP_CALLEE */
     0,  /* JSOP_SETLOCALPOP */
-    0,  /* JSOP_IFPRIMTOP */
-    0,  /* JSOP_SETCALL */
+    0,  /* JSOP_PICK */
     0,  /* JSOP_TRY */
     0,  /* JSOP_FINALLY */
-    0,  /* JSOP_OBJTOP */
+    0,  /* JSOP_GETDSLOT */
+    0,  /* JSOP_CALLDSLOT */
     0,  /* JSOP_ARGSUB */
     0,  /* JSOP_ARGCNT */
     0,  /* JSOP_DEFLOCALFUN */
@@ -865,8 +926,8 @@ uint8 js_opcode2extra[JSOP_LIMIT] = {
     0,  /* JSOP_XMLCOMMENT */
     0,  /* JSOP_XMLPI */
     0,  /* JSOP_CALLPROP */
-    0,  /* JSOP_GETFUNNS */
     0,  /* JSOP_GETUPVAR */
+    0,  /* JSOP_CALLUPVAR */
     0,  /* JSOP_DELDESC */
     0,  /* JSOP_UINT24 */
     0,  /* JSOP_INDEXBASE */
@@ -874,32 +935,24 @@ uint8 js_opcode2extra[JSOP_LIMIT] = {
     0,  /* JSOP_RESETBASE0 */
     0,  /* JSOP_STARTXML */
     0,  /* JSOP_STARTXMLEXPR */
-    0,  /* JSOP_CALLELEM */
+    3,  /* JSOP_CALLELEM */
     0,  /* JSOP_STOP */
     0,  /* JSOP_GETXPROP */
     0,  /* JSOP_CALLXMLNAME */
     0,  /* JSOP_TYPEOFEXPR */
     0,  /* JSOP_ENTERBLOCK */
     0,  /* JSOP_LEAVEBLOCK */
-    0,  /* JSOP_PICK */
+    0,  /* JSOP_IFPRIMTOP */
     0,  /* JSOP_PRIMTOP */
-    0,  /* JSOP_UNUSED203 */
-    0,  /* JSOP_UNUSED204 */
-    0,  /* JSOP_UNUSED205 */
-    0,  /* JSOP_UNUSED206 */
-    0,  /* JSOP_UNUSED207 */
-    0,  /* JSOP_UNUSED208 */
-    0,  /* JSOP_UNUSED209 */
     0,  /* JSOP_GENERATOR */
     0,  /* JSOP_YIELD */
     0,  /* JSOP_ARRAYPUSH */
-    0,  /* JSOP_CALLUPVAR */
+    0,  /* JSOP_GETFUNNS */
     0,  /* JSOP_ENUMCONSTELEM */
     0,  /* JSOP_LEAVEBLOCKEXPR */
     0,  /* JSOP_GETTHISPROP */
     0,  /* JSOP_GETARGPROP */
     0,  /* JSOP_GETLOCALPROP */
-    0,  /* JSOP_UNUSED219 */
     0,  /* JSOP_INDEXBASE1 */
     0,  /* JSOP_INDEXBASE2 */
     0,  /* JSOP_INDEXBASE3 */
@@ -912,6 +965,10 @@ uint8 js_opcode2extra[JSOP_LIMIT] = {
     0,  /* JSOP_LENGTH */
     0,  /* JSOP_NEWARRAY */
     0,  /* JSOP_HOLE */
+    0,  /* JSOP_DEFFUN_FC */
+    0,  /* JSOP_DEFLOCALFUN_FC */
+    0,  /* JSOP_LAMBDA_FC */
+    0,  /* JSOP_OBJTOP */
     0,  /* JSOP_LOOP */
 };
 #define JSOP_IS_IMACOP(x) (0 \
@@ -940,5 +997,7 @@ uint8 js_opcode2extra[JSOP_LIMIT] = {
  || x == JSOP_ITER \
  || x == JSOP_NEXTITER \
  || x == JSOP_APPLY \
+ || x == JSOP_NEW \
  || x == JSOP_INITELEM \
+ || x == JSOP_CALLELEM \
 )
