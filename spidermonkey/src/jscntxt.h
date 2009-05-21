@@ -123,24 +123,18 @@ struct GlobalState {
  */
 struct JSTraceMonitor {
     /*
-     * Flag set when running (or recording) JIT-compiled code. This prevents
-     * both interpreter activation and last-ditch garbage collection when up
-     * against our runtime's memory limits. This flag also suppresses calls to
-     * JS_ReportOutOfMemory when failing due to runtime limits.
+     * The context currently executing JIT-compiled code on this thread, or
+     * NULL if none. Among other things, this can in certain cases prevent
+     * last-ditch GC and suppress calls to JS_ReportOutOfMemory.
      *
-     * !onTrace && !recorder: not on trace.
-     * onTrace && recorder: recording a trace.
-     * onTrace && !recorder: executing a trace.
-     * !onTrace && recorder && !prohibitFlush:
-     *      not on trace; deep-aborted while recording.
-     * !onTrace && recorder && prohibitFlush:
-     *      not on trace; deep-bailed in SpiderMonkey code called from a
-     *      trace. JITted code is on the stack.
+     * !tracecx && !recorder: not on trace
+     * !tracecx && !recorder && prohibitFlush: deep-bailed
+     * !tracecx && recorder && !recorder->deepAborted: recording
+     * !tracecx && recorder && recorder->deepAborted: deep aborted
+     * tracecx && !recorder: executing a trace
+     * tracecx && recorder: executing inner loop, recording outer loop
      */
-    JSPackedBool            onTrace;
-
-    /* See reservedObjects below. */
-    JSPackedBool            useReservedObjects;
+    JSContext               *tracecx;
 
     CLS(nanojit::LirBuffer) lirbuf;
     CLS(nanojit::Fragmento) fragmento;
@@ -148,22 +142,31 @@ struct JSTraceMonitor {
     jsval                   *reservedDoublePool;
     jsval                   *reservedDoublePoolPtr;
 
-    struct GlobalState globalStates[MONITOR_N_GLOBAL_STATES];
-    struct VMFragment* vmfragments[FRAGMENT_TABLE_SIZE];
-
+    struct GlobalState      globalStates[MONITOR_N_GLOBAL_STATES];
+    struct VMFragment*      vmfragments[FRAGMENT_TABLE_SIZE];
+    JSDHashTable            recordAttempts;
 
     /*
-     * If nonzero, do not flush the JIT cache after a deep bail.  That would
-     * free JITted code pages that we will later return to.  Instead, set
-     * the needFlush flag so that it can be flushed later.
+     * Maximum size of the code cache before we start flushing. 1/16 of this
+     * size is used as threshold for the regular expression code cache.
+     */
+    uint32                  maxCodeCacheBytes;
+
+    /*
+     * If nonzero, do not flush the JIT cache after a deep bail. That would
+     * free JITted code pages that we will later return to. Instead, set the
+     * needFlush flag so that it can be flushed later.
+     *
+     * NB: needFlush and useReservedObjects are packed together.
      */
     uintN                   prohibitFlush;
-    JSBool                  needFlush;
+    JSPackedBool            needFlush;
 
     /*
      * reservedObjects is a linked list (via fslots[0]) of preallocated JSObjects.
      * The JIT uses this to ensure that leaving a trace tree can't fail.
      */
+    JSPackedBool            useReservedObjects;
     JSObject                *reservedObjects;
 
     /* Fragmento for the regular expression compiler. This is logically
@@ -184,7 +187,7 @@ typedef struct InterpStruct InterpStruct;
  * executing.  cx must be a context on the current thread.
  */
 #ifdef JS_TRACER
-# define JS_ON_TRACE(cx)            (JS_TRACE_MONITOR(cx).onTrace)
+# define JS_ON_TRACE(cx)            (JS_TRACE_MONITOR(cx).tracecx != NULL)
 #else
 # define JS_ON_TRACE(cx)            JS_FALSE
 #endif
@@ -235,11 +238,6 @@ struct JSThreadData {
     /* Property cache for faster call/get/set invocation. */
     JSPropertyCache     propertyCache;
 
-/*
- * N.B. JS_ON_TRACE(cx) is true if JIT code is on the stack in the current
- * thread, regardless of whether cx is the context in which that trace is
- * executing.  cx must be a context on the current thread.
- */
 #ifdef JS_TRACER
     /* Trace-tree JIT recorder/interpreter state. */
     JSTraceMonitor      traceMonitor;
@@ -260,7 +258,7 @@ struct JSThreadData {
  * that can be accessed without a global lock.
  */
 struct JSThread {
-    /* Linked list of all contexts active on this thread. */
+    /* Linked list of all contexts in use on this thread. */
     JSCList             contextList;
 
     /* Opaque thread-id, from NSPR's PR_GetCurrentThread(). */
@@ -275,6 +273,7 @@ struct JSThread {
     /* Indicates that the thread is waiting in ClaimTitle from jslock.cpp. */
     JSTitle             *titleToShare;
 
+    /* Factored out of JSThread for !JS_THREADSAFE embedding in JSRuntime. */
     JSThreadData        data;
 };
 
@@ -336,7 +335,7 @@ struct JSSetSlotRequest {
     JSObject            *obj;           /* object containing slot to set */
     JSObject            *pobj;          /* new proto or parent reference */
     uint16              slot;           /* which to set, proto or parent */
-    uint16              errnum;         /* JSMSG_NO_ERROR or error result */
+    JSPackedBool        cycle;          /* true if a cycle was detected */
     JSSetSlotRequest    *next;          /* next request in GC worklist */
 };
 
@@ -346,6 +345,20 @@ struct JSRuntime {
 
     /* Context create/destroy callback. */
     JSContextCallback   cxCallback;
+
+    /*
+     * Shape regenerated whenever a prototype implicated by an "add property"
+     * property cache fill and induced trace guard has a readonly property or a
+     * setter defined on it. This number proxies for the shapes of all objects
+     * along the prototype chain of all objects in the runtime on which such an
+     * add-property result has been cached/traced.
+     *
+     * See bug 492355 for more details.
+     *
+     * This comes early in JSRuntime to minimize the immediate format used by
+     * trace-JITted code that reads it.
+     */
+    uint32              protoHazardShape;
 
     /* Garbage collector state, used by jsgc.c. */
     JSGCChunkInfo       *gcChunkList;
@@ -1016,6 +1029,10 @@ struct JSContext {
      */
     InterpState         *interpState;
     VMSideExit          *bailExit;
+
+    /* Used when calling natives from trace to root the vp vector. */
+    uintN               nativeVpLen;
+    jsval               *nativeVp;
 #endif
 };
 
@@ -1445,9 +1462,9 @@ js_GetCurrentBytecodePC(JSContext* cx);
 
 #ifdef JS_TRACER
 /*
- * Reconstruct the JS stack and clear cx->onTrace. We must be currently
- * executing a _FAIL builtin from trace on cx. The machine code for the trace
- * remains on the C stack when js_DeepBail returns.
+ * Reconstruct the JS stack and clear cx->tracecx. We must be currently in a
+ * _FAIL builtin from trace on cx or another context on the same thread. The
+ * machine code for the trace remains on the C stack when js_DeepBail returns.
  *
  * Implemented in jstracer.cpp.
  */
@@ -1462,6 +1479,13 @@ js_LeaveTrace(JSContext *cx)
     if (JS_ON_TRACE(cx))
         js_DeepBail(cx);
 #endif
+}
+
+static JS_INLINE void
+js_LeaveTraceIfGlobalObject(JSContext *cx, JSObject *obj)
+{
+    if (!obj->fslots[JSSLOT_PARENT])
+        js_LeaveTrace(cx);
 }
 
 static JS_INLINE JSBool

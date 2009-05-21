@@ -1821,7 +1821,7 @@ EmitEnterBlock(JSContext *cx, JSParseNode *pn, JSCodeGenerator *cg)
 #endif
     }
 
-    blockObj->map->freeslot = JSSLOT_FREE(&js_BlockClass);
+    OBJ_SCOPE(blockObj)->freeslot = JSSLOT_FREE(&js_BlockClass);
     js_ReallocSlots(cx, blockObj, JSSLOT_FREE(&js_BlockClass), JS_TRUE);
     return true;
 }
@@ -1843,11 +1843,34 @@ EmitEnterBlock(JSContext *cx, JSParseNode *pn, JSCodeGenerator *cg)
 static bool
 MakeUpvarForEval(JSParseNode *pn, JSCodeGenerator *cg)
 {
-    if (cg->funbox && (cg->funbox->node->pn_dflags & PND_FUNARG))
-        return true;
-
     JSContext *cx = cg->compiler->context;
     JSFunction *fun = cg->compiler->callerFrame->fun;
+    uintN upvarLevel = fun->u.i.script->staticLevel;
+
+    JSFunctionBox *funbox = cg->funbox;
+    if (funbox) {
+        /*
+         * Treat top-level function definitions as escaping (i.e., as funargs),
+         * required since we compile each such top level function or statement
+         * and throw away the AST, so we can't yet see all funarg uses of this
+         * function being compiled (cg->funbox->object). See bug 493177.
+         */
+        if (funbox->level == fun->u.i.script->staticLevel + 1U &&
+            !(((JSFunction *) funbox->object)->flags & JSFUN_LAMBDA)) {
+            JS_ASSERT_IF(cx->options & JSOPTION_ANONFUNFIX,
+                         ((JSFunction *) funbox->object)->atom);
+            return true;
+        }
+
+        while (funbox->level >= upvarLevel) {
+            if (funbox->node->pn_dflags & PND_FUNARG)
+                return true;
+            funbox = funbox->parent;
+            if (!funbox)
+                break;
+        }
+    }
+
     JSAtom *atom = pn->pn_atom;
 
     uintN index;
@@ -1855,7 +1878,6 @@ MakeUpvarForEval(JSParseNode *pn, JSCodeGenerator *cg)
     if (localKind == JSLOCAL_NONE)
         return true;
 
-    uintN upvarLevel = fun->u.i.script->staticLevel;
     JS_ASSERT(cg->staticLevel > upvarLevel);
     if (cg->staticLevel >= JS_DISPLAY_SIZE || upvarLevel >= JS_DISPLAY_SIZE)
         return true;
@@ -3828,13 +3850,10 @@ EmitGroupAssignment(JSContext *cx, JSCodeGenerator *cg, JSOp prologOp,
             return JS_FALSE;
         }
 
-        if (pn->pn_type == TOK_COMMA) {
-            if (js_Emit1(cx, cg, JSOP_PUSH) < 0)
-                return JS_FALSE;
-        } else {
-            if (!js_EmitTree(cx, cg, pn))
-                return JS_FALSE;
-        }
+        /* MaybeEmitGroupAssignment won't call us if rhs is holey. */
+        JS_ASSERT(pn->pn_type != TOK_COMMA);
+        if (!js_EmitTree(cx, cg, pn))
+            return JS_FALSE;
         ++limit;
     }
 
@@ -3843,17 +3862,13 @@ EmitGroupAssignment(JSContext *cx, JSCodeGenerator *cg, JSOp prologOp,
 
     i = depth;
     for (pn = lhs->pn_head; pn; pn = pn->pn_next, ++i) {
-        if (i < limit) {
-            jsint slot;
+        /* MaybeEmitGroupAssignment requires lhs->pn_count <= rhs->pn_count. */
+        JS_ASSERT(i < limit);
+        jsint slot = AdjustBlockSlot(cx, cg, i);
+        if (slot < 0)
+            return JS_FALSE;
+        EMIT_UINT16_IMM_OP(JSOP_GETLOCAL, slot);
 
-            slot = AdjustBlockSlot(cx, cg, i);
-            if (slot < 0)
-                return JS_FALSE;
-            EMIT_UINT16_IMM_OP(JSOP_GETLOCAL, slot);
-        } else {
-            if (js_Emit1(cx, cg, JSOP_PUSH) < 0)
-                return JS_FALSE;
-        }
         if (pn->pn_type == TOK_COMMA && pn->pn_arity == PN_NULLARY) {
             if (js_Emit1(cx, cg, JSOP_POP) < 0)
                 return JS_FALSE;
@@ -3885,6 +3900,7 @@ MaybeEmitGroupAssignment(JSContext *cx, JSCodeGenerator *cg, JSOp prologOp,
     lhs = pn->pn_left;
     rhs = pn->pn_right;
     if (lhs->pn_type == TOK_RB && rhs->pn_type == TOK_RB &&
+        !(rhs->pn_xflags & PNX_HOLEY) &&
         lhs->pn_count <= rhs->pn_count) {
         if (!EmitGroupAssignment(cx, cg, prologOp, lhs, rhs))
             return JS_FALSE;

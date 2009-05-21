@@ -149,7 +149,11 @@ typedef enum JSTokenType {
     ((uintN)((tt) - TOK_NAME) <= (uintN)(TOK_PRIMARY - TOK_NAME))
 
 #define TOKEN_TYPE_IS_XML(tt) \
-    (tt == TOK_AT || tt == TOK_DBLCOLON || tt == TOK_ANYNAME)
+    ((tt) == TOK_AT || (tt) == TOK_DBLCOLON || (tt) == TOK_ANYNAME)
+
+#define TREE_TYPE_IS_XML(tt)                                                  \
+    ((tt) == TOK_XMLCOMMENT || (tt) == TOK_XMLCDATA || (tt) == TOK_XMLPI ||   \
+     (tt) == TOK_XMLELEM || (tt) == TOK_XMLLIST)
 
 #if JS_HAS_BLOCK_SCOPE
 # define TOKEN_TYPE_IS_DECL(tt) ((tt) == TOK_VAR || (tt) == TOK_LET)
@@ -225,8 +229,8 @@ extern void
 js_AppendJSString(JSStringBuffer *sb, JSString *str);
 
 struct JSTokenPtr {
-    uint16              index;          /* index of char in physical line */
-    uint16              lineno;         /* physical line number */
+    uint32              index;          /* index of char in physical line */
+    uint32              lineno;         /* physical line number */
 
     bool operator <(const JSTokenPtr& bptr) {
         return lineno < bptr.lineno ||
@@ -312,8 +316,8 @@ struct JSTokenStream {
     uintN               ungetpos;       /* next free char slot in ungetbuf */
     jschar              ungetbuf[6];    /* at most 6, for \uXXXX lookahead */
     uintN               flags;          /* flags -- see below */
-    ptrdiff_t           linelen;        /* physical linebuf segment length */
-    ptrdiff_t           linepos;        /* linebuf offset in physical line */
+    uint32              linelen;        /* physical linebuf segment length */
+    uint32              linepos;        /* linebuf offset in physical line */
     JSTokenBuf          linebuf;        /* line buffer for diagnostics */
     JSTokenBuf          userbuf;        /* user input buffer if !file */
     JSStringBuffer      tokenbuf;       /* current token string buffer */
