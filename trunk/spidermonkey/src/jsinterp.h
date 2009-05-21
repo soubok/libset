@@ -189,7 +189,6 @@ typedef struct JSInlineFrame {
 #define JSFRAME_YIELDING       0x40 /* js_Interpret dispatched JSOP_YIELD */
 #define JSFRAME_ITERATOR       0x80 /* trying to get an iterator for for-in */
 #define JSFRAME_GENERATOR     0x200 /* frame belongs to generator-iterator */
-#define JSFRAME_IMACRO_START  0x400 /* imacro starting -- see jstracer.h */
 
 #define JSFRAME_OVERRIDE_SHIFT 24   /* override bit-set params; see jsfun.c */
 #define JSFRAME_OVERRIDE_BITS  8
@@ -236,7 +235,7 @@ typedef struct JSInlineFrame {
 #define PCVCAP_TAGMASK          JS_BITMASK(PCVCAP_TAGBITS)
 #define PCVCAP_TAG(t)           ((t) & PCVCAP_TAGMASK)
 
-#define PCVCAP_MAKE(t,s,p)      (((t) << PCVCAP_TAGBITS) |                    \
+#define PCVCAP_MAKE(t,s,p)      ((uint32(t) << PCVCAP_TAGBITS) |              \
                                  ((s) << PCVCAP_PROTOBITS) |                  \
                                  (p))
 #define PCVCAP_SHAPE(t)         ((t) >> PCVCAP_TAGBITS)
@@ -271,11 +270,13 @@ typedef struct JSPropertyCache {
     JSPropCacheEntry    table[PROPERTY_CACHE_SIZE];
     JSBool              empty;
 #ifdef JS_PROPERTY_CACHE_METERING
+    JSPropCacheEntry    *pctestentry;   /* entry of the last PC-based test */
     uint32              fills;          /* number of cache entry fills */
     uint32              nofills;        /* couldn't fill (e.g. default get) */
     uint32              rofills;        /* set on read-only prop can't fill */
     uint32              disfills;       /* fill attempts on disabled cache */
     uint32              oddfills;       /* fill attempt after setter deleted */
+    uint32              modfills;       /* fill that rehashed to a new entry */
     uint32              brandfills;     /* scope brandings to type structural
                                            method fills */
     uint32              noprotos;       /* resolve-returned non-proto pobj */
@@ -348,9 +349,9 @@ typedef struct JSPropertyCache {
  * possible.
  */
 extern JS_REQUIRES_STACK JSPropCacheEntry *
-js_FillPropertyCache(JSContext *cx, JSObject *obj, jsuword kshape,
-                     uintN scopeIndex, uintN protoIndex,
-                     JSObject *pobj, JSScopeProperty *sprop);
+js_FillPropertyCache(JSContext *cx, JSObject *obj,
+                     uintN scopeIndex, uintN protoIndex, JSObject *pobj,
+                     JSScopeProperty *sprop, JSBool adding);
 
 /*
  * Property cache lookup macros. PROPERTY_CACHE_TEST is designed to inline the
@@ -373,6 +374,7 @@ js_FillPropertyCache(JSContext *cx, JSObject *obj, jsuword kshape,
         JSPropertyCache *cache_ = &JS_PROPERTY_CACHE(cx);                     \
         uint32 kshape_ = (JS_ASSERT(OBJ_IS_NATIVE(obj)), OBJ_SHAPE(obj));     \
         entry = &cache_->table[PROPERTY_CACHE_HASH_PC(pc, kshape_)];          \
+        PCMETER(cache_->pctestentry = entry);                                 \
         PCMETER(cache_->tests++);                                             \
         JS_ASSERT(&obj != &pobj);                                             \
         if (entry->kpc == pc && entry->kshape == kshape_) {                   \
@@ -527,7 +529,7 @@ extern JSBool
 js_InternalGetOrSet(JSContext *cx, JSObject *obj, jsid id, jsval fval,
                     JSAccessMode mode, uintN argc, jsval *argv, jsval *rval);
 
-extern JSBool
+extern JS_FORCES_STACK JSBool
 js_Execute(JSContext *cx, JSObject *chain, JSScript *script,
            JSStackFrame *down, uintN flags, jsval *result);
 
@@ -553,7 +555,7 @@ js_InternNonIntElementId(JSContext *cx, JSObject *obj, jsval idval, jsid *idp);
  * Given an active context, a static scope level, and an upvar cookie, return
  * the value of the upvar.
  */
-extern jsval
+extern jsval&
 js_GetUpvar(JSContext *cx, uintN level, uintN cookie);
 
 /*
