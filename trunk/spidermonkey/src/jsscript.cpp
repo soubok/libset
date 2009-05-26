@@ -264,7 +264,7 @@ script_compile_sub(JSContext *cx, JSObject *obj, uintN argc, jsval *argv,
      */
     tcflags = 0;
     script = JSCompiler::compileScript(cx, scopeobj, NULL, principals, tcflags,
-                                      JSSTRING_CHARS(str), JSSTRING_LENGTH(str),
+                                      STRING_CHARS(str), JSSTRING_LENGTH(str),
                                       NULL, file, line);
     if (!script)
         return JS_FALSE;
