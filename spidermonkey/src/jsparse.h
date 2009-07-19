@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set ts=8 sw=4 et tw=78:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -417,6 +417,9 @@ struct JSParseNode {
 #define PND_PLACEHOLDER 0x80            /* placeholder definition for lexdep */
 #define PND_FUNARG     0x100            /* downward or upward funarg usage */
 #define PND_BOUND      0x200            /* bound to a stack or global slot */
+
+/* Flags to propagate from uses to definition. */
+#define PND_USE2DEF_FLAGS (PND_ASSIGNED | PND_FUNARG)
 
 /* PN_LIST pn_xflags bits. */
 #define PNX_STRCAT      0x01            /* TOK_PLUS list has string term */

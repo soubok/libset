@@ -72,10 +72,6 @@
 
 #include "prmjtime.h"
 
-#ifdef LIVECONNECT
-#include "jsjava.h"
-#endif
-
 #ifdef JSDEBUGGER
 #include "jsdebug.h"
 #ifdef JSDEBUGGER_JAVA_UI
@@ -531,6 +527,9 @@ usage(void)
 #ifdef JS_GC_ZEAL
 "[-Z gczeal] "
 #endif
+#ifdef MOZ_TRACEVIS
+"[-T TraceVisFileName] "
+#endif
 "[scriptfile] [scriptarg...]\n");
     return 2;
 }
@@ -613,6 +612,9 @@ ProcessArgs(JSContext *cx, JSObject *obj, char **argv, int argc)
           case 't':
 #ifdef JS_GC_ZEAL
           case 'Z':
+#endif
+#ifdef MOZ_TRACEVIS
+          case 'T':
 #endif
             ++i;
             break;
@@ -795,6 +797,14 @@ extern void js_InitJITStatsClass(JSContext *cx, JSObject *glob);
 #ifdef MOZ_SHARK
         case 'k':
             JS_ConnectShark();
+            break;
+#endif
+#ifdef MOZ_TRACEVIS
+        case 'T':
+            if (++i == argc)
+                return usage();
+
+            JS_StartTraceVis(argv[i]);
             break;
 #endif
         default:
@@ -1019,10 +1029,6 @@ Help(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
 static JSBool
 Quit(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 {
-#ifdef LIVECONNECT
-    JSJ_SimpleShutdown();
-#endif
-
     JS_ConvertArguments(cx, argc, argv,"/ i", &gExitCode);
 
     gQuitting = JS_TRUE;
@@ -1052,7 +1058,7 @@ AssertEq(JSContext *cx, uintN argc, jsval *vp)
     }
 
     jsval *argv = JS_ARGV(cx, vp);
-    if (!js_StrictlyEqual(cx, argv[0], argv[1])) {
+    if (!JS_StrictlyEqual(cx, argv[0], argv[1])) {
         const char *actual = ToSource(cx, &argv[0]);
         const char *expected = ToSource(cx, &argv[1]);
         JS_ReportErrorNumber(cx, my_GetErrorMessage, NULL, JSSMSG_ASSERT_EQ_FAILED,
@@ -1928,7 +1934,7 @@ DumpScope(JSContext *cx, JSObject *obj, FILE *fp)
     i = 0;
     scope = OBJ_SCOPE(obj);
     for (sprop = SCOPE_LAST_PROP(scope); sprop; sprop = sprop->parent) {
-        if (SCOPE_HAD_MIDDLE_DELETE(scope) && !SCOPE_HAS_PROPERTY(scope, sprop))
+        if (scope->hadMiddleDelete() && !scope->has(sprop))
             continue;
         fprintf(fp, "%3u %p ", i, (void *)sprop);
 
@@ -3590,7 +3596,7 @@ static JSFunctionSpec shell_functions[] = {
     JS_FS("help",           Help,           0,0,0),
     JS_FS("quit",           Quit,           0,0,0),
     JS_FN("assertEq",       AssertEq,       2,0),
-    JS_FN("gc",             GC,             0,0),
+    JS_FN("gc",             ::GC,           0,0),
     JS_FN("gcparam",        GCParameter,    2,0),
     JS_FN("countHeap",      CountHeap,      0,0),
 #ifdef JS_GC_ZEAL
@@ -3642,6 +3648,10 @@ static JSFunctionSpec shell_functions[] = {
     JS_FS("stopVtune",      js_StopVtune,     0,0,0),
     JS_FS("pauseVtune",     js_PauseVtune,    0,0,0),
     JS_FS("resumeVtune",    js_ResumeVtune,   0,0,0),
+#endif
+#ifdef MOZ_TRACEVIS
+    JS_FS("startTraceVis",  js_StartTraceVis, 1,0,0),
+    JS_FS("stopTraceVis",   js_StopTraceVis,  0,0,0),
 #endif
 #ifdef DEBUG_ARRAYS
     JS_FS("arrayInfo",      js_ArrayInfo,       1,0,0),
@@ -3735,6 +3745,10 @@ static const char *const shell_help_messages[] = {
 "stopVtune()              Stop vtune instrumentation",
 "pauseVtune()             Pause vtune collection",
 "resumeVtune()            Resume vtune collection",
+#endif
+#ifdef MOZ_TRACEVIS
+"startTraceVis(filename)  Start TraceVis recording (stops any current recording)",
+"stopTraceVis()           Stop TraceVis recording",
 #endif
 #ifdef DEBUG_ARRAYS
 "arrayInfo(a1, a2, ...)   Report statistics about arrays",
@@ -4599,9 +4613,6 @@ main(int argc, char **argv, char **envp)
     JSContext *cx;
     JSObject *glob, *it, *envobj;
     int result;
-#ifdef LIVECONNECT
-    JavaVM *java_vm = NULL;
-#endif
 #ifdef JSDEBUGGER
     JSDContext *jsdc;
 #ifdef JSDEBUGGER_JAVA_UI
@@ -4703,10 +4714,6 @@ main(int argc, char **argv, char **envp)
         return 1;
     JSDJ_SetJSDContext(jsdjc, jsdc);
     java_env = JSDJ_CreateJavaVMAndStartDebugger(jsdjc);
-#ifdef LIVECONNECT
-    if (java_env)
-        (*java_env)->GetJavaVM(java_env, &java_vm);
-#endif
     /*
     * XXX This would be the place to wait for the debugger to start.
     * Waiting would be nice in general, but especially when a js file
@@ -4717,11 +4724,6 @@ main(int argc, char **argv, char **envp)
     jsdbc = JSDB_InitDebugger(rt, jsdc, 0);
 #endif /* JSDEBUGGER_C_UI */
 #endif /* JSDEBUGGER */
-
-#ifdef LIVECONNECT
-    if (!JSJ_SimpleInit(cx, glob, java_vm, getenv("CLASSPATH")))
-        return 1;
-#endif
 
     envobj = JS_DefineObject(cx, glob, "environment", &env_class, NULL, 0);
     if (!envobj || !JS_SetPrivate(cx, envobj, envp))

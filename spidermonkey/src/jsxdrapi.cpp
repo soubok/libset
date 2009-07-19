@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  *
  * ***** BEGIN LICENSE BLOCK *****
  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -447,7 +447,7 @@ JS_XDRString(JSXDRState *xdr, JSString **strp)
     jschar *chars;
 
     if (xdr->mode == JSXDR_ENCODE)
-        nchars = JSSTRING_LENGTH(*strp);
+        nchars = (*strp)->length();
     if (!JS_XDRUint32(xdr, &nchars))
         return JS_FALSE;
 
@@ -456,7 +456,7 @@ JS_XDRString(JSXDRState *xdr, JSString **strp)
         if (!chars)
             return JS_FALSE;
     } else {
-        chars = JSSTRING_CHARS(*strp);
+        chars = (*strp)->chars();
     }
 
     if (!XDRChars(xdr, chars, nchars))
@@ -493,8 +493,7 @@ XDRDoubleValue(JSXDRState *xdr, jsdouble *dp)
 {
     jsdpun u;
 
-    if (xdr->mode == JSXDR_ENCODE)
-        u.d = *dp;
+    u.d = (xdr->mode == JSXDR_ENCODE) ? *dp : 0.0;
     if (!JS_XDRUint32(xdr, &u.s.lo) || !JS_XDRUint32(xdr, &u.s.hi))
         return JS_FALSE;
     if (xdr->mode == JSXDR_DECODE)
@@ -505,10 +504,7 @@ XDRDoubleValue(JSXDRState *xdr, jsdouble *dp)
 JS_PUBLIC_API(JSBool)
 JS_XDRDouble(JSXDRState *xdr, jsdouble **dpp)
 {
-    jsdouble d;
-
-    if (xdr->mode == JSXDR_ENCODE)
-        d = **dpp;
+    jsdouble d = (xdr->mode == JSXDR_ENCODE) ? **dpp : 0.0;
     if (!XDRDoubleValue(xdr, &d))
         return JS_FALSE;
     if (xdr->mode == JSXDR_DECODE) {
@@ -544,9 +540,7 @@ XDRValueBody(JSXDRState *xdr, uint32 type, jsval *vp)
         break;
       }
       case JSVAL_DOUBLE: {
-        jsdouble *dp;
-        if (xdr->mode == JSXDR_ENCODE)
-            dp = JSVAL_TO_DOUBLE(*vp);
+        jsdouble *dp = (xdr->mode == JSXDR_ENCODE) ? JSVAL_TO_DOUBLE(*vp) : NULL;
         if (!JS_XDRDouble(xdr, &dp))
             return JS_FALSE;
         if (xdr->mode == JSXDR_DECODE)

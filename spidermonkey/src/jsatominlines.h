@@ -37,55 +37,63 @@
  *
  * ***** END LICENSE BLOCK ***** */
 
-#ifndef jsbool_h___
-#define jsbool_h___
-/*
- * JS boolean interface.
- */
+#ifndef jsatom_inlines_h___
+#define jsatom_inlines_h___
 
-#include "jsapi.h"
+#include "jsatom.h"
+#include "jsnum.h"
 
 JS_BEGIN_EXTERN_C
 
 /*
- * Pseudo-booleans, not visible to script but used internally by the engine.
- *
- * JSVAL_HOLE is a useful value for identifying a hole in an array.  It's also
- * used in the interpreter to represent "no exception pending".  In general it
- * can be used to represent "no value".
- *
- * A JSVAL_HOLE can be cheaply converted to undefined without affecting any
- * other boolean (or pseudo boolean) by masking out JSVAL_HOLE_MASK.
- *
- * JSVAL_ARETURN is used to throw asynchronous return for generator.close().
- *
- * NB: PSEUDO_BOOLEAN_TO_JSVAL(2) is JSVAL_VOID (see jsapi.h).
+ * Convert v to an atomized string and wrap it as an id.
  */
-#define JSVAL_HOLE_FLAG jsval(4 << JSVAL_TAGBITS)
-#define JSVAL_HOLE      (JSVAL_VOID | JSVAL_HOLE_FLAG)
-#define JSVAL_ARETURN   PSEUDO_BOOLEAN_TO_JSVAL(8)
-
-static JS_ALWAYS_INLINE JSBool
-JSVAL_TO_PUBLIC_PSEUDO_BOOLEAN(jsval v)
+static inline JSBool
+js_ValueToStringId(JSContext *cx, jsval v, jsid *idp)
 {
-    JS_ASSERT(v == JSVAL_TRUE || v == JSVAL_FALSE || v == JSVAL_VOID);
-    return JSVAL_TO_PSEUDO_BOOLEAN(v);
+    JSString *str;
+    JSAtom *atom;
+
+    /*
+     * Optimize for the common case where v is an already-atomized string. The
+     * comment in jsstr.h before JSString::flatSetAtomized explains why this is
+     * thread-safe. The extra rooting via lastAtom (which would otherwise be
+     * done in js_js_AtomizeString) ensures the caller that the resulting id at
+     * is least weakly rooted.
+     */
+    if (JSVAL_IS_STRING(v)) {
+        str = JSVAL_TO_STRING(v);
+        if (str->isAtomized()) {
+            cx->weakRoots.lastAtom = v;
+            *idp = ATOM_TO_JSID((JSAtom *) v);
+            return JS_TRUE;
+        }
+    } else {
+        str = js_ValueToString(cx, v);
+        if (!str)
+            return JS_FALSE;
+    }
+    atom = js_AtomizeString(cx, str, 0);
+    if (!atom)
+        return JS_FALSE;
+    *idp = ATOM_TO_JSID(atom);
+    return JS_TRUE;
 }
 
-extern JSClass js_BooleanClass;
-
-extern JSObject *
-js_InitBooleanClass(JSContext *cx, JSObject *obj);
-
-extern JSString *
-js_BooleanToString(JSContext *cx, JSBool b);
-
-extern JSBool
-js_BooleanToStringBuffer(JSContext *cx, JSBool b, JSTempVector<jschar> &buf);
-
-extern JSBool
-js_ValueToBoolean(jsval v);
+static inline JSBool
+js_Int32ToId(JSContext* cx, int32 index, jsid* id)
+{
+    if (INT_FITS_IN_JSVAL(index)) {
+        *id = INT_TO_JSID(index);
+        JS_ASSERT(INT_JSID_TO_JSVAL(*id) == INT_TO_JSVAL(index));
+        return JS_TRUE;
+    }
+    JSString* str = js_NumberToString(cx, index);
+    if (!str)
+        return JS_FALSE;
+    return js_ValueToStringId(cx, STRING_TO_JSVAL(str), id);
+}
 
 JS_END_EXTERN_C
 
-#endif /* jsbool_h___ */
+#endif /* jsatom_inlines_h___ */

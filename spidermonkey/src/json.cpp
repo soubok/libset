@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set ts=8 sw=4 et tw=99:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -60,6 +60,8 @@
 #include "jsxml.h"
 
 #include "json.h"
+
+#include "jsatominlines.h"
 
 JSClass js_JSONClass = {
     js_JSON_str,
@@ -227,7 +229,8 @@ public:
 
     ~StringifyContext()
     {
-        js_FinishStringBuffer(&gap);
+        if (STRING_BUFFER_OK(&gap))
+            js_FinishStringBuffer(&gap);
     }
 
     JSONWriteCallback callback;
@@ -577,11 +580,12 @@ InitializeGap(JSContext *cx, jsval space, JSStringBuffer *sb)
         return WriteStringGap(cx, space, sb);
 
     if (JSVAL_IS_NUMBER(space)) {
-        uint32 i;
-        if (!JS_ValueToECMAUint32(cx, space, &i))
-            return JS_FALSE;
-
-        js_RepeatChar(sb, jschar(' '), i);
+        jsdouble d = JSVAL_IS_INT(space)
+                     ? JSVAL_TO_INT(space)
+                     : js_DoubleToInteger(*JSVAL_TO_DOUBLE(space));
+        d = JS_MIN(10, d);
+        if (d >= 1)
+            js_RepeatChar(sb, jschar(' '), uint32(d));
 
         if (!STRING_BUFFER_OK(sb)) {
             JS_ReportOutOfMemory(cx);
@@ -605,7 +609,7 @@ js_Stringify(JSContext *cx, jsval *vp, JSObject *replacer, jsval space,
     if (!InitializeGap(cx, space, &scx.gap))
         return JS_FALSE;
 
-    JSObject *obj = js_NewObject(cx, &js_ObjectClass, NULL, NULL, 0);
+    JSObject *obj = js_NewObject(cx, &js_ObjectClass, NULL, NULL);
     if (!obj)
         return JS_FALSE;
 
@@ -710,7 +714,7 @@ static JSBool
 Revive(JSContext *cx, jsval reviver, jsval *vp)
 {
     
-    JSObject *obj = js_NewObject(cx, &js_ObjectClass, NULL, NULL, 0);
+    JSObject *obj = js_NewObject(cx, &js_ObjectClass, NULL, NULL);
     if (!obj)
         return JS_FALSE;
 
@@ -917,7 +921,7 @@ PushObject(JSContext *cx, JSONParser *jp, JSObject *obj)
 static JSBool
 OpenObject(JSContext *cx, JSONParser *jp)
 {
-    JSObject *obj = js_NewObject(cx, &js_ObjectClass, NULL, NULL, 0);
+    JSObject *obj = js_NewObject(cx, &js_ObjectClass, NULL, NULL);
     if (!obj)
         return JS_FALSE;
 

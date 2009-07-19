@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  *
  * ***** BEGIN LICENSE BLOCK *****
  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -40,7 +40,6 @@
 /*
  * JS math package.
  */
-#include "jslibmath.h"
 #include <stdlib.h>
 #include "jstypes.h"
 #include "jsstdint.h"
@@ -54,6 +53,7 @@
 #include "jslock.h"
 #include "jsmath.h"
 #include "jsnum.h"
+#include "jslibmath.h"
 #include "jsobj.h"
 
 extern jsdouble js_NaN;

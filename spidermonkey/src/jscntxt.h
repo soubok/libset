@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set ts=8 sw=4 et tw=78:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -56,6 +56,7 @@
 #include "jspubtd.h"
 #include "jsregexp.h"
 #include "jsutil.h"
+#include "jsarray.h"
 
 JS_BEGIN_EXTERN_C
 
@@ -207,10 +208,9 @@ typedef struct InterpStruct InterpStruct;
 # define EVAL_CACHE_METER_LIST(_)   _(probe), _(hit), _(step), _(noscope)
 # define identity(x)                x
 
-/* Have to typedef this for LiveConnect C code, which includes us. */
-typedef struct JSEvalCacheMeter {
+struct JSEvalCacheMeter {
     uint64 EVAL_CACHE_METER_LIST(identity);
-} JSEvalCacheMeter;
+};
 
 # undef identity
 #endif
@@ -249,6 +249,12 @@ struct JSThreadData {
 #ifdef JS_EVAL_CACHE_METERING
     JSEvalCacheMeter    evalCacheMeter;
 #endif
+
+    /*
+     * Thread-local version of JSRuntime.gcMallocBytes to avoid taking
+     * locks on each JS_malloc.
+     */
+    size_t              gcMallocBytes;
 };
 
 #ifdef JS_THREADSAFE
@@ -263,12 +269,6 @@ struct JSThread {
 
     /* Opaque thread-id, from NSPR's PR_GetCurrentThread(). */
     jsword              id;
-
-    /*
-     * Thread-local version of JSRuntime.gcMallocBytes to avoid taking
-     * locks on each JS_malloc.
-     */
-    uint32              gcMallocBytes;
 
     /* Indicates that the thread is waiting in ClaimTitle from jslock.cpp. */
     JSTitle             *titleToShare;
@@ -321,6 +321,7 @@ typedef enum JSBuiltinFunctionId {
     JSBUILTIN_GetElement,
     JSBUILTIN_SetProperty,
     JSBUILTIN_SetElement,
+    JSBUILTIN_HasInstance,
     JSBUILTIN_LIMIT
 } JSBuiltinFunctionId;
 
@@ -368,15 +369,16 @@ struct JSRuntime {
     JSDHashTable        gcRootsHash;
     JSDHashTable        *gcLocksHash;
     jsrefcount          gcKeepAtoms;
-    uint32              gcBytes;
-    uint32              gcLastBytes;
-    uint32              gcMaxBytes;
-    uint32              gcMaxMallocBytes;
+    size_t              gcBytes;
+    size_t              gcLastBytes;
+    size_t              gcMaxBytes;
+    size_t              gcMaxMallocBytes;
     uint32              gcEmptyArenaPoolLifespan;
     uint32              gcLevel;
     uint32              gcNumber;
     JSTracer            *gcMarkingTracer;
     uint32              gcTriggerFactor;
+    size_t              gcTriggerBytes;
     volatile JSBool     gcIsNeeded;
 
     /*
@@ -393,7 +395,7 @@ struct JSRuntime {
 #endif
 
     JSGCCallback        gcCallback;
-    uint32              gcMallocBytes;
+    size_t              gcMallocBytes;
     JSGCArenaInfo       *gcUntracedArenaStackTop;
 #ifdef DEBUG
     size_t              gcTraceLaterCount;
@@ -528,8 +530,8 @@ struct JSRuntime {
 
     /*
      * Shared scope property tree, and arena-pool for allocating its nodes.
-     * The propertyRemovals counter is incremented for every js_ClearScope,
-     * and for each js_RemoveScopeProperty that frees a slot in an object.
+     * The propertyRemovals counter is incremented for every JSScope::clear,
+     * and for each JSScope::remove method call that frees a slot in an object.
      * See js_NativeGet and js_NativeSet in jsobj.c.
      */
     JSDHashTable        propertyTreeHash;
@@ -681,6 +683,9 @@ struct JSRuntime {
     JSFunctionMeter     functionMeter;
     char                lastScriptFilename[1024];
 #endif
+
+    void setGCTriggerFactor(uint32 factor);
+    void setGCLastBytes(size_t lastBytes);
 };
 
 /* Common macros to access thread-local caches in JSThread or JSRuntime. */
@@ -954,6 +959,7 @@ struct JSContext {
 
     /* State for object and array toSource conversion. */
     JSSharpObjectMap    sharpObjectMap;
+    JSHashTable         *busyArrayTable;
 
     /* Argument formatter support for JS_{Convert,Push}Arguments{,VA}. */
     JSArgumentFormatMap *argumentFormatMap;
@@ -1034,6 +1040,17 @@ struct JSContext {
     uintN               nativeVpLen;
     jsval               *nativeVp;
 #endif
+
+    /* Call this after succesful malloc of memory for GC-related things. */
+    inline void
+    updateMallocCounter(size_t nbytes)
+    {
+        size_t *pbytes, bytes;
+
+        pbytes = &JS_THREAD_DATA(this)->gcMallocBytes;
+        bytes = *pbytes;
+        *pbytes = (size_t(-1) - bytes <= nbytes) ? size_t(-1) : bytes + nbytes;
+    }
 };
 
 #ifdef JS_THREADSAFE

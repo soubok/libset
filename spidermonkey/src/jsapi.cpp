@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set ts=8 sw=4 et tw=78:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -91,6 +91,8 @@
 #if JS_HAS_XML_SUPPORT
 #include "jsxml.h"
 #endif
+
+#include "jsatominlines.h"
 
 #ifdef HAVE_VA_LIST_AS_ARRAY
 #define JS_ADDRESSOF_VA_LIST(ap) ((va_list *)(ap))
@@ -833,6 +835,10 @@ JS_DestroyRuntime(JSRuntime *rt)
 {
 #ifdef DEBUG
     /* Don't hurt everyone in leaky ol' Mozilla with a fatal JS_ASSERT! */
+    if (rt->nativeEnumerators) {
+        fprintf(stderr,
+                "JS engine warning: leak of native enumerators is detected.\n");
+    }
     if (!JS_CLIST_IS_EMPTY(&rt->contextList)) {
         JSContext *cx, *iter = NULL;
         uintN cxcount = 0;
@@ -888,6 +894,10 @@ JS_DestroyRuntime(JSRuntime *rt)
 JS_PUBLIC_API(void)
 JS_ShutDown(void)
 {
+#ifdef MOZ_TRACEVIS
+    JS_StopTraceVis();
+#endif
+
 #ifdef JS_OPMETER
     extern void js_DumpOpMeters();
 
@@ -1606,7 +1616,7 @@ AlreadyHasOwnProperty(JSContext *cx, JSObject *obj, JSAtom *atom)
     JS_ASSERT(OBJ_IS_NATIVE(obj));
     JS_LOCK_OBJ(cx, obj);
     scope = OBJ_SCOPE(obj);
-    sprop = SCOPE_GET_PROPERTY(scope, ATOM_TO_JSID(atom));
+    sprop = scope->lookup(ATOM_TO_JSID(atom));
     JS_UNLOCK_SCOPE(cx, scope);
     return sprop != NULL;
 }
@@ -1837,7 +1847,7 @@ JS_malloc(JSContext *cx, size_t nbytes)
         JS_ReportOutOfMemory(cx);
         return NULL;
     }
-    js_UpdateMallocCounter(cx, nbytes);
+    cx->updateMallocCounter(nbytes);
 
     return p;
 }
@@ -1852,7 +1862,7 @@ JS_realloc(JSContext *cx, void *p, size_t nbytes)
         return NULL;
     }
     if (!orig)
-        js_UpdateMallocCounter(cx, nbytes);
+        cx->updateMallocCounter(nbytes);
     return p;
 }
 
@@ -2082,7 +2092,7 @@ JS_PrintTraceThingInfo(char *buf, size_t bufsize, JSTracer *trc,
       }
 
       case JSTRACE_STRING:
-        name = JSSTRING_IS_DEPENDENT((JSString *)thing)
+        name = ((JSString *)thing)->isDependent()
                ? "substring"
                : "string";
         break;
@@ -2575,7 +2585,7 @@ JS_SetGCParameter(JSRuntime *rt, JSGCParamKey key, uint32 value)
       default:
         JS_ASSERT(key == JSGC_TRIGGER_FACTOR);
         JS_ASSERT(value >= 100);
-        rt->gcTriggerFactor = value;
+        rt->setGCTriggerFactor(value);
         return;
     }
 }
@@ -2640,11 +2650,10 @@ JS_NewExternalString(JSContext *cx, jschar *chars, size_t length, intN type)
     CHECK_REQUEST(cx);
     JS_ASSERT((uintN) type < (uintN) (GCX_NTYPES - GCX_EXTERNAL_STRING));
 
-    str = (JSString *) js_NewGCThing(cx, (uintN) type + GCX_EXTERNAL_STRING,
-                                     sizeof(JSString));
+    str = js_NewGCString(cx, (uintN) type + GCX_EXTERNAL_STRING);
     if (!str)
         return NULL;
-    JSFLATSTR_INIT(str, chars, length);
+    str->initFlat(chars, length);
     return str;
 }
 
@@ -2886,7 +2895,7 @@ JS_NewObject(JSContext *cx, JSClass *clasp, JSObject *proto, JSObject *parent)
     CHECK_REQUEST(cx);
     if (!clasp)
         clasp = &js_ObjectClass;    /* default class is Object */
-    return js_NewObject(cx, clasp, proto, parent, 0);
+    return js_NewObject(cx, clasp, proto, parent);
 }
 
 JS_PUBLIC_API(JSObject *)
@@ -2896,7 +2905,7 @@ JS_NewObjectWithGivenProto(JSContext *cx, JSClass *clasp, JSObject *proto,
     CHECK_REQUEST(cx);
     if (!clasp)
         clasp = &js_ObjectClass;    /* default class is Object */
-    return js_NewObjectWithGivenProto(cx, clasp, proto, parent, 0);
+    return js_NewObjectWithGivenProto(cx, clasp, proto, parent);
 }
 
 JS_PUBLIC_API(JSBool)
@@ -2930,7 +2939,7 @@ JS_SealObject(JSContext *cx, JSObject *obj, JSBool deep)
 #endif
 
     /* Nothing to do if obj's scope is already sealed. */
-    if (SCOPE_IS_SEALED(scope))
+    if (scope->sealed())
         return JS_TRUE;
 
     /* XXX Enumerate lazy properties now, as they can't be added later. */
@@ -2943,8 +2952,8 @@ JS_SealObject(JSContext *cx, JSObject *obj, JSBool deep)
     JS_LOCK_OBJ(cx, obj);
     scope = js_GetMutableScope(cx, obj);
     if (scope) {
-        SCOPE_SET_SEALED(scope);
-        js_MakeScopeShapeUnique(cx, scope);
+        scope->sealingShapeChange(cx);
+        scope->setSealed();
     }
     JS_UNLOCK_OBJ(cx, obj);
     if (!scope)
@@ -3054,7 +3063,7 @@ JS_DefineObject(JSContext *cx, JSObject *obj, const char *name, JSClass *clasp,
     CHECK_REQUEST(cx);
     if (!clasp)
         clasp = &js_ObjectClass;    /* default class is Object */
-    nobj = js_NewObject(cx, clasp, proto, obj, 0);
+    nobj = js_NewObject(cx, clasp, proto, obj);
     if (!nobj)
         return NULL;
     if (!DefineProperty(cx, obj, name, OBJECT_TO_JSVAL(nobj), NULL, NULL, attrs,
@@ -3135,7 +3144,7 @@ LookupPropertyById(JSContext *cx, JSObject *obj, jsid id, uintN flags,
                    JSObject **objp, JSProperty **propp)
 {
     JSAutoResolveFlags rf(cx, flags);
-    CHECK_FOR_STRING_INDEX(id);
+    id = js_CheckForStringIndex(id);
     return OBJ_LOOKUP_PROPERTY(cx, obj, id, objp, propp);
 }
 
@@ -3403,7 +3412,7 @@ AlreadyHasOwnPropertyHelper(JSContext *cx, JSObject *obj, jsid id,
 
     JS_LOCK_OBJ(cx, obj);
     scope = OBJ_SCOPE(obj);
-    *foundp = (scope->object == obj && SCOPE_GET_PROPERTY(scope, id));
+    *foundp = (scope->object == obj && scope->lookup(id));
     JS_UNLOCK_SCOPE(cx, scope);
     return JS_TRUE;
 }
@@ -3553,8 +3562,6 @@ JS_PUBLIC_API(JSBool)
 JS_GetMethodById(JSContext *cx, JSObject *obj, jsid id, JSObject **objp,
                  jsval *vp)
 {
-    JSAutoResolveFlags rf(cx, JSRESOLVE_QUALIFIED);
-
     CHECK_REQUEST(cx);
     if (!js_GetMethod(cx, obj, id, false, vp))
         return JS_FALSE;
@@ -4101,7 +4108,7 @@ JS_NewPropertyIterator(JSContext *cx, JSObject *obj)
     JSIdArray *ida;
 
     CHECK_REQUEST(cx);
-    iterobj = js_NewObject(cx, &prop_iter_class, NULL, obj, 0);
+    iterobj = js_NewObject(cx, &prop_iter_class, NULL, obj);
     if (!iterobj)
         return NULL;
 
@@ -4167,8 +4174,7 @@ JS_NextProperty(JSContext *cx, JSObject *iterobj, jsid *idp)
         while (sprop &&
                (!(sprop->attrs & JSPROP_ENUMERATE) ||
                 (sprop->flags & SPROP_IS_ALIAS) ||
-                (SCOPE_HAD_MIDDLE_DELETE(scope) &&
-                 !SCOPE_HAS_PROPERTY(scope, sprop)))) {
+                (scope->hadMiddleDelete() && !scope->has(sprop)))) {
             sprop = sprop->parent;
         }
 
@@ -4354,7 +4360,7 @@ JS_CloneFunctionObject(JSContext *cx, JSObject *funobj, JSObject *parent)
         uint32 nslots = JSSLOT_FREE(&js_FunctionClass);
         JS_ASSERT(nslots == JS_INITIAL_NSLOTS);
         nslots += js_FunctionClass.reserveSlots(cx, clone);
-        if (!js_ReallocSlots(cx, clone, nslots, JS_TRUE))
+        if (!js_AllocSlots(cx, clone, nslots))
             return NULL;
 
         JSUpvarArray *uva = JS_SCRIPT_UPVARS(fun->u.i.script);
@@ -4815,12 +4821,12 @@ JS_NewScriptObject(JSContext *cx, JSScript *script)
 
     CHECK_REQUEST(cx);
     if (!script)
-        return js_NewObject(cx, &js_ScriptClass, NULL, NULL, 0);
+        return js_NewObject(cx, &js_ScriptClass, NULL, NULL);
 
     JS_ASSERT(!script->u.object);
 
     JS_PUSH_TEMP_ROOT_SCRIPT(cx, script, &tvr);
-    obj = js_NewObject(cx, &js_ScriptClass, NULL, NULL, 0);
+    obj = js_NewObject(cx, &js_ScriptClass, NULL, NULL);
     if (obj) {
         JS_SetPrivate(cx, obj, script);
         script->u.object = obj;
@@ -5449,20 +5455,20 @@ JS_GetStringChars(JSString *str)
      * rate bugs in string concatenation, is worth this slight loss in API
      * compatibility.
      */
-    if (JSSTRING_IS_DEPENDENT(str)) {
-        n = JSSTRDEP_LENGTH(str);
+    if (str->isDependent()) {
+        n = str->dependentLength();
         size = (n + 1) * sizeof(jschar);
         s = (jschar *) malloc(size);
         if (s) {
-            memcpy(s, JSSTRDEP_CHARS(str), n * sizeof *s);
+            memcpy(s, str->dependentChars(), n * sizeof *s);
             s[n] = 0;
-            JSFLATSTR_REINIT(str, s, n);
+            str->reinitFlat(s, n);
         } else {
-            s = JSSTRDEP_CHARS(str);
+            s = str->dependentChars();
         }
     } else {
-        JSFLATSTR_CLEAR_MUTABLE(str);
-        s = JSFLATSTR_CHARS(str);
+        str->flatClearMutable();
+        s = str->flatChars();
     }
     return s;
 }
@@ -5470,7 +5476,7 @@ JS_GetStringChars(JSString *str)
 JS_PUBLIC_API(size_t)
 JS_GetStringLength(JSString *str)
 {
-    return JSSTRING_LENGTH(str);
+    return str->length();
 }
 
 JS_PUBLIC_API(intN)
@@ -5488,7 +5494,7 @@ JS_NewGrowableString(JSContext *cx, jschar *chars, size_t length)
     str = js_NewString(cx, chars, length);
     if (!str)
         return str;
-    JSFLATSTR_SET_MUTABLE(str);
+    str->flatSetMutable();
     return str;
 }
 
@@ -5550,7 +5556,7 @@ JS_DecodeBytes(JSContext *cx, const char *src, size_t srclen, jschar *dst,
 JS_PUBLIC_API(char *)
 JS_EncodeString(JSContext *cx, JSString *str)
 {
-    return js_DeflateString(cx, JSSTRING_CHARS(str), JSSTRING_LENGTH(str));
+    return js_DeflateString(cx, str->chars(), str->length());
 }
 
 JS_PUBLIC_API(JSBool)
