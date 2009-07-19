@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set sw=4 ts=8 et tw=99:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -568,11 +568,11 @@ SprintCString(Sprinter *sp, const char *s)
 static ptrdiff_t
 SprintString(Sprinter *sp, JSString *str)
 {
-    jschar *chars;
+    const jschar *chars;
     size_t length, size;
     ptrdiff_t offset;
 
-    JSSTRING_CHARS_AND_LENGTH(str, chars, length);
+    str->getCharsAndLength(chars, length);
     if (length == 0)
         return sp->offset;
 
@@ -641,7 +641,7 @@ QuoteString(Sprinter *sp, JSString *str, uint32 quote)
         return NULL;
 
     /* Loop control variables: z points at end of string sentinel. */
-    JSSTRING_CHARS_AND_END(str, s, z);
+    str->getCharsAndEnd(s, z);
     for (t = s; t < z; s = ++t) {
         /* Move t forward from s past un-quote-worthy characters. */
         c = *t;
@@ -1832,8 +1832,8 @@ Decompile(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
  */
 #define ATOM_IS_IDENTIFIER(atom) js_IsIdentifier(ATOM_TO_STRING(atom))
 #define ATOM_IS_KEYWORD(atom)                                                 \
-    (js_CheckKeyword(JSSTRING_CHARS(ATOM_TO_STRING(atom)),                    \
-                     JSSTRING_LENGTH(ATOM_TO_STRING(atom))) != TOK_EOF)
+    (js_CheckKeyword(ATOM_TO_STRING(atom)->chars(),                           \
+                     ATOM_TO_STRING(atom)->length()) != TOK_EOF)
 
 /*
  * Given an atom already fetched from jp->script's atom map, quote/escape its
@@ -5132,8 +5132,7 @@ js_DecompileValueGenerator(JSContext *cx, intN spindex, jsval v,
         if (!fallback)
             return NULL;
     }
-    return js_DeflateString(cx, JSSTRING_CHARS(fallback),
-                            JSSTRING_LENGTH(fallback));
+    return js_DeflateString(cx, fallback->chars(), fallback->length());
 }
 
 static char *
@@ -5361,10 +5360,10 @@ SimulateImacroCFG(JSContext *cx, JSScript *script,
             ptrdiff_t jmpoff = (type == JOF_JUMP) ? GET_JUMP_OFFSET(pc)
                                                   : GET_JUMPX_OFFSET(pc);
             LOCAL_ASSERT(jmpoff >= 0);
-            uintN tmp_pcdepth = SimulateImacroCFG(cx, script, pcdepth, pc + jmpoff,
-                                                  target, tmp_pcstack);
+            intN tmp_pcdepth = SimulateImacroCFG(cx, script, pcdepth, pc + jmpoff,
+                                                 target, tmp_pcstack);
             if (tmp_pcdepth >= 0) {
-                pcdepth = tmp_pcdepth;
+                pcdepth = uintN(tmp_pcdepth);
                 goto success;
             }
 
@@ -5379,7 +5378,6 @@ SimulateImacroCFG(JSContext *cx, JSScript *script,
     LOCAL_ASSERT(pc == target);
 
   success:
-    LOCAL_ASSERT(pcdepth >= 0);
     memcpy(pcstack, tmp_pcstack, nbytes);
     JS_free(cx, tmp_pcstack);
     return pcdepth;
@@ -5404,7 +5402,7 @@ ReconstructImacroPCStack(JSContext *cx, JSScript *script,
      */
     JSStackFrame *fp = js_GetScriptedCaller(cx, NULL);
     JS_ASSERT(fp->imacpc);
-    uintN pcdepth = ReconstructPCStack(cx, script, fp->imacpc, pcstack);
+    intN pcdepth = ReconstructPCStack(cx, script, fp->imacpc, pcstack);
     if (pcdepth < 0)
         return pcdepth;
     return SimulateImacroCFG(cx, script, pcdepth, imacstart, target, pcstack);

@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  *
  * ***** BEGIN LICENSE BLOCK *****
  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -246,7 +246,7 @@ Resize(JSHashTable *ht, uint32 newshift)
 }
 
 JS_PUBLIC_API(JSHashEntry *)
-JS_HashTableRawAdd(JSHashTable *ht, JSHashEntry **hep,
+JS_HashTableRawAdd(JSHashTable *ht, JSHashEntry **&hep,
                    JSHashNumber keyHash, const void *key, void *value)
 {
     uint32 n;

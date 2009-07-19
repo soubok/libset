@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set ts=8 sw=4 et tw=99:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -1527,7 +1527,7 @@ js_LexicalLookup(JSTreeContext *tc, JSAtom *atom, jsint *slotp, JSStmtInfo *stmt
         obj = stmt->blockObj;
         JS_ASSERT(LOCKED_OBJ_GET_CLASS(obj) == &js_BlockClass);
         scope = OBJ_SCOPE(obj);
-        sprop = SCOPE_GET_PROPERTY(scope, ATOM_TO_JSID(atom));
+        sprop = scope->lookup(ATOM_TO_JSID(atom));
         if (sprop) {
             JS_ASSERT(sprop->flags & SPROP_HAS_SHORTID);
 
@@ -1822,8 +1822,7 @@ EmitEnterBlock(JSContext *cx, JSParseNode *pn, JSCodeGenerator *cg)
     }
 
     OBJ_SCOPE(blockObj)->freeslot = JSSLOT_FREE(&js_BlockClass);
-    js_ReallocSlots(cx, blockObj, JSSLOT_FREE(&js_BlockClass), JS_TRUE);
-    return true;
+    return js_GrowSlots(cx, blockObj, JSSLOT_FREE(&js_BlockClass));
 }
 
 /*
@@ -6760,6 +6759,10 @@ js_EmitTree(JSContext *cx, JSCodeGenerator *cg, JSParseNode *pn)
         if (pn->pn_arity == PN_LIST) {
             JS_ASSERT(pn->pn_count != 0);
             for (pn2 = pn->pn_head; pn2; pn2 = pn2->pn_next) {
+                if (pn2->pn_type == TOK_LC &&
+                    js_Emit1(cx, cg, JSOP_STARTXMLEXPR) < 0) {
+                    return JS_FALSE;
+                }
                 if (!js_EmitTree(cx, cg, pn2))
                     return JS_FALSE;
                 if (pn2 != pn->pn_head && js_Emit1(cx, cg, JSOP_ADD) < 0)

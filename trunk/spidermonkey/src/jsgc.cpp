@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set ts=8 sw=4 et tw=78:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -82,6 +82,10 @@
 #include "jsxml.h"
 #endif
 
+#ifdef INCLUDE_MOZILLA_DTRACE
+#include "jsdtracef.h"
+#endif
+
 /*
  * Check if posix_memalign is available.
  */
@@ -110,6 +114,11 @@ extern "C" {
 #   define JS_GC_USE_MMAP 1
 #  endif
 #  include <windows.h>
+# elif defined(__SYMBIAN32__)
+// Symbian's OpenC has mmap (and #defines _POSIX_MAPPED_FILES), but
+// doesn't implement MAP_ANON.  If we have MOZ_MEMORY, then we can use
+// posix_memalign; we've defined HAS_POSIX_MEMALIGN above.  Otherwise,
+// we overallocate.
 # else
 #  if defined(XP_UNIX) || defined(XP_BEOS)
 #   include <unistd.h>
@@ -642,10 +651,8 @@ IsMarkedDouble(JSGCArenaInfo *a, uint32 index)
  * The maximum number of things to put on the local free list by taking
  * several things from the global free list or from the tail of the last
  * allocated arena to amortize the cost of rt->gcLock.
- *
- * We use number 8 based on benchmarks from bug 312238.
  */
-#define MAX_THREAD_LOCAL_THINGS 8
+#define MAX_THREAD_LOCAL_THINGS 64
 
 #endif
 
@@ -1085,10 +1092,9 @@ InitGCArenaLists(JSRuntime *rt)
     for (i = 0; i < GC_NUM_FREELISTS; i++) {
         arenaList = &rt->gcArenaList[i];
         thingSize = GC_FREELIST_NBYTES(i);
-        JS_ASSERT((size_t)(uint16)thingSize == thingSize);
         arenaList->last = NULL;
-        arenaList->lastCount = (uint16) THINGS_PER_ARENA(thingSize);
-        arenaList->thingSize = (uint16) thingSize;
+        arenaList->lastCount = THINGS_PER_ARENA(thingSize);
+        arenaList->thingSize = thingSize;
         arenaList->freeList = NULL;
     }
     rt->gcDoubleArenaList.first = NULL;
@@ -1302,13 +1308,13 @@ js_InitGC(JSRuntime *rt, uint32 maxbytes)
      * By default the trigger factor gets maximum possible value. This
      * means that GC will not be triggered by growth of GC memory (gcBytes).
      */
-    rt->gcTriggerFactor = (uint32) -1;
+    rt->setGCTriggerFactor((uint32) -1);
 
     /*
      * The assigned value prevents GC from running when GC memory is too low
      * (during JS engine start).
      */
-    rt->gcLastBytes = 8192;
+    rt->setGCLastBytes(8192);
 
     METER(memset(&rt->gcStats, 0, sizeof rt->gcStats));
     return JS_TRUE;
@@ -1794,6 +1800,25 @@ EnsureLocalFreeList(JSContext *cx)
 
 #endif
 
+void
+JSRuntime::setGCTriggerFactor(uint32 factor)
+{
+    JS_ASSERT(factor >= 100);
+
+    gcTriggerFactor = factor;
+    setGCLastBytes(gcLastBytes);
+}
+
+void
+JSRuntime::setGCLastBytes(size_t lastBytes)
+{
+    gcLastBytes = lastBytes;
+    uint64 triggerBytes = uint64(lastBytes) * uint64(gcTriggerFactor / 100);
+    if (triggerBytes != size_t(triggerBytes))
+        triggerBytes = size_t(-1);
+    gcTriggerBytes = size_t(triggerBytes);
+}
+
 static JS_INLINE bool
 IsGCThresholdReached(JSRuntime *rt)
 {
@@ -1808,14 +1833,13 @@ IsGCThresholdReached(JSRuntime *rt)
      * the gcBytes value is close to zero at the JS engine start.
      */
     return rt->gcMallocBytes >= rt->gcMaxMallocBytes ||
-           rt->gcBytes / rt->gcTriggerFactor >= rt->gcLastBytes / 100;
+           rt->gcBytes >= rt->gcTriggerBytes;
 }
 
-void *
-js_NewGCThing(JSContext *cx, uintN flags, size_t nbytes)
+template <class T> static JS_INLINE T*
+NewGCThing(JSContext *cx, uintN flags)
 {
     JSRuntime *rt;
-    uintN flindex;
     bool doGC;
     JSGCThing *thing;
     uint8 *flagp;
@@ -1838,8 +1862,9 @@ js_NewGCThing(JSContext *cx, uintN flags, size_t nbytes)
 
     JS_ASSERT((flags & GCF_TYPEMASK) != GCX_DOUBLE);
     rt = cx->runtime;
-    nbytes = JS_ROUNDUP(nbytes, sizeof(JSGCThing));
-    flindex = GC_FREELIST_INDEX(nbytes);
+    size_t nbytes = sizeof(T);
+    JS_ASSERT(JS_ROUNDUP(nbytes, sizeof(JSGCThing)) == nbytes);
+    uintN flindex = GC_FREELIST_INDEX(nbytes);
 
     /* Updates of metering counters here may not be thread-safe. */
     METER(astats = &cx->runtime->gcStats.arenaStats[flindex]);
@@ -1850,7 +1875,7 @@ js_NewGCThing(JSContext *cx, uintN flags, size_t nbytes)
     JS_ASSERT(cx->thread);
     freeLists = cx->gcLocalFreeLists;
     thing = freeLists->array[flindex];
-    localMallocBytes = cx->thread->gcMallocBytes;
+    localMallocBytes = JS_THREAD_DATA(cx)->gcMallocBytes;
     if (thing && rt->gcMaxMallocBytes - rt->gcMallocBytes > localMallocBytes) {
         flagp = thing->flagp;
         freeLists->array[flindex] = thing->next;
@@ -1863,7 +1888,7 @@ js_NewGCThing(JSContext *cx, uintN flags, size_t nbytes)
 
     /* Transfer thread-local counter to global one. */
     if (localMallocBytes != 0) {
-        cx->thread->gcMallocBytes = 0;
+        JS_THREAD_DATA(cx)->gcMallocBytes = 0;
         if (rt->gcMaxMallocBytes - rt->gcMallocBytes < localMallocBytes)
             rt->gcMallocBytes = rt->gcMaxMallocBytes;
         else
@@ -2006,12 +2031,13 @@ testReservedObjects:
         maxFreeThings = thingsLimit - arenaList->lastCount;
         if (maxFreeThings > MAX_THREAD_LOCAL_THINGS)
             maxFreeThings = MAX_THREAD_LOCAL_THINGS;
+        uint32 lastCount = arenaList->lastCount;
         while (maxFreeThings != 0) {
             --maxFreeThings;
 
-            tmpflagp = THING_FLAGP(a, arenaList->lastCount);
+            tmpflagp = THING_FLAGP(a, lastCount);
             tmpthing = FLAGP_TO_THING(tmpflagp, nbytes);
-            arenaList->lastCount++;
+            lastCount++;
             tmpthing->flagp = tmpflagp;
             *tmpflagp = GCF_FINAL;    /* signifying that thing is free */
 
@@ -2019,6 +2045,7 @@ testReservedObjects:
             lastptr = &tmpthing->next;
         }
         *lastptr = NULL;
+        arenaList->lastCount = lastCount;
 #endif
         break;
     }
@@ -2071,7 +2098,7 @@ testReservedObjects:
     if (gcLocked)
         JS_UNLOCK_GC(rt);
 #endif
-    return thing;
+    return (T*)thing;
 
 fail:
 #ifdef JS_THREADSAFE
@@ -2081,6 +2108,26 @@ fail:
     METER(astats->fail++);
     js_ReportOutOfMemory(cx);
     return NULL;
+}
+
+extern JSObject* js_NewGCObject(JSContext *cx, uintN flags)
+{
+    return NewGCThing<JSObject>(cx, flags);
+}
+
+extern JSString* js_NewGCString(JSContext *cx, uintN flags)
+{
+    return NewGCThing<JSString>(cx, flags);
+}
+
+extern JSFunction* js_NewGCFunction(JSContext *cx, uintN flags)
+{
+    return NewGCThing<JSFunction>(cx, flags);
+}
+
+extern JSXML* js_NewGCXML(JSContext *cx, uintN flags)
+{
+    return NewGCThing<JSXML>(cx, flags);
 }
 
 static JSGCDoubleCell *
@@ -2276,7 +2323,7 @@ js_ReserveObjects(JSContext *cx, size_t nobjects)
     JSObject *&head = JS_TRACE_MONITOR(cx).reservedObjects;
     size_t i = head ? JSVAL_TO_INT(head->fslots[1]) : 0;
     while (i < nobjects) {
-        JSObject *obj = (JSObject *) js_NewGCThing(cx, GCX_OBJECT, sizeof(JSObject));
+        JSObject *obj = js_NewGCObject(cx, GCX_OBJECT);
         if (!obj)
             return JS_FALSE;
         memset(obj, 0, sizeof(JSObject));
@@ -2340,7 +2387,7 @@ js_RemoveAsGCBytes(JSRuntime *rt, size_t sz)
     ((flagp) &&                                                               \
      ((*(flagp) & GCF_TYPEMASK) >= GCX_EXTERNAL_STRING ||                     \
       ((*(flagp) & GCF_TYPEMASK) == GCX_STRING &&                             \
-       !JSSTRING_IS_DEPENDENT((JSString *) (thing)))))
+       !((JSString *) (thing))->isDependent())))
 
 /* This is compatible with JSDHashEntryStub. */
 typedef struct JSGCLockHashEntry {
@@ -2475,8 +2522,8 @@ JS_TraceChildren(JSTracer *trc, void *thing, uint32 kind)
 
       case JSTRACE_STRING:
         str = (JSString *)thing;
-        if (JSSTRING_IS_DEPENDENT(str))
-            JS_CALL_STRING_TRACER(trc, JSSTRDEP_BASE(str), "base");
+        if (str->isDependent())
+            JS_CALL_STRING_TRACER(trc, str->dependentBase(), "base");
         break;
 
 #if JS_HAS_XML_SUPPORT
@@ -2697,14 +2744,14 @@ JS_CallTracer(JSTracer *trc, void *thing, uint32 kind)
             flagp = THING_TO_FLAGP(thing, sizeof(JSGCThing));
             JS_ASSERT((*flagp & GCF_FINAL) == 0);
             JS_ASSERT(kind == MapGCFlagsToTraceKind(*flagp));
-            if (!JSSTRING_IS_DEPENDENT((JSString *) thing)) {
+            if (!((JSString *) thing)->isDependent()) {
                 *flagp |= GCF_MARK;
                 goto out;
             }
             if (*flagp & GCF_MARK)
                 goto out;
             *flagp |= GCF_MARK;
-            thing = JSSTRDEP_BASE((JSString *) thing);
+            thing = ((JSString *) thing)->dependentBase();
         }
         /* NOTREACHED */
     }
@@ -2882,7 +2929,7 @@ js_TraceStackFrame(JSTracer *trc, JSStackFrame *fp)
     if (fp->callobj)
         JS_CALL_OBJECT_TRACER(trc, fp->callobj, "call");
     if (fp->argsobj)
-        JS_CALL_OBJECT_TRACER(trc, fp->argsobj, "arguments");
+        JS_CALL_OBJECT_TRACER(trc, JSVAL_TO_OBJECT(fp->argsobj), "arguments");
     if (fp->varobj)
         JS_CALL_OBJECT_TRACER(trc, fp->varobj, "variables");
     if (fp->script) {
@@ -3240,6 +3287,96 @@ js_DestroyScriptsToGC(JSContext *cx, JSThreadData *data)
             js_DestroyScript(cx, script);
         }
     }
+}
+
+static void
+js_FinalizeObject(JSContext *cx, JSObject *obj)
+{
+    /* Cope with stillborn objects that have no map. */
+    if (!obj->map)
+        return;
+
+    if (JS_UNLIKELY(cx->debugHooks->objectHook != NULL)) {
+        cx->debugHooks->objectHook(cx, obj, JS_FALSE,
+                                   cx->debugHooks->objectHookData);
+    }
+
+    /* Finalize obj first, in case it needs map and slots. */
+    STOBJ_GET_CLASS(obj)->finalize(cx, obj);
+
+#ifdef INCLUDE_MOZILLA_DTRACE
+    if (JAVASCRIPT_OBJECT_FINALIZE_ENABLED())
+        jsdtrace_object_finalize(obj);
+#endif
+
+    if (JS_LIKELY(OBJ_IS_NATIVE(obj)))
+        OBJ_SCOPE(obj)->drop(cx, obj);
+    js_FreeSlots(cx, obj);
+}
+
+static JSStringFinalizeOp str_finalizers[GCX_NTYPES - GCX_EXTERNAL_STRING] = {
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+};
+
+intN
+js_ChangeExternalStringFinalizer(JSStringFinalizeOp oldop,
+                                 JSStringFinalizeOp newop)
+{
+    uintN i;
+
+    for (i = 0; i != JS_ARRAY_LENGTH(str_finalizers); i++) {
+        if (str_finalizers[i] == oldop) {
+            str_finalizers[i] = newop;
+            return (intN) i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * cx is NULL when we are called from js_FinishAtomState to force the
+ * finalization of the permanently interned strings.
+ */
+void
+js_FinalizeStringRT(JSRuntime *rt, JSString *str, intN type, JSContext *cx)
+{
+    jschar *chars;
+    JSBool valid;
+    JSStringFinalizeOp finalizer;
+
+    JS_RUNTIME_UNMETER(rt, liveStrings);
+    if (str->isDependent()) {
+        /* A dependent string can not be external and must be valid. */
+        JS_ASSERT(type < 0);
+        JS_ASSERT(str->dependentBase());
+        JS_RUNTIME_UNMETER(rt, liveDependentStrings);
+        valid = JS_TRUE;
+    } else {
+        /* A stillborn string has null chars, so is not valid. */
+        chars = str->flatChars();
+        valid = (chars != NULL);
+        if (valid) {
+            if (IN_UNIT_STRING_SPACE_RT(rt, chars)) {
+                JS_ASSERT(rt->unitStrings[*chars] == str);
+                JS_ASSERT(type < 0);
+                rt->unitStrings[*chars] = NULL;
+            } else if (type < 0) {
+                free(chars);
+            } else {
+                JS_ASSERT((uintN) type < JS_ARRAY_LENGTH(str_finalizers));
+                finalizer = str_finalizers[type];
+                if (finalizer) {
+                    /*
+                     * Assume that the finalizer for the permanently interned
+                     * string knows how to deal with null context.
+                     */
+                    finalizer(cx, str);
+                }
+            }
+        }
+    }
+    if (valid && str->isDeflated())
+        js_PurgeDeflatedStringCache(rt, str);
 }
 
 /*
@@ -3615,7 +3752,7 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
                  */
                 freeList = arenaList->freeList;
                 if (a == arenaList->last)
-                    arenaList->lastCount = (uint16) indexLimit;
+                    arenaList->lastCount = indexLimit;
                 *ap = a->prev;
                 a->prev = emptyArenas;
                 emptyArenas = a;
@@ -3748,7 +3885,7 @@ out:
         goto restart;
     }
 
-    rt->gcLastBytes = rt->gcBytes;
+    rt->setGCLastBytes(rt->gcBytes);
   done_running:
     rt->gcLevel = 0;
     rt->gcRunning = JS_FALSE;
@@ -3799,18 +3936,4 @@ out:
             goto restart_at_beginning;
         }
     }
-}
-
-void
-js_UpdateMallocCounter(JSContext *cx, size_t nbytes)
-{
-    uint32 *pbytes, bytes;
-
-#ifdef JS_THREADSAFE
-    pbytes = &cx->thread->gcMallocBytes;
-#else
-    pbytes = &cx->runtime->gcMallocBytes;
-#endif
-    bytes = *pbytes;
-    *pbytes = ((uint32)-1 - bytes <= nbytes) ? (uint32)-1 : bytes + nbytes;
 }
