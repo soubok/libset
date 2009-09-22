@@ -118,7 +118,6 @@ namespace nanojit
     }
 
     NIns* Assembler::genEpilogue() {
-        max_param_size = 0;
         BLR();
         MTLR(R0);
         LP(R0, lr_offset, SP);
@@ -563,9 +562,7 @@ namespace nanojit
     }
 
     void Assembler::asm_ret(LIns *ins) {
-        UNLESS_PEDANTIC( if (_nIns != _epilogue) ) {
-            br(_epilogue, 0);
-        }
+        genEpilogue();
         assignSavedParams();
         LIns *value = ins->oprnd1();
         Register r = ins->isop(LIR_ret) ? R3 : F1;
@@ -580,7 +577,7 @@ namespace nanojit
 
     void Assembler::asm_restore(LIns *i, Reservation *resv, Register r) {
         int d;
-        if (i->isop(LIR_ialloc)) {
+        if (i->isop(LIR_alloc)) {
             d = disp(resv);
             ADDI(r, FP, d);
         }
@@ -734,7 +731,7 @@ namespace nanojit
                     if (rA->reg == UnknownReg) {
                         // load it into the arg reg
                         int d = findMemFor(p);
-                        if (p->isop(LIR_ialloc)) {
+                        if (p->isop(LIR_alloc)) {
                             NanoAssert(isS16(d));
                             ADDI(r, FP, d);
                         } else if (p->isQuad()) {
@@ -1122,10 +1119,8 @@ namespace nanojit
         NanoAssert(ins->isop(LIR_cmov) || ins->isop(LIR_qcmov));
         LIns* cond = ins->oprnd1();
         NanoAssert(cond->isCmp());
-        LIns* values = ins->oprnd2();
-        NanoAssert(values->opcode() == LIR_2);
-        LIns* iftrue = values->oprnd1();
-        LIns* iffalse = values->oprnd2();
+        LIns* iftrue = ins->oprnd2();
+        LIns* iffalse = ins->oprnd3();
         NanoAssert(iftrue->isQuad() == iffalse->isQuad());
         // fixme: we could handle fpu registers here, too, since we're just branching
         Register rr = prepResultReg(ins, GpRegs);
@@ -1179,6 +1174,10 @@ namespace nanojit
     }
 
     void Assembler::nInit(AvmCore*) {
+    }
+
+    void Assembler::nBeginAssembly() {
+        max_param_size = 0;
     }
 
     void Assembler::nativePageSetup() {
@@ -1272,7 +1271,6 @@ namespace nanojit
 
     void Assembler::nRegisterResetAll(RegAlloc &regs) {
         regs.clear();
-        regs.used = 0;
         regs.free = SavedRegs | 0x1ff8 /* R3-12 */ | 0x3ffe00000000LL /* F1-13 */;
         debug_only(regs.managed = regs.free);
     }
@@ -1296,10 +1294,6 @@ namespace nanojit
         }
     }
 #endif // NANOJIT_64BIT
-
-    void Assembler::asm_loop(LIns*, NInsList&) {
-        TODO(asm_loop);
-    }
 
     void Assembler::nFragExit(LIns*) {
         TODO(nFragExit);

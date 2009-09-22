@@ -68,6 +68,7 @@ namespace nanojit
     static const int kcalleeAreaSize = 80; // The max size.
     static const int NJ_PAGE_SIZE_SPARC = 8192; // Use sparc page size here.
 
+#define TODO(x) do{ verbose_only(outputf(#x);) NanoAssertMsgf(false, "%s", #x); } while(0)
 #define BIT_ROUND_UP(v,q)      ( (((uintptr_t)v)+(q)-1) & ~((q)-1) )
 
     void Assembler::nInit(AvmCore* core)
@@ -75,26 +76,34 @@ namespace nanojit
         has_cmov = true;
     }
 
+    void Assembler::nBeginAssembly() {
+    }
+
     NIns* Assembler::genPrologue()
     {
         /**
          * Prologue
          */
-        underrunProtect(12);
+        underrunProtect(16);
         uint32_t stackNeeded = STACK_GRANULARITY * _activation.highwatermark;
         uint32_t frameSize = stackNeeded + kcalleeAreaSize + kLinkageAreaSize;
         frameSize = BIT_ROUND_UP(frameSize, 8);
 
+        if (frameSize <= 4096)
+            SUBI(FP, frameSize, SP);
+        else {
+            SUB(FP, G1, SP);
+            ORI(G1, frameSize & 0x3FF, G1);
+            SETHI(frameSize, G1);
+        }
+
         verbose_only( verbose_outputf("        %p:",_nIns); )
         verbose_only( asm_output("        patch entry:"); )
-            NIns *patchEntry = _nIns;
-        if (frameSize <= 4096)
-            SAVEI(SP, (-frameSize), SP);
-        else {
-            SAVE(SP, G1, SP);
-            ORI(G1, -frameSize & 0x3FF, G1);
-            SETHI(-frameSize, G1);
-        }
+        NIns *patchEntry = _nIns;
+
+        // The frame size in SAVE is faked. We will still re-caculate SP later.
+        // We can use 0 here but it is not good for debuggers.
+        SAVEI(SP, -148, SP);
 
         // align the entry point
         asm_align_code();
@@ -120,7 +129,9 @@ namespace nanojit
             }
         else
             {
-                // target doesn't exit yet.  emit jump to epilog, and set up to patch later.
+                // Target doesn't exit yet. Emit jump to epilog, and set up to patch later.
+                if (!_epilogue)
+                    _epilogue = genEpilogue();
                 lr = guard->record();
                 JMP_long((intptr_t)_epilogue);
                 lr->jmp = _nIns;
@@ -146,7 +157,7 @@ namespace nanojit
         underrunProtect(8);
         NOP();
 
-        ArgSize sizes[10];
+        ArgSize sizes[MAXARGS];
         uint32_t argc = call->get_sizes(sizes);
 
         NanoAssert(ins->isop(LIR_call) || ins->isop(LIR_fcall));
@@ -192,24 +203,7 @@ namespace nanojit
             }
     }
 
-    void Assembler::nMarkExecute(Page* page, int flags)
-    {
-        static const int kProtFlags[4] = {
-            PROT_READ,                        // 0
-            PROT_READ|PROT_WRITE,            // PAGE_WRITE
-            PROT_READ|PROT_EXEC,            // PAGE_EXEC
-            PROT_READ|PROT_WRITE|PROT_EXEC    // PAGE_EXEC|PAGE_WRITE
-        };
-        int prot = kProtFlags[flags & (PAGE_WRITE|PAGE_EXEC)];
-        intptr_t addr = (intptr_t)page;
-        addr &= ~((uintptr_t)NJ_PAGE_SIZE_SPARC - 1);
-        if (mprotect((char *)addr, NJ_PAGE_SIZE_SPARC, prot) == -1) {
-            // todo: we can't abort or assert here, we have to fail gracefully.
-            NanoAssertMsg(false, "FATAL ERROR: mprotect(PROT_EXEC) failed\n");
-        }
-    }
-
-    Register Assembler::nRegisterAllocFromSet(int set)
+    Register Assembler::nRegisterAllocFromSet(RegisterMask set)
     {
         // need to implement faster way
         int i=0;
@@ -222,21 +216,16 @@ namespace nanojit
     void Assembler::nRegisterResetAll(RegAlloc& a)
     {
         a.clear();
-        a.used = 0;
         a.free = GpRegs | FpRegs;
         debug_only( a.managed = a.free; )
             }
 
-    NIns *Assembler::nPatchBranch(NIns* branch, NIns* location)
+    void Assembler::nPatchBranch(NIns* branch, NIns* location)
     {
-        NIns *was;
-
-        was = (NIns*)(((*(uint32_t*)&branch[0] & 0x3FFFFF) << 10) | (*(uint32_t*)&branch[1] & 0x3FF ));
         *(uint32_t*)&branch[0] &= 0xFFC00000;
         *(uint32_t*)&branch[0] |= ((intptr_t)location >> 10) & 0x3FFFFF;
         *(uint32_t*)&branch[1] &= 0xFFFFFC00;
         *(uint32_t*)&branch[1] |= (intptr_t)location & 0x3FF;
-        return was;
     }
 
     RegisterMask Assembler::hint(LIns* i, RegisterMask allow)
@@ -256,7 +245,7 @@ namespace nanojit
         Register rr = resv->reg;
 
         if (rr != UnknownReg && (rmask(rr) & FpRegs))
-            evict(rr);
+            evict(rr, ins);
 
         if (hi->isconst()) {
             STW32(L2, d+4, FP);
@@ -282,7 +271,7 @@ namespace nanojit
     void Assembler::asm_restore(LInsp i, Reservation *resv, Register r)
     {
         underrunProtect(24);
-        if (i->isop(LIR_ialloc)) {
+        if (i->isop(LIR_alloc)) {
             ADD(FP, L2, r);
             SET32(disp(resv), L2);
             verbose_only(if (_logc->lcbits & LC_RegAlloc) {
@@ -323,7 +312,7 @@ namespace nanojit
                 // make sure what is in a register
                 Reservation *rA, *rB;
                 Register ra, rb;
-                if (base->isop(LIR_ialloc)) {
+                if (base->isop(LIR_alloc)) {
                     rb = FP;
                     dr += findMemFor(base);
                     ra = findRegFor(value, GpRegs);
@@ -364,7 +353,7 @@ namespace nanojit
 
         int dr = disp(resv);
         Register rb;
-        if (base->isop(LIR_ialloc)) {
+        if (base->isop(LIR_alloc)) {
             rb = FP;
             db += findMemFor(base);
         } else {
@@ -414,7 +403,7 @@ namespace nanojit
 
                 int da = findMemFor(value);
                 Register rb;
-                if (base->isop(LIR_ialloc)) {
+                if (base->isop(LIR_alloc)) {
                     rb = FP;
                     dr += findMemFor(base);
                 } else {
@@ -425,7 +414,7 @@ namespace nanojit
             }
 
         Register rb;
-        if (base->isop(LIR_ialloc)) {
+        if (base->isop(LIR_alloc)) {
             rb = FP;
             dr += findMemFor(base);
         } else {
@@ -462,9 +451,8 @@ namespace nanojit
         LDSW32(rs, ds, t);
     }
 
-    NIns* Assembler::asm_branch(bool branchOnFalse, LInsp cond, NIns* targ, bool isfar)
+    NIns* Assembler::asm_branch(bool branchOnFalse, LInsp cond, NIns* targ)
     {
-              // XXX ignoring isfar
         NIns* at = 0;
         LOpcode condop = cond->opcode();
         NanoAssert(cond->isCond());
@@ -577,22 +565,6 @@ namespace nanojit
             }
     }
 
-    void Assembler::asm_loop(LInsp ins, NInsList& loopJumps)
-    {
-        (void)ins;
-        JMP_long_placeholder(); // jump to SOT
-        verbose_only( if ((_logc->lcbits & LC_Assembly) && _outputCache) {
-                          _outputCache->removeLast(); outputf("         jmp   SOT"); } );
-
-        loopJumps.add(_nIns);
-
-        assignSavedRegs();
-
-        // restore first parameter, the only one we use
-        LInsp state = _thisfrag->lirbuf->state;
-        findSpecificRegFor(state, argRegs[state->paramArg()]);
-    }
-
     void Assembler::asm_fcond(LInsp ins)
     {
         // only want certain regs
@@ -649,7 +621,7 @@ namespace nanojit
                 }
                 allow &= ~rmask(rb);
             }
-        else if ((op == LIR_add||op == LIR_iaddp) && lhs->isop(LIR_ialloc) && rhs->isconst()) {
+        else if ((op == LIR_add||op == LIR_iaddp) && lhs->isop(LIR_alloc) && rhs->isconst()) {
             // add alloc+const, use lea
             Register rr = prepResultReg(ins, allow);
             int d = findMemFor(lhs) + rhs->imm32();
@@ -850,12 +822,10 @@ namespace nanojit
         freeRsrcOf(ins, false);
         if (d)
             {
-                Register r = registerAlloc(GpRegs);
-                _allocator.addFree(r);
-                STW32(r, d+4, FP);
-                SET32(ins->imm64_0(), r);
-                STW32(r, d, FP);
-                SET32(ins->imm64_1(), r);
+                STW32(L2, d+4, FP);
+                SET32(ins->imm64_0(), L2);
+                STW32(L2, d, FP);
+                SET32(ins->imm64_1(), L2);
             }
     }
 
@@ -921,7 +891,7 @@ namespace nanojit
         if (rR) {
             Register rr;
             if ((rr=rR->reg) != UnknownReg && (rmask(rr) & FpRegs))
-                evict(rr);
+                evict(rr, ins);
         }
         return prepResultReg(ins, rmask(F0));
     }
@@ -976,13 +946,13 @@ namespace nanojit
                 if (condop == LIR_feq)
                     FBNE(0, tt);
                 else if (condop == LIR_fle)
-                    FBG(0, tt);
+                    FBUG(0, tt);
                 else if (condop == LIR_flt)
-                    FBGE(0, tt);
+                    FBUGE(0, tt);
                 else if (condop == LIR_fge)
-                    FBL(0, tt);
+                    FBUL(0, tt);
                 else //if (condop == LIR_fgt)
-                    FBLE(0, tt);
+                    FBULE(0, tt);
             }
         else // op == LIR_xt
             {
@@ -1056,41 +1026,28 @@ namespace nanojit
 
     void Assembler::nativePageSetup()
     {
-        if (!_nIns)         _nIns       = pageAlloc();
-        if (!_nExitIns)  _nExitIns = pageAlloc(true);
-    }
-
-    // Reset the _nIns pointer to the starting value. This can be used to roll
-    // back the instruction pointer in case an error occurred during the code
-    // generation.
-    void Assembler::resetInstructionPointer()
-    {
-        _nIns = _startingIns;
-    }
-
-    // Store the starting _nIns value so that it can be reset later.
-    void Assembler::recordStartingInstructionPointer()
-    {
-        _startingIns = _nIns;
+        if (!_nIns) codeAlloc(codeStart, codeEnd, _nIns);
+        if (!_nExitIns) codeAlloc(exitStart, exitEnd, _nExitIns);
     }
 
     void
-    Assembler::underrunProtect(int bytes)
+    Assembler::underrunProtect(int n)
     {
-        intptr_t u = bytes + sizeof(PageHeader)/sizeof(NIns) + 16;
-        if (!samepage((intptr_t)_nIns-u,_nIns)) {
-            NIns* target = _nIns;
-            _nIns = pageAlloc(_inExit);
-            JMP_long_nocheck((intptr_t)target);
+        NIns *eip = _nIns;
+        if (eip - n < (_inExit ? exitStart : codeStart)) {
+            // We are done with the current page.  Tell Valgrind that new code
+            // has been generated.
+            if (_inExit)
+                codeAlloc(exitStart, exitEnd, _nIns);
+            else
+                codeAlloc(codeStart, codeEnd, _nIns);
+            JMP_long_nocheck((intptr_t)eip);
         }
     }
 
-/*
     void Assembler::asm_ret(LInsp ins)
     {
-        if (_nIns != _epilogue) {
-            JMP(_epilogue);
-        }
+        genEpilogue();
         assignSavedRegs();
         LIns *val = ins->oprnd1();
         if (ins->isop(LIR_ret)) {
@@ -1099,7 +1056,11 @@ namespace nanojit
             findSpecificRegFor(val, F0);
         }
     }
-*/
+
+    void Assembler::asm_promote(LIns *) {
+        // i2q or u2q
+        TODO(asm_promote);
+    }
 
 #endif /* FEATURE_NANOJIT */
 }

@@ -58,6 +58,7 @@
 #include "jsstr.h"
 #include "jsbuiltins.h"
 #include "jstracer.h"
+#include "jsvector.h"
 
 #include "jsatominlines.h"
 
@@ -129,7 +130,7 @@ js_BoxInt32(JSContext* cx, int32 i)
     if (!js_NewDoubleInRootedValue(cx, d, &v))
         return JSVAL_ERROR_COOKIE;
     return v;
-} 
+}
 JS_DEFINE_CALLINFO_2(extern, JSVAL, js_BoxInt32, CONTEXT, INT32, 1, 1)
 
 jsdouble FASTCALL
@@ -242,15 +243,12 @@ JSBool FASTCALL
 js_AddProperty(JSContext* cx, JSObject* obj, JSScopeProperty* sprop)
 {
     JS_ASSERT(OBJ_IS_NATIVE(obj));
-    JS_ASSERT(SPROP_HAS_STUB_SETTER(sprop));
-
     JS_LOCK_OBJ(cx, obj);
 
     JSScope* scope = OBJ_SCOPE(obj);
     uint32 slot;
-    if (scope->object == obj) {
-        if (sprop == scope->lastProp || scope->has(sprop))
-            goto exit_trace;
+    if (scope->owned()) {
+        JS_ASSERT(!scope->has(sprop));
     } else {
         scope = js_GetMutableScope(cx, obj);
         if (!scope)
@@ -300,18 +298,18 @@ HasProperty(JSContext* cx, JSObject* obj, jsid id)
     // Check that we know how the lookup op will behave.
     for (JSObject* pobj = obj; pobj; pobj = OBJ_GET_PROTO(cx, pobj)) {
         if (pobj->map->ops->lookupProperty != js_LookupProperty)
-            return JSVAL_TO_PSEUDO_BOOLEAN(JSVAL_VOID);
+            return JSVAL_TO_SPECIAL(JSVAL_VOID);
         JSClass* clasp = OBJ_GET_CLASS(cx, pobj);
         if (clasp->resolve != JS_ResolveStub && clasp != &js_StringClass)
-            return JSVAL_TO_PSEUDO_BOOLEAN(JSVAL_VOID);
+            return JSVAL_TO_SPECIAL(JSVAL_VOID);
     }
 
     JSObject* obj2;
     JSProperty* prop;
     if (js_LookupPropertyWithFlags(cx, obj, id, JSRESOLVE_QUALIFIED, &obj2, &prop) < 0)
-        return JSVAL_TO_PSEUDO_BOOLEAN(JSVAL_VOID);
+        return JSVAL_TO_SPECIAL(JSVAL_VOID);
     if (prop)
-        OBJ_DROP_PROPERTY(cx, obj2, prop);
+        obj2->dropProperty(cx, prop);
     return prop != NULL;
 }
 
@@ -337,17 +335,6 @@ js_HasNamedPropertyInt32(JSContext* cx, JSObject* obj, int32 index)
 }
 JS_DEFINE_CALLINFO_3(extern, BOOL, js_HasNamedPropertyInt32, CONTEXT, OBJECT, INT32, 0, 0)
 
-jsval FASTCALL
-js_CallGetter(JSContext* cx, JSObject* obj, JSScopeProperty* sprop)
-{
-    JS_ASSERT(!SPROP_HAS_STUB_GETTER(sprop));
-    jsval v;
-    if (!js_GetSprop(cx, sprop, obj, &v))
-        return JSVAL_ERROR_COOKIE;
-    return v;
-}
-JS_DEFINE_CALLINFO_3(extern, JSVAL, js_CallGetter, CONTEXT, OBJECT, SCOPEPROP, 0, 0)
-
 JSString* FASTCALL
 js_TypeOfObject(JSContext* cx, JSObject* obj)
 {
@@ -360,7 +347,7 @@ JSString* FASTCALL
 js_TypeOfBoolean(JSContext* cx, int32 unboxed)
 {
     /* Watch out for pseudo-booleans. */
-    jsval boxed = PSEUDO_BOOLEAN_TO_JSVAL(unboxed);
+    jsval boxed = SPECIAL_TO_JSVAL(unboxed);
     JS_ASSERT(JSVAL_IS_VOID(boxed) || JSVAL_IS_BOOLEAN(boxed));
     JSType type = JS_TypeOfValue(cx, boxed);
     return ATOM_TO_STRING(cx->runtime->atomState.typeAtoms[type]);
@@ -370,7 +357,7 @@ JS_DEFINE_CALLINFO_2(extern, STRING, js_TypeOfBoolean, CONTEXT, INT32, 1, 1)
 jsdouble FASTCALL
 js_BooleanOrUndefinedToNumber(JSContext* cx, int32 unboxed)
 {
-    if (unboxed == JSVAL_TO_PSEUDO_BOOLEAN(JSVAL_VOID))
+    if (unboxed == JSVAL_TO_SPECIAL(JSVAL_VOID))
         return js_NaN;
     JS_ASSERT(unboxed == JS_TRUE || unboxed == JS_FALSE);
     return unboxed;
@@ -386,15 +373,6 @@ js_BooleanOrUndefinedToString(JSContext *cx, int32 unboxed)
 JS_DEFINE_CALLINFO_2(extern, STRING, js_BooleanOrUndefinedToString, CONTEXT, INT32, 1, 1)
 
 JSObject* FASTCALL
-js_Arguments(JSContext* cx, JSObject* parent, JSObject* cached)
-{
-    if (cached)
-        return cached;
-    return js_NewObject(cx, &js_ArgumentsClass, NULL, NULL);
-}
-JS_DEFINE_CALLINFO_3(extern, OBJECT, js_Arguments, CONTEXT, OBJECT, OBJECT, 0, 0)
-
-JSObject* FASTCALL
 js_NewNullClosure(JSContext* cx, JSObject* funobj, JSObject* proto, JSObject* parent)
 {
     JS_ASSERT(HAS_FUNCTION_CLASS(funobj));
@@ -408,12 +386,17 @@ js_NewNullClosure(JSContext* cx, JSObject* funobj, JSObject* proto, JSObject* pa
     if (!closure)
         return NULL;
 
-    OBJ_SCOPE(proto)->hold();
-    closure->map = proto->map;
+    JSScope *scope = OBJ_SCOPE(proto)->getEmptyScope(cx, &js_FunctionClass);
+    if (!scope) {
+        closure->map = NULL;
+        return NULL;
+    }
+
+    closure->map = &scope->map;
     closure->classword = jsuword(&js_FunctionClass);
-    closure->fslots[JSSLOT_PROTO] = OBJECT_TO_JSVAL(proto);
-    closure->fslots[JSSLOT_PARENT] = OBJECT_TO_JSVAL(parent);
-    closure->fslots[JSSLOT_PRIVATE] = PRIVATE_TO_JSVAL(fun);
+    closure->setProto(proto);
+    closure->setParent(parent);
+    closure->setPrivate(fun);
     for (unsigned i = JSSLOT_PRIVATE + 1; i != JS_INITIAL_NSLOTS; ++i)
         closure->fslots[i] = JSVAL_VOID;
     closure->dslots = NULL;
@@ -421,3 +404,41 @@ js_NewNullClosure(JSContext* cx, JSObject* funobj, JSObject* proto, JSObject* pa
 }
 JS_DEFINE_CALLINFO_4(extern, OBJECT, js_NewNullClosure, CONTEXT, OBJECT, OBJECT, OBJECT, 0, 0)
 
+JSString* FASTCALL
+js_ConcatN(JSContext *cx, JSString **strArray, uint32 size)
+{
+    /* Calculate total size. */
+    size_t numChar = 1;
+    for (uint32 i = 0; i < size; ++i) {
+        size_t before = numChar;
+        numChar += strArray[i]->length();
+        if (numChar < before)
+            return NULL;
+    }
+
+
+    /* Allocate buffer. */
+    if (numChar & js::tl::MulOverflowMask<sizeof(jschar)>::result)
+        return NULL;
+    jschar *buf = (jschar *)cx->malloc(numChar * sizeof(jschar));
+    if (!buf)
+        return NULL;
+
+    /* Fill buffer. */
+    jschar *ptr = buf;
+    for (uint32 i = 0; i < size; ++i) {
+        const jschar *chars;
+        size_t length;
+        strArray[i]->getCharsAndLength(chars, length);
+        js_strncpy(ptr, chars, length);
+        ptr += length;
+    }
+    *ptr = '\0';
+
+    /* Create string. */
+    JSString *str = js_NewString(cx, buf, numChar - 1);
+    if (!str)
+        cx->free(buf);
+    return str;
+}
+JS_DEFINE_CALLINFO_3(extern, STRING, js_ConcatN, CONTEXT, STRINGPTR, UINT32, 0, 0)

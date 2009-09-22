@@ -50,9 +50,6 @@ JS_BEGIN_EXTERN_C
 
 #define ARRAY_CAPACITY_MIN      7
 
-/* Generous sanity-bound on length (in elements) of array initialiser. */
-#define ARRAY_INIT_LIMIT        JS_BIT(24)
-
 extern JSBool
 js_IdIsIndex(jsval id, jsuint *indexp);
 
@@ -97,8 +94,8 @@ js_GetProtoIfDenseArray(JSContext *cx, JSObject *obj)
 extern JSObject *
 js_InitArrayClass(JSContext *cx, JSObject *obj);
 
-extern JSBool
-js_InitContextBusyArrayTable(JSContext *);
+extern bool
+js_InitContextBusyArrayTable(JSContext *cx);
 
 extern JSObject *
 js_NewArrayObject(JSContext *cx, jsuint length, jsval *vector,
@@ -206,6 +203,10 @@ js_PrototypeHasIndexedProperties(JSContext *cx, JSObject *obj);
 JSBool
 js_GetDenseArrayElementValue(JSContext *cx, JSObject *obj, JSProperty *prop,
                              jsval *vp);
+
+/* Array constructor native. Exposed only so the JIT can know its address. */
+JSBool
+js_Array(JSContext* cx, JSObject* obj, uintN argc, jsval* argv, jsval* rval);
 
 JS_END_EXTERN_C
 

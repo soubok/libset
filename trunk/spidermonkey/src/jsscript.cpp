@@ -104,8 +104,7 @@ script_toSource(JSContext *cx, uintN argc, jsval *vp)
     JSScript *script;
     size_t i, j, k, n;
     char buf[16];
-    const jschar *s;
-    jschar *t;
+    jschar *s, *t;
     JSString *str;
 
     obj = JS_THIS_OBJECT(cx, vp);
@@ -119,7 +118,7 @@ script_toSource(JSContext *cx, uintN argc, jsval *vp)
             return JS_FALSE;
     }
 
-    script = (JSScript *) JS_GetPrivate(cx, obj);
+    script = (JSScript *) obj->getPrivate();
 
     /* Let n count the source string length, j the "front porch" length. */
     j = JS_snprintf(buf, sizeof buf, "(new %s(", js_ScriptClass.name);
@@ -141,7 +140,7 @@ script_toSource(JSContext *cx, uintN argc, jsval *vp)
     }
 
     /* Allocate the source string and copy into it. */
-    t = (jschar *) JS_malloc(cx, (n + 1) * sizeof(jschar));
+    t = (jschar *) cx->malloc((n + 1) * sizeof(jschar));
     if (!t)
         return JS_FALSE;
     for (i = 0; i < j; i++)
@@ -155,7 +154,7 @@ script_toSource(JSContext *cx, uintN argc, jsval *vp)
     /* Create and return a JS string for t. */
     str = JS_NewUCString(cx, t, n);
     if (!str) {
-        JS_free(cx, t);
+        cx->free(t);
         return JS_FALSE;
     }
     *vp = STRING_TO_JSVAL(str);
@@ -181,7 +180,7 @@ script_toString(JSContext *cx, uintN argc, jsval *vp)
     obj = JS_THIS_OBJECT(cx, vp);
     if (!JS_InstanceOf(cx, obj, &js_ScriptClass, vp + 2))
         return JS_FALSE;
-    script = (JSScript *) JS_GetPrivate(cx, obj);
+    script = (JSScript *) obj->getPrivate();
     if (!script) {
         *vp = STRING_TO_JSVAL(cx->runtime->emptyString);
         return JS_TRUE;
@@ -201,7 +200,6 @@ script_compile_sub(JSContext *cx, JSObject *obj, uintN argc, jsval *argv,
 {
     JSString *str;
     JSObject *scopeobj;
-    jsval v;
     JSScript *script, *oldscript;
     JSStackFrame *caller;
     const char *file;
@@ -285,9 +283,8 @@ script_compile_sub(JSContext *cx, JSObject *obj, uintN argc, jsval *argv,
     }
 
     /* Swap script for obj's old script, if any. */
-    v = LOCKED_OBJ_GET_SLOT(obj, JSSLOT_PRIVATE);
-    oldscript = (JSScript*) (!JSVAL_IS_VOID(v) ? JSVAL_TO_PRIVATE(v) : NULL);
-    LOCKED_OBJ_SET_SLOT(obj, JSSLOT_PRIVATE, PRIVATE_TO_JSVAL(script));
+    oldscript = (JSScript*) obj->getPrivate();
+    obj->setPrivate(script);
     JS_UNLOCK_OBJ(cx, obj);
 
     if (oldscript)
@@ -381,7 +378,7 @@ script_exec_sub(JSContext *cx, JSObject *obj, uintN argc, jsval *argv,
     AdjustScriptExecDepth(cx, obj, 1);
 
     /* Must get to out label after this */
-    script = (JSScript *) JS_GetPrivate(cx, obj);
+    script = (JSScript *) obj->getPrivate();
     if (!script) {
         ok = JS_FALSE;
         goto out;
@@ -534,7 +531,7 @@ js_XDRScript(JSXDRState *xdr, JSScript **scriptp, JSBool *hasMagic)
     ok = JS_XDRBytes(xdr, (char *) code, length * sizeof(jsbytecode));
 
     if (code != script->code)
-        JS_free(cx, code);
+        cx->free(code);
 
     if (!ok)
         goto error;
@@ -577,7 +574,7 @@ js_XDRScript(JSXDRState *xdr, JSScript **scriptp, JSBool *hasMagic)
             filename = js_SaveScriptFilename(cx, filename);
             if (!filename)
                 goto error;
-            JS_free(cx, (void *) script->filename);
+            cx->free((void *) script->filename);
             script->filename = filename;
             filenameWasSaved = JS_TRUE;
         }
@@ -666,7 +663,7 @@ js_XDRScript(JSXDRState *xdr, JSScript **scriptp, JSBool *hasMagic)
     if (xdr->mode == JSXDR_DECODE) {
         JS_POP_TEMP_ROOT(cx, &tvr);
         if (script->filename && !filenameWasSaved) {
-            JS_free(cx, (void *) script->filename);
+            cx->free((void *) script->filename);
             script->filename = NULL;
         }
         js_DestroyScript(cx, script);
@@ -697,7 +694,7 @@ script_freeze(JSContext *cx, uintN argc, jsval *vp)
     obj = JS_THIS_OBJECT(cx, vp);
     if (!JS_InstanceOf(cx, obj, &js_ScriptClass, vp + 2))
         return JS_FALSE;
-    script = (JSScript *) JS_GetPrivate(cx, obj);
+    script = (JSScript *) obj->getPrivate();
     if (!script)
         return JS_TRUE;
 
@@ -784,7 +781,7 @@ script_thaw(JSContext *cx, uintN argc, jsval *vp)
 
     /* Swap bytes in Unichars to keep frozen strings machine-independent. */
     from = (jschar *)buf;
-    to = (jschar *) JS_malloc(cx, len * sizeof(jschar));
+    to = (jschar *) cx->malloc(len * sizeof(jschar));
     if (!to) {
         JS_XDRDestroy(xdr);
         return JS_FALSE;
@@ -821,9 +818,8 @@ script_thaw(JSContext *cx, uintN argc, jsval *vp)
     }
 
     /* Swap script for obj's old script, if any. */
-    v = LOCKED_OBJ_GET_SLOT(obj, JSSLOT_PRIVATE);
-    oldscript = !JSVAL_IS_VOID(v) ? JSVAL_TO_PRIVATE(v) : NULL;
-    LOCKED_OBJ_SET_SLOT(obj, JSSLOT_PRIVATE, PRIVATE_TO_JSVAL(script));
+    oldscript = (JSScript *) obj->getPrivate();
+    obj->setPrivate(script);
     JS_UNLOCK_OBJ(cx, obj);
 
     if (oldscript)
@@ -840,7 +836,7 @@ out:
     JS_XDRMemSetData(xdr, NULL, 0);
     JS_XDRDestroy(xdr);
 #if IS_BIG_ENDIAN
-    JS_free(cx, buf);
+    cx->free(buf);
 #endif
     *vp = JSVAL_TRUE;
     return ok;
@@ -872,9 +868,7 @@ static JSFunctionSpec script_methods[] = {
 static void
 script_finalize(JSContext *cx, JSObject *obj)
 {
-    JSScript *script;
-
-    script = (JSScript *) JS_GetPrivate(cx, obj);
+    JSScript *script = (JSScript *) obj->getPrivate();
     if (script)
         js_DestroyScript(cx, script);
 }
@@ -892,9 +886,7 @@ script_call(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 static void
 script_trace(JSTracer *trc, JSObject *obj)
 {
-    JSScript *script;
-
-    script = (JSScript *) JS_GetPrivate(trc->context, obj);
+    JSScript *script = (JSScript *) obj->getPrivate();
     if (script)
         js_TraceScript(trc, script);
 }
@@ -996,13 +988,13 @@ typedef struct ScriptFilenameEntry {
 static void *
 js_alloc_table_space(void *priv, size_t size)
 {
-    return malloc(size);
+    return js_malloc(size);
 }
 
 static void
 js_free_table_space(void *priv, void *item, size_t size)
 {
-    free(item);
+    js_free(item);
 }
 
 static JSHashEntry *
@@ -1011,7 +1003,7 @@ js_alloc_sftbl_entry(void *priv, const void *key)
     size_t nbytes = offsetof(ScriptFilenameEntry, filename) +
                     strlen((const char *) key) + 1;
 
-    return (JSHashEntry *) malloc(JS_MAX(nbytes, sizeof(JSHashEntry)));
+    return (JSHashEntry *) js_malloc(JS_MAX(nbytes, sizeof(JSHashEntry)));
 }
 
 static void
@@ -1019,7 +1011,7 @@ js_free_sftbl_entry(void *priv, JSHashEntry *he, uintN flag)
 {
     if (flag != HT_FREE_ENTRY)
         return;
-    free(he);
+    js_free(he);
 }
 
 static JSHashAllocOps sftbl_alloc_ops = {
@@ -1081,7 +1073,7 @@ js_FreeRuntimeScriptState(JSRuntime *rt)
     while (!JS_CLIST_IS_EMPTY(&rt->scriptFilenamePrefixes)) {
         sfp = (ScriptFilenamePrefix *) rt->scriptFilenamePrefixes.next;
         JS_REMOVE_LINK(&sfp->links);
-        free(sfp);
+        js_free(sfp);
     }
     js_FinishRuntimeScriptState(rt);
 }
@@ -1144,7 +1136,7 @@ SaveScriptFilename(JSRuntime *rt, const char *filename, uint32 flags)
 
         if (!sfp) {
             /* No such prefix: add one now. */
-            sfp = (ScriptFilenamePrefix *) malloc(sizeof(ScriptFilenamePrefix));
+            sfp = (ScriptFilenamePrefix *) js_malloc(sizeof(ScriptFilenamePrefix));
             if (!sfp)
                 return NULL;
             JS_INSERT_AFTER(&sfp->links, link);
@@ -1385,7 +1377,7 @@ js_NewScript(JSContext *cx, uint32 length, uint32 nsrcnotes, uint32 natoms,
     if (ntrynotes != 0)
         size += sizeof(JSTryNoteArray) + ntrynotes * sizeof(JSTryNote);
 
-    script = (JSScript *) JS_malloc(cx, size);
+    script = (JSScript *) cx->malloc(size);
     if (!script)
         return NULL;
     memset(script, 0, sizeof(JSScript));
@@ -1537,7 +1529,7 @@ js_NewScriptFromCG(JSContext *cx, JSCodeGenerator *cg)
         memcpy(JS_SCRIPT_UPVARS(script)->vector, cg->upvarMap.vector,
                cg->upvarList.count * sizeof(uint32));
         cg->upvarList.clear();
-        JS_free(cx, cg->upvarMap.vector);
+        cx->free(cg->upvarMap.vector);
         cg->upvarMap.vector = NULL;
     }
 
@@ -1607,8 +1599,17 @@ js_DestroyScript(JSContext *cx, JSScript *script)
         JS_PURGE_GSN_CACHE(cx);
 
     /*
-     * The GC flushes all property caches, so no need to purge just the
-     * entries for this script.
+     * Worry about purging the property cache and any compiled traces related
+     * to its bytecode if this script is being destroyed from JS_DestroyScript
+     * or equivalent according to a mandatory "New/Destroy" protocol.
+     *
+     * The GC purges all property caches when regenerating shapes upon shape
+     * generator overflow, so no need in that event to purge just the entries
+     * for this script.
+     *
+     * The GC purges trace-JITted code on every GC activation, not just when
+     * regenerating shapes, so we don't have to purge fragments if the GC is
+     * currently running.
      *
      * JS_THREADSAFE note: js_PurgePropertyCacheForScript purges only the
      * current thread's property cache, so a script not owned by a function
@@ -1624,21 +1625,24 @@ js_DestroyScript(JSContext *cx, JSScript *script)
     JS_ASSERT_IF(cx->runtime->gcRunning, !script->owner);
 #endif
 
+    /* FIXME: bug 506341; would like to do this only if regenerating shapes. */
     if (!cx->runtime->gcRunning) {
         JSStackFrame *fp = js_GetTopStackFrame(cx);
 
         if (!(fp && (fp->flags & JSFRAME_EVAL))) {
+            js_PurgePropertyCacheForScript(cx, script);
+
 #ifdef CHECK_SCRIPT_OWNER
             JS_ASSERT(script->owner == cx->thread);
-#endif
-            js_PurgePropertyCacheForScript(cx, script);
-#ifdef JS_TRACER
-            js_PurgeScriptFragments(cx, script);
 #endif
         }
     }
 
-    JS_free(cx, script);
+#ifdef JS_TRACER
+    js_PurgeScriptFragments(cx, script);
+#endif
+
+    cx->free(script);
 }
 
 void

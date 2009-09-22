@@ -55,9 +55,10 @@ JS_BEGIN_EXTERN_C
 #ifdef JS_THREADSAFE
 
 #if (defined(_WIN32) && defined(_M_IX86)) ||                                  \
-    (defined(__GNUC__) && defined(__i386__)) ||                               \
-    (defined(__GNUC__) && defined(__x86_64__)) ||                             \
-    (defined(SOLARIS) && defined(sparc) && defined(ULTRA_SPARC)) ||           \
+    (defined(_WIN64) && (defined(_M_AMD64) || defined(_M_X64))) ||            \
+    (defined(__i386) && (defined(__GNUC__) || defined(__SUNPRO_CC))) ||       \
+    (defined(__x86_64) && (defined(__GNUC__) || defined(__SUNPRO_CC))) ||     \
+    (defined(__sparc) && (defined(__GNUC__) || defined(__SUNPRO_CC))) ||      \
     defined(AIX) ||                                                           \
     defined(USE_ARM_KUSER)
 # define JS_HAS_NATIVE_COMPARE_AND_SWAP 1
@@ -235,19 +236,6 @@ extern void js_SetScopeInfo(JSScope *scope, const char *file, int line);
 
 #endif /* DEBUG */
 
-#define JS_LOCK_OBJ_VOID(cx, obj, e)                                          \
-    JS_BEGIN_MACRO                                                            \
-        JS_LOCK_OBJ(cx, obj);                                                 \
-        e;                                                                    \
-        JS_UNLOCK_OBJ(cx, obj);                                               \
-    JS_END_MACRO
-
-#define JS_LOCK_VOID(cx, e)                                                   \
-    JS_BEGIN_MACRO                                                            \
-        JSRuntime *_rt = (cx)->runtime;                                       \
-        JS_LOCK_RUNTIME_VOID(_rt, e);                                         \
-    JS_END_MACRO
-
 #else  /* !JS_THREADSAFE */
 
 #define JS_ATOMIC_INCREMENT(p)      (++*(p))
@@ -283,7 +271,6 @@ extern void js_SetScopeInfo(JSScope *scope, const char *file, int line);
 #define JS_IS_RUNTIME_LOCKED(rt)        1
 #define JS_IS_OBJ_LOCKED(cx,obj)        1
 #define JS_IS_TITLE_LOCKED(cx,title)    1
-#define JS_LOCK_VOID(cx, e)             JS_LOCK_RUNTIME_VOID((cx)->runtime, e)
 
 #endif /* !JS_THREADSAFE */
 

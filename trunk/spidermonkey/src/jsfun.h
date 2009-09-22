@@ -162,7 +162,6 @@ struct JSFunction {
     } u;
     JSAtom          *atom;        /* name for diagnostics and decompiling */
 
-#ifdef __cplusplus
     bool optimizedClosure() { return FUN_KIND(this) > JSFUN_INTERPRETED; }
     bool needsWrapper()     { return FUN_NULL_CLOSURE(this) && u.i.skipmin != 0; }
 
@@ -180,7 +179,8 @@ struct JSFunction {
         JS_ASSERT(FUN_INTERPRETED(this));
         return countLocalNames() != 0;
     }
-#endif
+
+    uint32 countInterpretedReservedSlots() const;
 };
 
 /*
@@ -218,7 +218,7 @@ extern JS_FRIEND_DATA(JSClass) js_FunctionClass;
  */
 #define GET_FUNCTION_PRIVATE(cx, funobj)                                      \
     (JS_ASSERT(HAS_FUNCTION_CLASS(funobj)),                                   \
-     (JSFunction *) OBJ_GET_PRIVATE(cx, funobj))
+     (JSFunction *) (funobj)->getAssignedPrivate())
 
 extern JSObject *
 js_InitFunctionClass(JSContext *cx, JSObject *obj);
@@ -273,14 +273,35 @@ js_ReportIsNotFunction(JSContext *cx, jsval *vp, uintN flags);
 extern JSObject *
 js_GetCallObject(JSContext *cx, JSStackFrame *fp);
 
-extern JS_FRIEND_API(JSBool)
+extern void
 js_PutCallObject(JSContext *cx, JSStackFrame *fp);
+
+extern JSFunction *
+js_GetCallObjectFunction(JSObject *obj);
 
 extern JSBool
 js_GetCallArg(JSContext *cx, JSObject *obj, jsid id, jsval *vp);
 
 extern JSBool
-js_GetCallVar(JSContext *cx, JSObject *obj, jsval id, jsval *vp);
+js_GetCallVar(JSContext *cx, JSObject *obj, jsid id, jsval *vp);
+
+extern JSBool
+SetCallArg(JSContext *cx, JSObject *obj, jsid id, jsval *vp);
+
+extern JSBool
+SetCallVar(JSContext *cx, JSObject *obj, jsid id, jsval *vp);
+
+/*
+ * js_SetCallArg and js_SetCallVar are extern fastcall copies of the setter
+ * functions. These versions are required in order to set call vars from traces.
+ * The normal versions must not be fastcall because they are stored in the
+ * property ops map.
+ */
+extern JSBool JS_FASTCALL
+js_SetCallArg(JSContext *cx, JSObject *obj, jsid id, jsval v);
+
+extern JSBool JS_FASTCALL
+js_SetCallVar(JSContext *cx, JSObject *obj, jsid id, jsval v);
 
 /*
  * Slower version of js_GetCallVar used when call_resolve detects an attempt to
@@ -298,7 +319,7 @@ js_GetArgsProperty(JSContext *cx, JSStackFrame *fp, jsid id, jsval *vp);
 extern JSObject *
 js_GetArgsObject(JSContext *cx, JSStackFrame *fp);
 
-extern JS_FRIEND_API(JSBool)
+extern void
 js_PutArgsObject(JSContext *cx, JSStackFrame *fp);
 
 extern JSBool

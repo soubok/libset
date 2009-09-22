@@ -58,6 +58,7 @@
 #include "jsscan.h"
 #include "jsstr.h"
 #include "jsversion.h"
+#include "jsstrinlines.h"
 
 /*
  * ATOM_HASH assumes that JSHashNumber is 32-bit even on 64-bit systems.
@@ -98,7 +99,7 @@ js_AtomToPrintableString(JSContext *cx, JSAtom *atom)
  * The elements of the array after the first empty string define strings
  * corresponding to the two boolean literals, false and true, followed by the
  * JSType enumerators from jspubtd.h starting with "undefined" for JSTYPE_VOID
- * (which is pseudo-boolean 2) and continuing as initialized below. The static
+ * (which is special-value 2) and continuing as initialized below. The static
  * asserts check these relations.
  */
 JS_STATIC_ASSERT(JSTYPE_LIMIT == 8);
@@ -325,11 +326,8 @@ static const JSDHashTableOps StringHashOps = {
 static JSDHashNumber
 HashDouble(JSDHashTable *table, const void *key)
 {
-    jsdouble d;
-
     JS_ASSERT(IS_DOUBLE_TABLE(table));
-    d = *(jsdouble *)key;
-    return JSDOUBLE_HI32(d) ^ JSDOUBLE_LO32(d);
+    return JS_HASH_DOUBLE(*(jsdouble *)key);
 }
 
 static JSDHashNumber
@@ -559,14 +557,29 @@ js_pinned_atom_tracer(JSDHashTable *table, JSDHashEntryHdr *hdr,
 void
 js_TraceAtomState(JSTracer *trc, JSBool allAtoms)
 {
-    JSAtomState *state;
+    JSRuntime *rt = trc->context->runtime;
+    JSAtomState *state = &rt->atomState;
 
-    state = &trc->context->runtime->atomState;
     if (allAtoms) {
         JS_DHashTableEnumerate(&state->doubleAtoms, js_locked_atom_tracer, trc);
         JS_DHashTableEnumerate(&state->stringAtoms, js_locked_atom_tracer, trc);
     } else {
         JS_DHashTableEnumerate(&state->stringAtoms, js_pinned_atom_tracer, trc);
+    }
+
+    if (rt->state != JSRTS_LANDING) {
+        /*
+         * Unit strings aren't in state->stringAtoms, so we mark any that have
+         * been created on demand. This bloats more than strictly necessary but
+         * we can't help that without putting unit atoms in state->stringAtoms,
+         * which is too expensive.
+         */
+        for (uintN i = 0; i < UNIT_STRING_LIMIT; i++) {
+            if (JSString *str = rt->unitStrings[i]) {
+                JS_SET_TRACING_INDEX(trc, "unit_string_atom", i);
+                JS_CallTracer(trc, str, JSTRACE_STRING);
+            }
+        }
     }
 }
 
@@ -672,6 +685,14 @@ js_AtomizeString(JSContext *cx, JSString *str, uintN flags)
 
     JS_ASSERT(!(flags & ~(ATOM_PINNED|ATOM_INTERNED|ATOM_TMPSTR|ATOM_NOCOPY)));
     JS_ASSERT_IF(flags & ATOM_NOCOPY, flags & ATOM_TMPSTR);
+
+    if (str->length() == 1) {
+        jschar c = str->chars()[0];
+        if (c < UNIT_STRING_LIMIT) {
+            JSString *str = JSString::getUnitString(cx, c);
+            return str ? (JSAtom *) STRING_TO_JSVAL(str) : NULL;
+        }
+    }
 
     state = &cx->runtime->atomState;
     table = &state->stringAtoms;
@@ -783,7 +804,7 @@ js_Atomize(JSContext *cx, const char *bytes, size_t length, uintN flags)
     str.initFlat(chars, inflatedLength);
     atom = js_AtomizeString(cx, &str, ATOM_TMPSTR | flags);
     if (chars != inflated && str.flatChars())
-        JS_free(cx, chars);
+        cx->free(chars);
     return atom;
 }
 
@@ -802,6 +823,14 @@ js_GetExistingStringAtom(JSContext *cx, const jschar *chars, size_t length)
     JSString str, *str2;
     JSAtomState *state;
     JSDHashEntryHdr *hdr;
+
+    if (length == 1) {
+        jschar c = *chars;
+        if (c < UNIT_STRING_LIMIT) {
+            JSString *str = JSString::getUnitString(cx, c);
+            return str ? (JSAtom *) STRING_TO_JSVAL(str) : NULL;
+        }
+    }
 
     str.initFlat((jschar *)chars, length);
     state = &cx->runtime->atomState;
