@@ -47,6 +47,7 @@
 #include "jsdhash.h"
 #include "jsbit.h"
 #include "jsutil.h"
+#include "jstask.h"
 
 JS_BEGIN_EXTERN_C
 
@@ -309,18 +310,6 @@ typedef struct JSGCDoubleArenaList {
                                            things */
 } JSGCDoubleArenaList;
 
-typedef struct JSGCFreeListSet JSGCFreeListSet;
-
-struct JSGCFreeListSet {
-    JSGCThing           *array[GC_NUM_FREELISTS];
-    JSGCFreeListSet     *link;
-};
-
-extern const JSGCFreeListSet js_GCEmptyFreeListSet;
-
-extern void
-js_RevokeGCLocalFreeLists(JSContext *cx);
-
 extern void
 js_DestroyScriptsToGC(JSContext *cx, JSThreadData *data);
 
@@ -352,6 +341,28 @@ js_AddAsGCBytes(JSContext *cx, size_t sz);
 
 extern void
 js_RemoveAsGCBytes(JSRuntime* rt, size_t sz);
+
+#ifdef JS_THREADSAFE
+class JSFreePointerListTask : public JSBackgroundTask {
+    void *head;
+  public:
+    JSFreePointerListTask() : head(NULL) {}
+
+    void add(void* ptr) {
+        *(void**)ptr = head;
+        head = ptr;
+    }
+
+    void run() {
+        void *ptr = head;
+        while (ptr) {
+            void *next = *(void **)ptr;
+            js_free(ptr);
+            ptr = next;
+        }
+    }
+};
+#endif
 
 /*
  * Free the chars held by str when it is finalized by the GC. When type is

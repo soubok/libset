@@ -41,6 +41,7 @@ DEPTH		= .
 topsrcdir	= @top_srcdir@
 srcdir		= @srcdir@
 
+run_for_side_effects := $(shell echo "MAKE: $(MAKE)")
 include $(DEPTH)/config/autoconf.mk
 
 DIRS		= config
@@ -56,6 +57,10 @@ endif
 # editline needs to get built before the shell
 ifndef JS_DISABLE_SHELL
 DIRS += shell
+endif
+
+ifdef ENABLE_TESTS
+DIRS += jsapi-tests
 endif
 
 MODULE		    = js
@@ -144,6 +149,7 @@ CPPSRCS		= \
 		jsscope.cpp \
 		jsscript.cpp \
 		jsstr.cpp \
+		jstask.cpp \
 		jsutil.cpp \
 		jsxdrapi.cpp \
 		jsxml.cpp \
@@ -200,6 +206,7 @@ INSTALLED_HEADERS = \
 		jsscript.h \
 		jsstaticcheck.h \
 		jsstr.h \
+		jstask.h \
 		jstracer.h \
 		jstypes.h \
 		jsutil.h \
@@ -214,6 +221,9 @@ VPATH		+= $(srcdir)/nanojit
 INSTALLED_HEADERS += \
 		jsbuiltins.h    \
 		Assembler.h     \
+		Allocator.h     \
+		CodeAlloc.h     \
+		Containers.h    \
 		LIR.h		\
 		avmplus.h	\
 		Fragmento.h	\
@@ -226,6 +236,9 @@ INSTALLED_HEADERS += \
 CPPSRCS += \
 		jstracer.cpp \
 		Assembler.cpp  \
+		Allocator.cpp  \
+		CodeAlloc.cpp  \
+		Containers.cpp \
 		Fragmento.cpp  \
 		LIR.cpp        \
 		RegAlloc.cpp   \
@@ -237,6 +250,7 @@ CPPSRCS += \
 ifdef WINCE
 # don't need -c
 AS_DASH_C_FLAG =
+ASFLAGS += -arch 6
 ASFILES += jswince.asm
 endif
 
@@ -255,8 +269,6 @@ endif
 
 EXPORTS = $(INSTALLED_HEADERS)
 
-JS_SAFE_ARENA	= 1
-
 DASH_R		= -r
 
 ifneq (,$(filter OS2 WINCE WINNT,$(OS_ARCH)))
@@ -272,15 +284,6 @@ EXTRA_DSO_LDOPTS += $(NSPR_LIBS)
 ifdef MOZ_MEMORY
 ifeq ($(OS_ARCH),SunOS)
 EXTRA_DSO_LDOPTS += $(call EXPAND_LIBNAME_PATH,jemalloc,$(DIST)/lib)
-endif
-endif
-
-# When using gcc the assembly is inlined in the C-file (see jslock.cpp)
-ifeq ($(OS_ARCH),SunOS)
-ifneq (86,$(findstring 86,$(OS_TEST)))
-ifndef GNU_CC
-ASFILES		= lock_$(OS_ARCH).s
-endif
 endif
 endif
 
@@ -334,7 +337,7 @@ ifdef MOZ_SYNC_BUILD_FILES
 # belongs in the other as well.  If the change isn't right for both
 # places, then that's something to bring up with the other developers.
 #
-# Some files are reasonable to diverge; for example,
+# Some files are reasonable to diverge; for  example,
 # js/config/autoconf.mk.in doesn't need most of the stuff in
 # config/autoconf.mk.in.
 check-sync-dirs = $(PYTHON) $(srcdir)/config/check-sync-dirs.py
@@ -345,14 +348,13 @@ endif
 
 ifdef ENABLE_JIT
 check::
-	$(wildcard $(RUN_TEST_PROGRAM)) $(DIST)/bin/js$(BIN_SUFFIX) -j -e \
-		"var gSrcdir='$(call normalizepath,$(srcdir))'; var gSkipSlowTests=true; var gReportSummary=false;" \
-		$(srcdir)/trace-test.js
+	$(wildcard $(RUN_TEST_PROGRAM)) $(PYTHON) -u $(srcdir)/trace-test/trace-test.py \
+	        --no-slow --no-progress --tinderbox $(DIST)/bin/js$(BIN_SUFFIX)
 endif
 
 DIST_GARBAGE = config.cache config.log config.status \
    config/myrules.mk config/myconfig.mk \
-   unallmakefiles js-config js-config.h mozilla-config.h
+   unallmakefiles js-config js-config.h js-confdefs.h
 
 distclean::
 	cat unallmakefiles | $(XARGS) rm -f
@@ -370,10 +372,6 @@ GARBAGE		+= jscpucfg.o jsautocfg.h jsautocfg.tmp jscpucfg
 
 ifneq (,$(CROSS_COMPILE)$(filter-out WINNT,$(OS_ARCH)))
 TARGETS		+= jscpucfg$(HOST_BIN_SUFFIX)
-endif
-
-ifdef JS_SAFE_ARENA
-DEFINES		+= -DJS_USE_SAFE_ARENA
 endif
 
 ifdef JS_THREADSAFE
@@ -437,15 +435,12 @@ endif
 ifeq ($(OS_ARCH),SunOS)
 ifeq ($(TARGET_CPU),sparc)
 
-ifdef JS_ULTRASPARC_OPTS
-DEFINES += -DULTRA_SPARC
 ifdef GNU_CC
-CFLAGS   += -Wa,-xarch=v8plus,-DULTRA_SPARC,-P,-L,-D_ASM,-D__STDC__=0
-CXXFLAGS += -Wa,-xarch=v8plus,-DULTRA_SPARC,-P,-L,-D_ASM,-D__STDC__=0,-K,PIC
+CFLAGS   += -mcpu=v9
+CXXFLAGS += -mcpu=v9
 else
-ASFLAGS  += -xarch=v8plus -DULTRA_SPARC -P -L -D_ASM -D__STDC__=0 -K PIC
+ASFLAGS  += -xarch=v8plus -P -L -D_ASM -D__STDC__=0 -K PIC
 endif # GNU_CC
-endif # JS_ULTRASPARC_OPTS
 
 endif
 ifeq ($(OS_RELEASE),4.1)

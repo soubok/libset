@@ -52,12 +52,16 @@
 #include "jscntxt.h"
 #include "jsdtoa.h"
 #include "jsgc.h"
-#include "jsfun.h"      /* for VALUE_IS_FUNCTION from LOCKED_OBJ_WRITE_SLOT */
 #include "jslock.h"
 #include "jsscope.h"
 #include "jsstr.h"
 
 #define ReadWord(W) (W)
+
+#if !defined(__GNUC__)
+# define __asm__ asm
+# define __volatile__ volatile
+#endif
 
 /* Implement NativeCompareAndSwap. */
 
@@ -86,6 +90,19 @@ NativeCompareAndSwap(jsword *w, jsword ov, jsword nv)
     return (NativeCompareAndSwapHelper(w, ov, nv) & 1);
 }
 
+#elif defined(_MSC_VER) && (defined(_M_AMD64) || defined(_M_X64))
+JS_BEGIN_EXTERN_C
+extern long long __cdecl
+_InterlockedCompareExchange64(long long *volatile dest, long long exchange, long long comp);
+JS_END_EXTERN_C
+#pragma intrinsic(_InterlockedCompareExchange64)
+
+static JS_ALWAYS_INLINE int
+NativeCompareAndSwap(jsword *w, jsword ov, jsword nv)
+{
+    return _InterlockedCompareExchange64(w, nv, ov) == ov;
+}
+
 #elif defined(XP_MACOSX) || defined(DARWIN)
 
 #include <libkern/OSAtomic.h>
@@ -97,7 +114,7 @@ NativeCompareAndSwap(jsword *w, jsword ov, jsword nv)
     return OSAtomicCompareAndSwapPtrBarrier(ov, nv, w);
 }
 
-#elif defined(__GNUC__) && defined(__i386__)
+#elif defined(__i386) && (defined(__GNUC__) || defined(__SUNPRO_CC))
 
 /* Note: This fails on 386 cpus, cmpxchgl is a >= 486 instruction */
 static JS_ALWAYS_INLINE int
@@ -116,7 +133,8 @@ NativeCompareAndSwap(jsword *w, jsword ov, jsword nv)
     return (int)res;
 }
 
-#elif defined(__GNUC__) && defined(__x86_64__)
+#elif defined(__x86_64) && (defined(__GNUC__) || defined(__SUNPRO_CC))
+
 static JS_ALWAYS_INLINE int
 NativeCompareAndSwap(jsword *w, jsword ov, jsword nv)
 {
@@ -133,30 +151,24 @@ NativeCompareAndSwap(jsword *w, jsword ov, jsword nv)
     return (int)res;
 }
 
-#elif defined(SOLARIS) && defined(sparc) && defined(ULTRA_SPARC)
+#elif defined(__sparc) && (defined(__GNUC__) || defined(__SUNPRO_CC))
 
 static JS_ALWAYS_INLINE int
 NativeCompareAndSwap(jsword *w, jsword ov, jsword nv)
 {
-#if defined(__GNUC__)
     unsigned int res;
-    JS_ASSERT(ov != nv);
-    asm volatile ("\
-stbar\n\
-cas [%1],%2,%3\n\
-cmp %2,%3\n\
-be,a 1f\n\
-mov 1,%0\n\
-mov 0,%0\n\
-1:"
+
+    __asm__ __volatile__ (
+                  "stbar\n"
+                  "cas [%1],%2,%3\n"
+                  "cmp %2,%3\n"
+                  "be,a 1f\n"
+                  "mov 1,%0\n"
+                  "mov 0,%0\n"
+                  "1:"
                   : "=r" (res)
                   : "r" (w), "r" (ov), "r" (nv));
     return (int)res;
-#else /* !__GNUC__ */
-    extern int compare_and_swap(jsword*, jsword, jsword);
-    JS_ASSERT(ov != nv);
-    return compare_and_swap(w, ov, nv);
-#endif
 }
 
 #elif defined(AIX)
@@ -210,7 +222,7 @@ js_CompareAndSwap(jsword *w, jsword ov, jsword nv)
 #elif defined(NSPR_LOCK)
 
 # ifdef __GNUC__
-# warning "js_CompareAndSwap is implemented using NSSP lock"
+# warning "js_CompareAndSwap is implemented using NSPR lock"
 # endif
 
 JSBool
@@ -710,18 +722,7 @@ js_GetSlotThreadSafe(JSContext *cx, JSObject *obj, uint32 slot)
     jsword me;
 #endif
 
-    /*
-     * We handle non-native objects via JSObjectOps.getRequiredSlot, treating
-     * all slots starting from 0 as required slots.  A property definition or
-     * some prior arrangement must have allocated slot.
-     *
-     * Note once again (see jspubtd.h, before JSGetRequiredSlotOp's typedef)
-     * the crucial distinction between a |required slot number| that's passed
-     * to the get/setRequiredSlot JSObjectOps, and a |reserved slot index|
-     * passed to the JS_Get/SetReservedSlot APIs.
-     */
-    if (!OBJ_IS_NATIVE(obj))
-        return OBJ_GET_REQUIRED_SLOT(cx, obj, slot);
+    OBJ_CHECK_SLOT(obj, slot);
 
     /*
      * Native object locking is inlined here to optimize the single-threaded
@@ -739,7 +740,7 @@ js_GetSlotThreadSafe(JSContext *cx, JSObject *obj, uint32 slot)
      * an earlier request.
      */
     if (CX_THREAD_IS_RUNNING_GC(cx) ||
-        (scope->sealed() && scope->object == obj) ||
+        scope->sealed() ||
         (title->ownercx && ClaimTitle(title, cx))) {
         return STOBJ_GET_SLOT(obj, slot);
     }
@@ -802,20 +803,13 @@ js_SetSlotThreadSafe(JSContext *cx, JSObject *obj, uint32 slot, jsval v)
     jsword me;
 #endif
 
+    OBJ_CHECK_SLOT(obj, slot);
+
     /* Any string stored in a thread-safe object must be immutable. */
     if (JSVAL_IS_STRING(v) &&
         !js_MakeStringImmutable(cx, JSVAL_TO_STRING(v))) {
         /* FIXME bug 363059: See comments in js_FinishSharingScope. */
         v = JSVAL_NULL;
-    }
-
-    /*
-     * We handle non-native objects via JSObjectOps.setRequiredSlot, as above
-     * for the Get case.
-     */
-    if (!OBJ_IS_NATIVE(obj)) {
-        OBJ_SET_REQUIRED_SLOT(cx, obj, slot, v);
-        return;
     }
 
     /*
@@ -834,9 +828,9 @@ js_SetSlotThreadSafe(JSContext *cx, JSObject *obj, uint32 slot, jsval v)
      * an earlier request.
      */
     if (CX_THREAD_IS_RUNNING_GC(cx) ||
-        (scope->sealed() && scope->object == obj) ||
+        scope->sealed() ||
         (title->ownercx && ClaimTitle(title, cx))) {
-        LOCKED_OBJ_WRITE_SLOT(cx, obj, slot, v);
+        LOCKED_OBJ_SET_SLOT(obj, slot, v);
         return;
     }
 
@@ -846,7 +840,7 @@ js_SetSlotThreadSafe(JSContext *cx, JSObject *obj, uint32 slot, jsval v)
     JS_ASSERT(CURRENT_THREAD_IS_ME(me));
     if (NativeCompareAndSwap(&tl->owner, 0, me)) {
         if (scope == OBJ_SCOPE(obj)) {
-            LOCKED_OBJ_WRITE_SLOT(cx, obj, slot, v);
+            LOCKED_OBJ_SET_SLOT(obj, slot, v);
             if (!NativeCompareAndSwap(&tl->owner, me, 0)) {
                 /* Assert that scope locks never revert to flyweight. */
                 JS_ASSERT(title->ownercx != cx);
@@ -858,15 +852,14 @@ js_SetSlotThreadSafe(JSContext *cx, JSObject *obj, uint32 slot, jsval v)
         }
         if (!NativeCompareAndSwap(&tl->owner, me, 0))
             js_Dequeue(tl);
-    }
-    else if (Thin_RemoveWait(ReadWord(tl->owner)) == me) {
-        LOCKED_OBJ_WRITE_SLOT(cx, obj, slot, v);
+    } else if (Thin_RemoveWait(ReadWord(tl->owner)) == me) {
+        LOCKED_OBJ_SET_SLOT(obj, slot, v);
         return;
     }
 #endif
 
     js_LockObj(cx, obj);
-    LOCKED_OBJ_WRITE_SLOT(cx, obj, slot, v);
+    LOCKED_OBJ_SET_SLOT(obj, slot, v);
 
     /*
      * Same drill as above, in js_GetSlotThreadSafe.
@@ -896,7 +889,7 @@ DestroyFatlock(JSFatLock *fl)
 {
     PR_DestroyLock(fl->slock);
     PR_DestroyCondVar(fl->svar);
-    free(fl);
+    js_free(fl);
 }
 
 static JSFatLock *
@@ -990,7 +983,7 @@ js_SetupLocks(int listc, int globc)
     global_locks_log2 = JS_CeilingLog2(globc);
     global_locks_mask = JS_BITMASK(global_locks_log2);
     global_lock_count = JS_BIT(global_locks_log2);
-    global_locks = (PRLock **) malloc(global_lock_count * sizeof(PRLock*));
+    global_locks = (PRLock **) js_malloc(global_lock_count * sizeof(PRLock*));
     if (!global_locks)
         return JS_FALSE;
     for (i = 0; i < global_lock_count; i++) {
@@ -1001,7 +994,7 @@ js_SetupLocks(int listc, int globc)
             return JS_FALSE;
         }
     }
-    fl_list_table = (JSFatLockTable *) malloc(i * sizeof(JSFatLockTable));
+    fl_list_table = (JSFatLockTable *) js_malloc(i * sizeof(JSFatLockTable));
     if (!fl_list_table) {
         js_CleanupLocks();
         return JS_FALSE;
@@ -1023,7 +1016,7 @@ js_CleanupLocks()
     if (global_locks) {
         for (i = 0; i < global_lock_count; i++)
             PR_DestroyLock(global_locks[i]);
-        free(global_locks);
+        js_free(global_locks);
         global_locks = NULL;
         global_lock_count = 1;
         global_locks_log2 = 0;
@@ -1036,7 +1029,7 @@ js_CleanupLocks()
             DeleteListOfFatlocks(fl_list_table[i].taken);
             fl_list_table[i].taken = NULL;
         }
-        free(fl_list_table);
+        js_free(fl_list_table);
         fl_list_table = NULL;
         fl_list_table_len = 0;
     }
@@ -1398,8 +1391,7 @@ js_LockObj(JSContext *cx, JSObject *obj)
     for (;;) {
         scope = OBJ_SCOPE(obj);
         title = &scope->title;
-        if (scope->sealed() && scope->object == obj &&
-            !cx->lockedSealedTitle) {
+        if (scope->sealed() && !cx->lockedSealedTitle) {
             cx->lockedSealedTitle = title;
             return;
         }

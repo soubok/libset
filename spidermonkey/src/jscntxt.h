@@ -57,8 +57,7 @@
 #include "jsregexp.h"
 #include "jsutil.h"
 #include "jsarray.h"
-
-JS_BEGIN_EXTERN_C
+#include "jstask.h"
 
 /*
  * js_GetSrcNote cache to avoid O(n^2) growth in finding a source note for a
@@ -94,11 +93,17 @@ typedef struct VMSideExit VMSideExit;
 
 #ifdef __cplusplus
 namespace nanojit {
+    class Assembler;
+    class CodeAlloc;
     class Fragment;
-    class Fragmento;
     class LirBuffer;
+#ifdef DEBUG
+    class LabelMap;
+#endif
+    extern "C++" { template<typename K, typename V, typename H> class HashMap; }
 }
 class TraceRecorder;
+class VMAllocator;
 extern "C++" { template<typename T> class Queue; }
 typedef Queue<uint16> SlotList;
 
@@ -109,6 +114,12 @@ typedef Queue<uint16> SlotList;
 
 #define FRAGMENT_TABLE_SIZE 512
 struct VMFragment;
+
+#ifdef __cplusplus
+struct REHashKey;
+struct REHashFn;
+typedef nanojit::HashMap<REHashKey, nanojit::Fragment*, REHashFn> REHashMap;
+#endif
 
 #define MONITOR_N_GLOBAL_STATES 4
 struct GlobalState {
@@ -129,7 +140,6 @@ struct JSTraceMonitor {
      * last-ditch GC and suppress calls to JS_ReportOutOfMemory.
      *
      * !tracecx && !recorder: not on trace
-     * !tracecx && !recorder && prohibitFlush: deep-bailed
      * !tracecx && recorder && !recorder->deepAborted: recording
      * !tracecx && recorder && recorder->deepAborted: deep aborted
      * tracecx && !recorder: executing a trace
@@ -138,7 +148,13 @@ struct JSTraceMonitor {
     JSContext               *tracecx;
 
     CLS(nanojit::LirBuffer) lirbuf;
-    CLS(nanojit::Fragmento) fragmento;
+    CLS(VMAllocator)        allocator;   // A chunk allocator for LIR.
+    CLS(nanojit::CodeAlloc) codeAlloc;   // A general allocator for native code.
+    CLS(nanojit::Assembler) assembler;
+#ifdef DEBUG
+    CLS(nanojit::LabelMap)  labels;
+#endif
+
     CLS(TraceRecorder)      recorder;
     jsval                   *reservedDoublePool;
     jsval                   *reservedDoublePoolPtr;
@@ -157,27 +173,36 @@ struct JSTraceMonitor {
      * If nonzero, do not flush the JIT cache after a deep bail. That would
      * free JITted code pages that we will later return to. Instead, set the
      * needFlush flag so that it can be flushed later.
-     *
-     * NB: needFlush and useReservedObjects are packed together.
      */
-    uintN                   prohibitFlush;
-    JSPackedBool            needFlush;
+    JSBool                  needFlush;
 
     /*
      * reservedObjects is a linked list (via fslots[0]) of preallocated JSObjects.
      * The JIT uses this to ensure that leaving a trace tree can't fail.
      */
-    JSPackedBool            useReservedObjects;
+    JSBool                  useReservedObjects;
     JSObject                *reservedObjects;
 
-    /* Fragmento for the regular expression compiler. This is logically
+    /* Parts for the regular expression compiler. This is logically
      * a distinct compiler but needs to be managed in exactly the same
-     * way as the real tracing Fragmento. */
+     * way as the trace compiler. */
+    CLS(VMAllocator)        reAllocator;
+    CLS(nanojit::CodeAlloc) reCodeAlloc;
+    CLS(nanojit::Assembler) reAssembler;
     CLS(nanojit::LirBuffer) reLirBuf;
-    CLS(nanojit::Fragmento) reFragmento;
+    CLS(REHashMap)          reFragments;
+#ifdef DEBUG
+    CLS(nanojit::LabelMap)  reLabels;
+#endif
 
     /* Keep a list of recorders we need to abort on cache flush. */
     CLS(TraceRecorder)      abortStack;
+
+    /* Flush the JIT cache. */
+    void flush();
+
+    /* Mark all objects baked into native code in the code cache. */
+    void mark(JSTracer *trc);
 };
 
 typedef struct InterpStruct InterpStruct;
@@ -238,6 +263,9 @@ struct JSThreadData {
     /* Property cache for faster call/get/set invocation. */
     JSPropertyCache     propertyCache;
 
+    /* Random number generator state, used by jsmath.cpp. */
+    int64               rngSeed;
+
 #ifdef JS_TRACER
     /* Trace-tree JIT recorder/interpreter state. */
     JSTraceMonitor      traceMonitor;
@@ -255,6 +283,19 @@ struct JSThreadData {
      * locks on each JS_malloc.
      */
     size_t              gcMallocBytes;
+
+#ifdef JS_THREADSAFE
+    /*
+     * Deallocator task for this thread.
+     */
+    JSFreePointerListTask *deallocatorTask;
+#endif
+
+    void mark(JSTracer *trc) {
+#ifdef JS_TRACER
+        traceMonitor.mark(trc);
+#endif
+    }
 };
 
 #ifdef JS_THREADSAFE
@@ -272,6 +313,8 @@ struct JSThread {
 
     /* Indicates that the thread is waiting in ClaimTitle from jslock.cpp. */
     JSTitle             *titleToShare;
+
+    JSGCThing           *gcFreeLists[GC_NUM_FREELISTS];
 
     /* Factored out of JSThread for !JS_THREADSAFE embedding in JSRuntime. */
     JSThreadData        data;
@@ -317,11 +360,6 @@ typedef enum JSRuntimeState {
 typedef enum JSBuiltinFunctionId {
     JSBUILTIN_ObjectToIterator,
     JSBUILTIN_CallIteratorNext,
-    JSBUILTIN_GetProperty,
-    JSBUILTIN_GetElement,
-    JSBUILTIN_SetProperty,
-    JSBUILTIN_SetElement,
-    JSBUILTIN_HasInstance,
     JSBUILTIN_LIMIT
 } JSBuiltinFunctionId;
 
@@ -365,7 +403,6 @@ struct JSRuntime {
     JSGCChunkInfo       *gcChunkList;
     JSGCArenaList       gcArenaList[GC_NUM_FREELISTS];
     JSGCDoubleArenaList gcDoubleArenaList;
-    JSGCFreeListSet     *gcFreeListsPool;
     JSDHashTable        gcRootsHash;
     JSDHashTable        *gcLocksHash;
     jsrefcount          gcKeepAtoms;
@@ -380,6 +417,7 @@ struct JSRuntime {
     uint32              gcTriggerFactor;
     size_t              gcTriggerBytes;
     volatile JSBool     gcIsNeeded;
+    volatile JSBool     gcFlushCodeCaches;
 
     /*
      * NB: do not pack another flag here by claiming gcPadding unless the new
@@ -389,7 +427,19 @@ struct JSRuntime {
      */
     JSPackedBool        gcPoke;
     JSPackedBool        gcRunning;
-    uint16              gcPadding;
+    JSPackedBool        gcRegenShapes;
+
+    /*
+     * During gc, if rt->gcRegenShapes &&
+     *   (scope->flags & JSScope::SHAPE_REGEN) == rt->gcRegenShapesScopeFlag,
+     * then the scope's shape has already been regenerated during this GC.
+     * To avoid having to sweep JSScopes, the bit's meaning toggles with each
+     * shape-regenerating GC.
+     *
+     * FIXME Once scopes are GC'd (bug 505004), this will be obsolete.
+     */
+    uint8              gcRegenShapesScopeFlag;
+
 #ifdef JS_GC_ZEAL
     jsrefcount          gcZeal;
 #endif
@@ -421,14 +471,6 @@ struct JSRuntime {
      * rt->gcLock.
      */
     JSSetSlotRequest    *setSlotRequests;
-
-    /* Random number generator state, used by jsmath.c. */
-    JSBool              rngInitialized;
-    int64               rngMultiplier;
-    int64               rngAddend;
-    int64               rngMask;
-    int64               rngSeed;
-    jsdouble            rngDscale;
 
     /* Well-known numbers held for use by this runtime's contexts. */
     jsdouble            *jsNaN;
@@ -686,6 +728,26 @@ struct JSRuntime {
 
     void setGCTriggerFactor(uint32 factor);
     void setGCLastBytes(size_t lastBytes);
+
+    inline void* malloc(size_t bytes) {
+        return ::js_malloc(bytes);
+    }
+
+    inline void* calloc(size_t bytes) {
+        return ::js_calloc(bytes);
+    }
+
+    inline void* realloc(void* p, size_t bytes) {
+        return ::js_realloc(p, bytes);
+    }
+
+    inline void free(void* p) {
+        ::js_free(p);
+    }
+
+#ifdef JS_THREADSAFE
+    JSBackgroundThread    *deallocatorThread;
+#endif
 };
 
 /* Common macros to access thread-local caches in JSThread or JSRuntime. */
@@ -904,21 +966,9 @@ struct JSContext {
      */
     JSDHashTable        *resolvingTable;
 
-#if JS_HAS_LVALUE_RETURN
-    /*
-     * Secondary return value from native method called on the left-hand side
-     * of an assignment operator.  The native should store the object in which
-     * to set a property in *rval, and return the property's id expressed as a
-     * jsval by calling JS_SetCallReturnValue2(cx, idval).
-     */
-    jsval               rval2;
-    JSPackedBool        rval2set;
-#endif
-
     /*
      * True if generating an error, to prevent runaway recursion.
-     * NB: generatingError packs with rval2set, #if JS_HAS_LVALUE_RETURN;
-     * with insideGCMarkCallback and with throwing below.
+     * NB: generatingError packs with insideGCMarkCallback and throwing below.
      */
     JSPackedBool        generatingError;
 
@@ -1008,10 +1058,6 @@ struct JSContext {
     /* Stack of thread-stack-allocated temporary GC roots. */
     JSTempValueRooter   *tempValueRooters;
 
-#ifdef JS_THREADSAFE
-    JSGCFreeListSet     *gcLocalFreeLists;
-#endif
-
     /* List of pre-allocated doubles. */
     JSGCDoubleCell      *doubleFreeList;
 
@@ -1041,15 +1087,125 @@ struct JSContext {
     jsval               *nativeVp;
 #endif
 
+#ifdef JS_THREADSAFE
+    inline void createDeallocatorTask() {
+        JSThreadData* tls = JS_THREAD_DATA(this);
+        JS_ASSERT(!tls->deallocatorTask);
+        if (runtime->deallocatorThread && !runtime->deallocatorThread->busy())
+            tls->deallocatorTask = new JSFreePointerListTask();
+    }
+
+    inline void submitDeallocatorTask() {
+        JSThreadData* tls = JS_THREAD_DATA(this);
+        if (tls->deallocatorTask) {
+            runtime->deallocatorThread->schedule(tls->deallocatorTask);
+            tls->deallocatorTask = NULL;
+        }
+    }
+#endif
+
     /* Call this after succesful malloc of memory for GC-related things. */
-    inline void
-    updateMallocCounter(size_t nbytes)
-    {
+    inline void updateMallocCounter(size_t nbytes) {
         size_t *pbytes, bytes;
 
         pbytes = &JS_THREAD_DATA(this)->gcMallocBytes;
         bytes = *pbytes;
         *pbytes = (size_t(-1) - bytes <= nbytes) ? size_t(-1) : bytes + nbytes;
+    }
+
+    inline void* malloc(size_t bytes) {
+        JS_ASSERT(bytes != 0);
+        void *p = runtime->malloc(bytes);
+        if (!p) {
+            JS_ReportOutOfMemory(this);
+            return NULL;
+        }
+        updateMallocCounter(bytes);
+        return p;
+    }
+
+    inline void* calloc(size_t bytes) {
+        JS_ASSERT(bytes != 0);
+        void *p = runtime->calloc(bytes);
+        if (!p) {
+            JS_ReportOutOfMemory(this);
+            return NULL;
+        }
+        updateMallocCounter(bytes);
+        return p;
+    }
+
+    inline void* realloc(void* p, size_t bytes) {
+        void *orig = p;
+        p = runtime->realloc(p, bytes);
+        if (!p) {
+            JS_ReportOutOfMemory(this);
+            return NULL;
+        }
+        if (!orig)
+            updateMallocCounter(bytes);
+        return p;
+    }
+
+#ifdef JS_THREADSAFE
+    inline void free(void* p) {
+        if (!p)
+            return;
+        if (thread) {
+            JSFreePointerListTask* task = JS_THREAD_DATA(this)->deallocatorTask;
+            if (task) {
+                task->add(p);
+                return;
+            }
+        }
+        runtime->free(p);
+    }
+#else
+    inline void free(void* p) {
+        if (!p)
+            return;
+        runtime->free(p);
+    }
+#endif
+
+    /*
+     * In the common case that we'd like to allocate the memory for an object
+     * with cx->malloc/free, we cannot use overloaded C++ operators (no
+     * placement delete).  Factor the common workaround into one place.
+     */
+#define CREATE_BODY(parms)                                                    \
+    void *memory = this->malloc(sizeof(T));                                   \
+    if (!memory) {                                                            \
+        JS_ReportOutOfMemory(this);                                           \
+        return NULL;                                                          \
+    }                                                                         \
+    return new(memory) T parms;
+
+    template <class T>
+    JS_ALWAYS_INLINE T *create() {
+        CREATE_BODY(())
+    }
+
+    template <class T, class P1>
+    JS_ALWAYS_INLINE T *create(const P1 &p1) {
+        CREATE_BODY((p1))
+    }
+
+    template <class T, class P1, class P2>
+    JS_ALWAYS_INLINE T *create(const P1 &p1, const P2 &p2) {
+        CREATE_BODY((p1, p2))
+    }
+
+    template <class T, class P1, class P2, class P3>
+    JS_ALWAYS_INLINE T *create(const P1 &p1, const P2 &p2, const P3 &p3) {
+        CREATE_BODY((p1, p2, p3))
+    }
+#undef CREATE_BODY
+
+    template <class T>
+    JS_ALWAYS_INLINE void destroy(T *p) {
+        p->~T();
+        this->free(p);
     }
 };
 
@@ -1195,6 +1351,9 @@ js_FinishThreads(JSRuntime *rt);
 
 extern void
 js_PurgeThreads(JSContext *cx);
+
+extern void
+js_TraceThreads(JSRuntime *rt, JSTracer *trc);
 
 /*
  * Ensures the JSOPTION_XML and JSOPTION_ANONFUNFIX bits of cx->options are
@@ -1477,6 +1636,9 @@ js_GetScriptedCaller(JSContext *cx, JSStackFrame *fp);
 extern jsbytecode*
 js_GetCurrentBytecodePC(JSContext* cx);
 
+extern bool
+js_CurrentPCIsInImacro(JSContext *cx);
+
 #ifdef JS_TRACER
 /*
  * Reconstruct the JS stack and clear cx->tracecx. We must be currently in a
@@ -1539,6 +1701,7 @@ static JS_INLINE uint32
 js_RegenerateShapeForGC(JSContext *cx)
 {
     JS_ASSERT(cx->runtime->gcRunning);
+    JS_ASSERT(cx->runtime->gcRegenShapes);
 
     /*
      * Under the GC, compared with js_GenerateShape, we don't need to use
@@ -1550,7 +1713,5 @@ js_RegenerateShapeForGC(JSContext *cx)
     cx->runtime->shapeGen = shape;
     return shape;
 }
-
-JS_END_EXTERN_C
 
 #endif /* jscntxt_h___ */

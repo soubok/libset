@@ -164,7 +164,7 @@ CopyErrorReport(JSContext *cx, JSErrorReport *report)
      */
     mallocSize = sizeof(JSErrorReport) + argsArraySize + argsCopySize +
                  ucmessageSize + uclinebufSize + linebufSize + filenameSize;
-    cursor = (uint8 *)JS_malloc(cx, mallocSize);
+    cursor = (uint8 *)cx->malloc(mallocSize);
     if (!cursor)
         return NULL;
 
@@ -281,7 +281,7 @@ InitExnPrivate(JSContext *cx, JSObject *exnObject, JSString *message,
         if (fp->fun && fp->argv) {
             v = JSVAL_NULL;
             if (checkAccess &&
-                !checkAccess(cx, fp->callee, callerid, JSACC_READ, &v)) {
+                !checkAccess(cx, fp->callee(), callerid, JSACC_READ, &v)) {
                 break;
             }
             valueCount += fp->argc;
@@ -301,7 +301,7 @@ InitExnPrivate(JSContext *cx, JSObject *exnObject, JSString *message,
         js_ReportAllocationOverflow(cx);
         return JS_FALSE;
     }
-    priv = (JSExnPrivate *)JS_malloc(cx, size);
+    priv = (JSExnPrivate *)cx->malloc(size);
     if (!priv)
         return JS_FALSE;
 
@@ -342,7 +342,7 @@ InitExnPrivate(JSContext *cx, JSObject *exnObject, JSString *message,
     JS_ASSERT(priv->stackElems + stackDepth == elem);
     JS_ASSERT(GetStackTraceValueBuffer(priv) + valueCount == values);
 
-    STOBJ_SET_SLOT(exnObject, JSSLOT_PRIVATE, PRIVATE_TO_JSVAL(priv));
+    exnObject->setPrivate(priv);
 
     if (report) {
         /*
@@ -361,19 +361,10 @@ InitExnPrivate(JSContext *cx, JSObject *exnObject, JSString *message,
     return JS_TRUE;
 }
 
-static JSExnPrivate *
+static inline JSExnPrivate *
 GetExnPrivate(JSContext *cx, JSObject *obj)
 {
-    jsval privateValue;
-    JSExnPrivate *priv;
-
-    JS_ASSERT(OBJ_GET_CLASS(cx, obj) == &js_ErrorClass);
-    privateValue = OBJ_GET_SLOT(cx, obj, JSSLOT_PRIVATE);
-    if (JSVAL_IS_VOID(privateValue))
-        return NULL;
-    priv = (JSExnPrivate *)JSVAL_TO_PRIVATE(privateValue);
-    JS_ASSERT(priv);
-    return priv;
+    return (JSExnPrivate *) obj->getPrivate();
 }
 
 static void
@@ -417,8 +408,8 @@ exn_finalize(JSContext *cx, JSObject *obj)
     priv = GetExnPrivate(cx, obj);
     if (priv) {
         if (priv->errorReport)
-            JS_free(cx, priv->errorReport);
-        JS_free(cx, priv);
+            cx->free(priv->errorReport);
+        cx->free(priv);
     }
 }
 
@@ -445,7 +436,7 @@ exn_enumerate(JSContext *cx, JSObject *obj)
         if (!js_LookupProperty(cx, obj, ATOM_TO_JSID(atom), &pobj, &prop))
             return JS_FALSE;
         if (prop)
-            OBJ_DROP_PROPERTY(cx, pobj, prop);
+            pobj->dropProperty(cx, prop);
     }
     return JS_TRUE;
 }
@@ -586,7 +577,7 @@ StackTraceToString(JSContext *cx, JSExnPrivate *priv)
             if (stackmax >= STACK_LENGTH_LIMIT)                               \
                 goto done;                                                    \
             stackmax = stackmax ? 2 * stackmax : 64;                          \
-            ptr_ = JS_realloc(cx, stackbuf, (stackmax+1) * sizeof(jschar));   \
+            ptr_ = cx->realloc(stackbuf, (stackmax+1) * sizeof(jschar));      \
             if (!ptr_)                                                        \
                 goto bad;                                                     \
             stackbuf = (jschar *) ptr_;                                       \
@@ -608,7 +599,7 @@ StackTraceToString(JSContext *cx, JSExnPrivate *priv)
                 goto done;                                                    \
             }                                                                 \
             stackmax = JS_BIT(JS_CeilingLog2(stacklen + length_));            \
-            ptr_ = JS_realloc(cx, stackbuf, (stackmax+1) * sizeof(jschar));   \
+            ptr_ = cx->realloc(stackbuf, (stackmax+1) * sizeof(jschar));      \
             if (!ptr_)                                                        \
                 goto bad;                                                     \
             stackbuf = (jschar *) ptr_;                                       \
@@ -659,7 +650,7 @@ StackTraceToString(JSContext *cx, JSExnPrivate *priv)
          * don't use JS_realloc here; simply let the oversized allocation
          * be owned by the string in that rare case.
          */
-        void *shrunk = JS_realloc(cx, stackbuf, (stacklen+1) * sizeof(jschar));
+        void *shrunk = cx->realloc(stackbuf, (stacklen+1) * sizeof(jschar));
         if (shrunk)
             stackbuf = (jschar *) shrunk;
     }
@@ -671,7 +662,7 @@ StackTraceToString(JSContext *cx, JSExnPrivate *priv)
 
   bad:
     if (stackbuf)
-        JS_free(cx, stackbuf);
+        cx->free(stackbuf);
     return NULL;
 }
 
@@ -704,11 +695,12 @@ Exception(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
          * js_NewObject to find the class prototype, we must get the class
          * prototype ourselves.
          */
-        if (!OBJ_GET_PROPERTY(cx, JSVAL_TO_OBJECT(argv[-2]),
-                              ATOM_TO_JSID(cx->runtime->atomState
-                                           .classPrototypeAtom),
-                              rval))
+        if (!JSVAL_TO_OBJECT(argv[-2])->getProperty(cx,
+                                                    ATOM_TO_JSID(cx->runtime->atomState
+                                                                 .classPrototypeAtom),
+                                                    rval)) {
             return JS_FALSE;
+        }
         obj = js_NewObject(cx, &js_ErrorClass, JSVAL_TO_OBJECT(*rval), NULL);
         if (!obj)
             return JS_FALSE;
@@ -720,7 +712,7 @@ Exception(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
      * data so that the finalizer doesn't attempt to free it.
      */
     if (OBJ_GET_CLASS(cx, obj) == &js_ErrorClass)
-        STOBJ_SET_SLOT(obj, JSSLOT_PRIVATE, JSVAL_VOID);
+        obj->setPrivate(NULL);
 
     /* Set the 'message' property. */
     if (argc != 0) {
@@ -782,12 +774,8 @@ exn_toString(JSContext *cx, uintN argc, jsval *vp)
     size_t name_length, message_length, length;
 
     obj = JS_THIS_OBJECT(cx, vp);
-    if (!obj ||
-        !OBJ_GET_PROPERTY(cx, obj,
-                          ATOM_TO_JSID(cx->runtime->atomState.nameAtom),
-                          &v)) {
+    if (!obj || !obj->getProperty(cx, ATOM_TO_JSID(cx->runtime->atomState.nameAtom), &v))
         return JS_FALSE;
-    }
     name = JSVAL_IS_STRING(v) ? JSVAL_TO_STRING(v) : cx->runtime->emptyString;
     *vp = STRING_TO_JSVAL(name);
 
@@ -800,7 +788,7 @@ exn_toString(JSContext *cx, uintN argc, jsval *vp)
         name_length = name->length();
         message_length = message->length();
         length = (name_length ? name_length + 2 : 0) + message_length;
-        cp = chars = (jschar *) JS_malloc(cx, (length + 1) * sizeof(jschar));
+        cp = chars = (jschar *) cx->malloc((length + 1) * sizeof(jschar));
         if (!chars)
             return JS_FALSE;
 
@@ -815,7 +803,7 @@ exn_toString(JSContext *cx, uintN argc, jsval *vp)
 
         result = js_NewString(cx, chars, length);
         if (!result) {
-            JS_free(cx, chars);
+            cx->free(chars);
             return JS_FALSE;
         }
     } else {
@@ -843,12 +831,8 @@ exn_toSource(JSContext *cx, uintN argc, jsval *vp)
     jschar *chars, *cp;
 
     obj = JS_THIS_OBJECT(cx, vp);
-    if (!obj ||
-        !OBJ_GET_PROPERTY(cx, obj,
-                          ATOM_TO_JSID(cx->runtime->atomState.nameAtom),
-                          vp)) {
+    if (!obj || !obj->getProperty(cx, ATOM_TO_JSID(cx->runtime->atomState.nameAtom), vp))
         return JS_FALSE;
-    }
     name = js_ValueToString(cx, *vp);
     if (!name)
         return JS_FALSE;
@@ -915,7 +899,7 @@ exn_toSource(JSContext *cx, uintN argc, jsval *vp)
         }
     }
 
-    cp = chars = (jschar *) JS_malloc(cx, (length + 1) * sizeof(jschar));
+    cp = chars = (jschar *) cx->malloc((length + 1) * sizeof(jschar));
     if (!chars) {
         ok = JS_FALSE;
         goto out;
@@ -955,7 +939,7 @@ exn_toSource(JSContext *cx, uintN argc, jsval *vp)
 
     result = js_NewString(cx, chars, length);
     if (!result) {
-        JS_free(cx, chars);
+        cx->free(chars);
         ok = JS_FALSE;
         goto out;
     }
@@ -1046,7 +1030,7 @@ js_InitExceptionClasses(JSContext *cx, JSObject *obj)
         }
 
         /* So exn_finalize knows whether to destroy private data. */
-        STOBJ_SET_SLOT(proto, JSSLOT_PRIVATE, JSVAL_VOID);
+        proto->setPrivate(NULL);
 
         /* Make a constructor function for the current name. */
         protoKey = GetExceptionProtoKey(i);

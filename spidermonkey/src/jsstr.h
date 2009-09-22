@@ -55,6 +55,12 @@
 
 JS_BEGIN_EXTERN_C
 
+/*
+ * Maximum character code for which we will create a pinned unit string on
+ * demand -- see JSRuntime.unitStrings in jscntxt.h.
+ */
+#define UNIT_STRING_LIMIT 256U
+
 #define JSSTRING_BIT(n)             ((size_t)1 << (n))
 #define JSSTRING_BITMASK(n)         (JSSTRING_BIT(n) - 1)
 
@@ -70,6 +76,13 @@ class TraceRecorder;
 
 extern jschar *
 js_GetDependentStringChars(JSString *str);
+
+/*
+ * Make the independent string containing only the character code c, which must
+ * be less than UNIT_STRING_LIMIT, and cache it in the runtime.
+ */
+extern JSString *
+js_MakeUnitString(JSContext *cx, jschar c);
 
 /*
  * The GC-thing "string" type.
@@ -135,7 +148,11 @@ private:
      *
      * ATOMIZED is used only with flat, immutable strings.
      */
-    enum {
+    enum
+#if defined(_MSC_VER) && defined(_WIN64)
+    : size_t /* VC++ 64-bit incorrectly defaults this enum's size to int. */
+#endif
+    {
         DEPENDENT =     JSSTRING_BIT(JS_BITS_PER_WORD - 1),
         PREFIX =        JSSTRING_BIT(JS_BITS_PER_WORD - 2),
         MUTABLE =       PREFIX,
@@ -145,7 +162,12 @@ private:
         LENGTH_BITS =   JS_BITS_PER_WORD - 4,
         LENGTH_MASK =   JSSTRING_BITMASK(LENGTH_BITS),
 
-        DEPENDENT_LENGTH_BITS = LENGTH_BITS / 2,
+        /*
+         * VC++ 64-bit incorrectly produces the compiler error "Conversion to
+         * enumeration type requires an explicit cast" unless we cast to size_t
+         * here.
+         */
+        DEPENDENT_LENGTH_BITS = size_t(LENGTH_BITS) / 2,
         DEPENDENT_LENGTH_MASK = JSSTRING_BITMASK(DEPENDENT_LENGTH_BITS),
         DEPENDENT_START_BITS =  LENGTH_BITS - DEPENDENT_LENGTH_BITS,
         DEPENDENT_START_SHIFT = DEPENDENT_LENGTH_BITS,
@@ -157,7 +179,11 @@ private:
     }
 
 public:
-    enum {
+    enum
+#if defined(_MSC_VER) && defined(_WIN64)
+    : size_t /* VC++ 64-bit incorrectly defaults this enum's size to int. */
+#endif
+    {
         MAX_LENGTH = LENGTH_MASK,
         MAX_DEPENDENT_START = DEPENDENT_START_MASK,
         MAX_DEPENDENT_LENGTH = DEPENDENT_LENGTH_MASK
@@ -351,6 +377,9 @@ public:
         JS_ASSERT(isDependent() && dependentIsPrefix());
         mBase = bstr;
     }
+
+    static JSString *getUnitString(JSContext *cx, jschar c);
+    static JSString *getUnitString(JSContext *cx, JSString *str, size_t index);
 };
 
 extern const jschar *
@@ -370,11 +399,6 @@ js_toLowerCase(JSContext *cx, JSString *str);
 
 extern JSString * JS_FASTCALL
 js_toUpperCase(JSContext *cx, JSString *str);
-
-typedef struct JSCharBuffer {
-    size_t          length;
-    jschar          *chars;
-} JSCharBuffer;
 
 struct JSSubString {
     size_t          length;
@@ -495,9 +519,17 @@ extern const bool js_alnum[];
 
 #define JS_ISDIGIT(c)   (JS_CTYPE(c) == JSCT_DECIMAL_DIGIT_NUMBER)
 
-/* XXXbe unify on A/X/Y tbls, avoid ctype.h? */
-/* XXXbe fs, etc. ? */
-#define JS_ISSPACE(c)   ((JS_CCODE(c) & 0x00070000) == 0x00040000)
+static inline bool
+JS_ISSPACE(jschar c)
+{
+    unsigned w = c;
+
+    if (w < 256)
+        return (w <= ' ' && (w == ' ' || (9 <= w && w <= 0xD))) || w == 0xA0;
+
+    return (JS_CCODE(w) & 0x00070000) == 0x00040000;
+}
+
 #define JS_ISPRINT(c)   ((c) < 128 && isprint(c))
 
 #define JS_ISUPPER(c)   (JS_CTYPE(c) == JSCT_UPPERCASE_LETTER)
@@ -527,26 +559,6 @@ js_InitRuntimeStringState(JSContext *cx);
 extern JSBool
 js_InitDeflatedStringCache(JSRuntime *rt);
 
-/*
- * Maximum character code for which we will create a pinned unit string on
- * demand -- see JSRuntime.unitStrings in jscntxt.h.
- */
-#define UNIT_STRING_LIMIT 256U
-
-/*
- * Get the independent string containing only character code at index in str
- * (backstopped with a zero character as usual for independent strings).
- */
-extern JSString *
-js_GetUnitString(JSContext *cx, JSString *str, size_t index);
-
-/*
- * Get the independent string containing only the character code c, which must
- * be less than UNIT_STRING_LIMIT.
- */
-extern JSString *
-js_GetUnitStringForChar(JSContext *cx, jschar c);
-
 extern void
 js_FinishUnitStrings(JSRuntime *rt);
 
@@ -573,6 +585,14 @@ extern const char js_encodeURIComponent_str[];
 /* GC-allocate a string descriptor for the given malloc-allocated chars. */
 extern JSString *
 js_NewString(JSContext *cx, jschar *chars, size_t length);
+
+/*
+ * GC-allocate a string descriptor and steal the char buffer held by |cb|.
+ * This function takes responsibility for adding the terminating '\0' required
+ * by js_NewString.
+ */
+extern JSString *
+js_NewStringFromCharBuffer(JSContext *cx, JSCharBuffer &cb);
 
 extern JSString *
 js_NewDependentString(JSContext *cx, JSString *base, size_t start,
@@ -608,12 +628,12 @@ extern JS_FRIEND_API(JSString *)
 js_ValueToString(JSContext *cx, jsval v);
 
 /*
- * This function implements E-262-3 section 9.8, toString.  Convert the given
- * value to a string of jschars appended to the given buffer.  On error, the
+ * This function implements E-262-3 section 9.8, toString. Convert the given
+ * value to a string of jschars appended to the given buffer. On error, the
  * passed buffer may have partial results appended.
  */
 extern JS_FRIEND_API(JSBool)
-js_ValueToStringBuffer(JSContext *, jsval, JSTempVector<jschar> &);
+js_ValueToCharBuffer(JSContext *cx, jsval v, JSCharBuffer &cb);
 
 /*
  * Convert a value to its source expression, returning null after reporting
@@ -674,8 +694,14 @@ js_strchr_limit(const jschar *s, jschar c, const jschar *limit);
 /*
  * Return s advanced past any Unicode white space characters.
  */
-extern const jschar *
-js_SkipWhiteSpace(const jschar *s, const jschar *end);
+static inline const jschar *
+js_SkipWhiteSpace(const jschar *s, const jschar *end)
+{
+    JS_ASSERT(s <= end);
+    while (s != end && JS_ISSPACE(*s))
+        s++;
+    return s;
+}
 
 /*
  * Inflate bytes to JS chars and vice versa.  Report out of memory via cx
@@ -740,10 +766,6 @@ js_str_escape(JSContext *cx, JSObject *obj, uintN argc, jsval *argv,
 
 extern JSBool
 js_str_toString(JSContext *cx, uintN argc, jsval *vp);
-
-extern JSBool
-js_StringReplaceHelper(JSContext *cx, uintN argc, JSObject *lambda,
-                       JSString *repstr, jsval *vp);
 
 /*
  * Convert one UCS-4 char and write it into a UTF-8 buffer, which must be at
