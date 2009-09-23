@@ -878,6 +878,11 @@ JSCompiler::compileScript(JSContext *cx, JSObject *scopeChain, JSStackFrame *cal
     onlyXML = true;
 #endif
 
+    CG_SWITCH_TO_PROLOG(&cg);
+    if (js_Emit1(cx, &cg, JSOP_TRACE) < 0)
+        goto out;
+    CG_SWITCH_TO_MAIN(&cg);
+
     for (;;) {
         jsc.tokenStream.flags |= TSF_OPERAND;
         tt = js_PeekToken(cx, &jsc.tokenStream);
@@ -935,7 +940,7 @@ JSCompiler::compileScript(JSContext *cx, JSObject *scopeChain, JSStackFrame *cal
      * local references to skip the globals.
      */
     scriptGlobals = cg.ngvars + cg.regexpList.length;
-    if (scriptGlobals != 0) {
+    if (scriptGlobals != 0 || cg.hasSharps()) {
         jsbytecode *code, *end;
         JSOp op;
         const JSCodeSpec *cs;
@@ -951,16 +956,20 @@ JSCompiler::compileScript(JSContext *cx, JSObject *scopeChain, JSStackFrame *cal
             len = (cs->length > 0)
                   ? (uintN) cs->length
                   : js_GetVariableBytecodeLength(code);
-            if (JOF_TYPE(cs->format) == JOF_LOCAL ||
+            if ((cs->format & JOF_SHARPSLOT) ||
+                JOF_TYPE(cs->format) == JOF_LOCAL ||
                 (JOF_TYPE(cs->format) == JOF_SLOTATOM)) {
                 /*
                  * JSOP_GETARGPROP also has JOF_SLOTATOM type, but it may be
                  * emitted only for a function.
                  */
-                JS_ASSERT((JOF_TYPE(cs->format) == JOF_SLOTATOM) ==
-                          (op == JSOP_GETLOCALPROP));
+                JS_ASSERT_IF(!(cs->format & JOF_SHARPSLOT),
+                             (JOF_TYPE(cs->format) == JOF_SLOTATOM) ==
+                             (op == JSOP_GETLOCALPROP));
                 slot = GET_SLOTNO(code);
                 slot += scriptGlobals;
+                if (!(cs->format & JOF_SHARPSLOT))
+                    slot += cg.sharpSlots();
                 if (slot >= SLOTNO_LIMIT)
                     goto too_many_slots;
                 SET_SLOTNO(code, slot);
@@ -1307,6 +1316,7 @@ LinkUseToDef(JSParseNode *pn, JSDefinition *dn, JSTreeContext *tc)
     JS_ASSERT(pn != dn->dn_uses);
     pn->pn_link = dn->dn_uses;
     dn->dn_uses = pn;
+    dn->pn_dflags |= pn->pn_dflags & PND_USE2DEF_FLAGS;
     pn->pn_used = true;
     pn->pn_lexdef = dn;
 }
@@ -3041,18 +3051,11 @@ BindLet(JSContext *cx, BindData *data, JSAtom *atom, JSTreeContext *tc)
     pn->pn_dflags |= PND_LET | PND_BOUND;
 
     /*
-     * Use JSPROP_ENUMERATE to aid the disassembler. Define the let binding's
-     * property before storing pn in a reserved slot, since block_reserveSlots
-     * depends on OBJ_SCOPE(blockObj)->entryCount.
+     * Define the let binding's property before storing pn in a reserved slot,
+     * since block_reserveSlots depends on OBJ_SCOPE(blockObj)->entryCount.
      */
-    if (!js_DefineNativeProperty(cx, blockObj, ATOM_TO_JSID(atom), JSVAL_VOID,
-                                 NULL, NULL,
-                                 JSPROP_ENUMERATE |
-                                 JSPROP_PERMANENT |
-                                 JSPROP_SHARED,
-                                 SPROP_HAS_SHORTID, (int16) n, NULL)) {
+    if (!js_DefineBlockVariable(cx, blockObj, ATOM_TO_JSID(atom), n))
         return JS_FALSE;
-    }
 
     /*
      * Store pn temporarily in what would be reserved slots in a cloned block
@@ -4307,7 +4310,6 @@ RebindLets(JSParseNode *pn, JSTreeContext *tc)
                     JSDefinition *dn = ALE_DEFN(ale);
                     dn->pn_type = TOK_NAME;
                     dn->pn_op = JSOP_NOP;
-                    dn->pn_dflags |= pn->pn_dflags & PND_USE2DEF_FLAGS;
                 }
                 LinkUseToDef(pn, ALE_DEFN(ale), tc);
             }
@@ -6642,6 +6644,18 @@ GeneratorExpr(JSParseNode *pn, JSParseNode *kid, JSTreeContext *tc)
             return NULL;
 
         /*
+         * We have to dance around a bit to propagate sharp variables from tc
+         * to gentc before setting TCF_HAS_SHARPS implicitly by propagating all
+         * of tc's TCF_FUN_FLAGS flags. As below, we have to be conservative by
+         * leaving TCF_HAS_SHARPS set in tc if we do propagate to gentc.
+         */
+        if (tc->flags & TCF_HAS_SHARPS) {
+            gentc.flags |= TCF_IN_FUNCTION;
+            if (!gentc.ensureSharpSlots())
+                return NULL;
+        }
+
+        /*
          * We assume conservatively that any deoptimization flag in tc->flags
          * besides TCF_FUN_PARAM_ARGUMENTS can come from the kid. So we
          * propagate these flags into genfn. For code simplicity we also do
@@ -8003,7 +8017,8 @@ PrimaryExpr(JSContext *cx, JSTokenStream *ts, JSTreeContext *tc,
         pn->pn_kid = PrimaryExpr(cx, ts, tc, tt, JS_FALSE);
         if (!pn->pn_kid)
             return NULL;
-        tc->flags |= TCF_HAS_SHARPS;
+        if (!tc->ensureSharpSlots())
+            return NULL;
         break;
 
       case TOK_USESHARP:
@@ -8011,8 +8026,9 @@ PrimaryExpr(JSContext *cx, JSTokenStream *ts, JSTreeContext *tc,
         pn = NewParseNode(PN_NULLARY, tc);
         if (!pn)
             return NULL;
+        if (!tc->ensureSharpSlots())
+            return NULL;
         pn->pn_num = (jsint) CURRENT_TOKEN(ts).t_dval;
-        tc->flags |= TCF_HAS_SHARPS;
         break;
 #endif /* JS_HAS_SHARP_VARS */
 

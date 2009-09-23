@@ -1,5 +1,5 @@
 /* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
- * vim: set ts=8 sw=4 et tw=0 ft=C:
+ * vim: set ts=8 sw=4 et tw=79 ft=cpp:
  *
  * ***** BEGIN LICENSE BLOCK *****
  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -14,17 +14,19 @@
  * for the specific language governing rights and limitations under the
  * License.
  *
- * The Original Code is Mozilla SpiderMonkey JavaScript 1.9 code, released
- * June 22, 2008.
+ * The Original Code is SpiderMonkey JavaScript engine.
  *
  * The Initial Developer of the Original Code is
- *   Brian Crowder <crowder@fiverocks.com>
+ * Mozilla Corporation.
+ * Portions created by the Initial Developer are Copyright (C) 2009
+ * the Initial Developer. All Rights Reserved.
  *
  * Contributor(s):
+ *   Jason Orendorff <jorendorff@mozilla.com>
  *
  * Alternatively, the contents of this file may be used under the terms of
- * either of the GNU General Public License Version 2 or later (the "GPL"),
- * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+ * either the GNU General Public License Version 2 or later (the "GPL"), or
+ * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
  * in which case the provisions of the GPL or the LGPL are applicable instead
  * of those above. If you wish to allow use of your version of this file only
  * under the terms of either the GPL or the LGPL, and not to allow others to
@@ -36,28 +38,32 @@
  *
  * ***** END LICENSE BLOCK ***** */
 
-/* NB: Keep this list synced with jitstatHandler in trace-test.js. */
-JITSTAT(recorderStarted)
-JITSTAT(recorderAborted)
-JITSTAT(traceCompleted)
-JITSTAT(sideExitIntoInterpreter)
-JITSTAT(timeoutIntoInterpreter)
-JITSTAT(typeMapMismatchAtEntry)
-JITSTAT(returnToDifferentLoopHeader)
-JITSTAT(traceTriggered)
-JITSTAT(globalShapeMismatchAtEntry)
-JITSTAT(treesTrashed)
-JITSTAT(slotPromoted)
-JITSTAT(unstableLoopVariable)
-JITSTAT(breakLoopExits)
-JITSTAT(returnLoopExits)
-JITSTAT(mergedLoopExits)
-JITSTAT(noCompatInnerTrees)
-JITSTAT(blacklisted)
-JITSTAT(cacheFlushed)
-JITSTAT(archIsIA32)
-JITSTAT(archIsAMD64)
-JITSTAT(archIs64BIT)
-JITSTAT(archIsARM)
-JITSTAT(archIsSPARC)
-JITSTAT(archIsPPC)
+#ifndef jsscriptinlines_h___
+#define jsscriptinlines_h___
+
+#include "jsfun.h"
+#include "jsregexp.h"
+#include "jsscript.h"
+
+inline JSFunction *
+JSScript::getFunction(size_t index)
+{
+    JSObject *funobj = getObject(index);
+    JS_ASSERT(HAS_FUNCTION_CLASS(funobj));
+    JS_ASSERT(funobj == (JSObject *) funobj->getPrivate());
+    JSFunction *fun = (JSFunction *) funobj;
+    JS_ASSERT(FUN_INTERPRETED(fun));
+    return fun;
+}
+
+inline JSObject *
+JSScript::getRegExp(size_t index)
+{
+    JSObjectArray *arr = regexps();
+    JS_ASSERT((uint32) index < arr->length);
+    JSObject *obj = arr->vector[index];
+    JS_ASSERT(STOBJ_GET_CLASS(obj) == &js_RegExpClass);
+    return obj;
+}
+
+#endif /* jsscriptinlines_h___ */

@@ -86,14 +86,29 @@ struct JSObjectOps {
 };
 
 struct JSObjectMap {
-    JSObjectOps *ops;           /* high level object operation vtable */
+    const JSObjectOps * const   ops;    /* high level object operation vtable */
+    uint32                      shape;  /* shape identifier */
+
+    explicit JSObjectMap(const JSObjectOps *ops, uint32 shape) : ops(ops), shape(shape) {}
+
+    enum { SHAPELESS = 0xffffffff };
 };
 
 const uint32 JS_INITIAL_NSLOTS = 5;
 
 const uint32 JSSLOT_PROTO   = 0;
 const uint32 JSSLOT_PARENT  = 1;
+
+/*
+ * The first available slot to store generic value. For JSCLASS_HAS_PRIVATE
+ * classes the slot stores a pointer to private data reinterpreted as jsval.
+ * Such pointer is stored as is without an overhead of PRIVATE_TO_JSVAL
+ * tagging and should be accessed using the (get|set)Private methods of
+ * JSObject.
+ */
 const uint32 JSSLOT_PRIVATE = 2;
+
+const uint32 JSSLOT_PRIMITIVE_THIS = JSSLOT_PRIVATE;
 
 const uintptr_t JSSLOT_CLASS_MASK_BITS = 3;
 
@@ -196,33 +211,44 @@ struct JSObject {
             JS_CALL_OBJECT_TRACER(trc, parent, "__parent__");
     }
 
-    /*
-     * Get private value previously assigned with setPrivate.
-     */
-    void *getAssignedPrivate() const {
-        JS_ASSERT(getClass()->flags & JSCLASS_HAS_PRIVATE);
-
-        jsval v = fslots[JSSLOT_PRIVATE];
-        JS_ASSERT(JSVAL_IS_INT(v));
-        return JSVAL_TO_PRIVATE(v);
-    }
-
-    /*
-     * Get private value or null if the value has not yet been assigned.
-     */
     void *getPrivate() const {
         JS_ASSERT(getClass()->flags & JSCLASS_HAS_PRIVATE);
-
         jsval v = fslots[JSSLOT_PRIVATE];
-        if (JSVAL_IS_INT(v))
-            return JSVAL_TO_PRIVATE(v);
-        JS_ASSERT(JSVAL_IS_VOID(v));
-        return NULL;
+        JS_ASSERT((v & jsval(1)) == jsval(0));
+        return reinterpret_cast<void *>(v);
     }
 
     void setPrivate(void *data) {
         JS_ASSERT(getClass()->flags & JSCLASS_HAS_PRIVATE);
-        fslots[JSSLOT_PRIVATE] = PRIVATE_TO_JSVAL(data);
+        jsval v = reinterpret_cast<jsval>(data);
+        JS_ASSERT((v & jsval(1)) == jsval(0));
+        fslots[JSSLOT_PRIVATE] = v;
+    }
+
+    static jsval defaultPrivate(JSClass *clasp) {
+        return (clasp->flags & JSCLASS_HAS_PRIVATE)
+               ? JSVAL_NULL
+               : JSVAL_VOID;
+    }
+
+    /* The map field is not initialized here and should be set separately. */
+    void init(JSClass *clasp, JSObject *proto, JSObject *parent,
+              jsval privateSlotValue) {
+        JS_ASSERT(((jsuword) clasp & 3) == 0);
+        JS_STATIC_ASSERT(JSSLOT_PRIVATE + 3 == JS_INITIAL_NSLOTS);
+        JS_ASSERT_IF(clasp->flags & JSCLASS_HAS_PRIVATE,
+                     (privateSlotValue & jsval(1)) == jsval(0));
+
+        classword = jsuword(clasp);
+        JS_ASSERT(!isDelegate());
+        JS_ASSERT(!isSystem());
+
+        setProto(proto);
+        setParent(parent);
+        fslots[JSSLOT_PRIVATE] = privateSlotValue;
+        fslots[JSSLOT_PRIVATE + 1] = JSVAL_VOID;
+        fslots[JSSLOT_PRIVATE + 2] = JSVAL_VOID;
+        dslots = NULL;
     }
 
     JSBool lookupProperty(JSContext *cx, jsid id,
@@ -302,7 +328,7 @@ struct JSObject {
 
 #define JSSLOT_START(clasp) (((clasp)->flags & JSCLASS_HAS_PRIVATE)           \
                              ? JSSLOT_PRIVATE + 1                             \
-                             : JSSLOT_PARENT + 1)
+                             : JSSLOT_PRIVATE)
 
 #define JSSLOT_FREE(clasp)  (JSSLOT_START(clasp)                              \
                              + JSCLASS_RESERVED_SLOTS(clasp))
@@ -462,8 +488,11 @@ extern JSClass  js_BlockClass;
 static inline bool
 OBJ_IS_CLONED_BLOCK(JSObject *obj)
 {
-    return obj->fslots[JSSLOT_PROTO] != JSVAL_NULL;
+    return obj->getProto() != NULL;
 }
+
+extern JSBool
+js_DefineBlockVariable(JSContext *cx, JSObject *obj, jsid id, int16 index);
 
 #define OBJ_BLOCK_COUNT(cx,obj)                                               \
     (OBJ_SCOPE(obj)->entryCount)
@@ -536,7 +565,7 @@ js_HasOwnPropertyHelper(JSContext *cx, JSLookupPropOp lookup, uintN argc,
 
 extern JSBool
 js_HasOwnProperty(JSContext *cx, JSLookupPropOp lookup, JSObject *obj, jsid id,
-                  jsval *vp);
+                  JSBool *foundp);
 
 extern JSBool
 js_PropertyIsEnumerable(JSContext *cx, JSObject *obj, jsid id, jsval *vp);
@@ -581,9 +610,8 @@ js_NewObjectWithGivenProto(JSContext *cx, JSClass *clasp, JSObject *proto,
                            JSObject *parent, size_t objectSize = 0);
 
 /*
- * Allocate a new native object and initialize all fslots with JSVAL_VOID
- * starting with the specified slot. The parent slot is set to the value of
- * proto's parent slot.
+ * Allocate a new native object with the given value of the proto and private
+ * slots. The parent slot is set to the value of proto's parent slot.
  *
  * Note that this is the correct global object for native class instances, but
  * not for user-defined functions called as constructors.  Functions used as
@@ -591,7 +619,8 @@ js_NewObjectWithGivenProto(JSContext *cx, JSClass *clasp, JSObject *proto,
  * object, not by the parent of its .prototype object value.
  */
 extern JSObject*
-js_NewNativeObject(JSContext *cx, JSClass *clasp, JSObject *proto, uint32 slot);
+js_NewNativeObject(JSContext *cx, JSClass *clasp, JSObject *proto,
+                   jsval privateSlotValue);
 
 /*
  * Fast access to immutable standard objects (constructors and prototypes).
@@ -843,7 +872,10 @@ js_Enumerate(JSContext *cx, JSObject *obj, JSIterateOp enum_op,
              jsval *statep, jsid *idp);
 
 extern void
-js_TraceNativeEnumerators(JSTracer *trc);
+js_MarkEnumeratorState(JSTracer *trc, JSObject *obj, jsval state);
+
+extern void
+js_PurgeCachedNativeEnumerators(JSContext *cx, JSThreadData *data);
 
 extern JSBool
 js_CheckAccess(JSContext *cx, JSObject *obj, jsid id, JSAccessMode mode,
@@ -955,8 +987,8 @@ js_GetterOnlyPropertyStub(JSContext *cx, JSObject *obj, jsval id, jsval *vp);
  * for this reason among others Blocks must never be exposed to scripts).
  */
 static inline bool
-js_ObjectIsSimilarToProto(JSContext *cx, JSObject *obj, JSObjectOps *ops, JSClass *clasp,
-                          JSObject *proto)
+js_ObjectIsSimilarToProto(JSContext *cx, JSObject *obj, const JSObjectOps *ops,
+                          JSClass *clasp, JSObject *proto)
 {
     JS_ASSERT(proto == OBJ_GET_PROTO(cx, obj));
     return (proto->map->ops == ops && OBJ_GET_CLASS(cx, proto) == clasp);

@@ -55,34 +55,18 @@
 
 JS_BEGIN_EXTERN_C
 
-/*
- * Maximum character code for which we will create a pinned unit string on
- * demand -- see JSRuntime.unitStrings in jscntxt.h.
- */
-#define UNIT_STRING_LIMIT 256U
-
 #define JSSTRING_BIT(n)             ((size_t)1 << (n))
 #define JSSTRING_BITMASK(n)         (JSSTRING_BIT(n) - 1)
 
-#define UNIT_STRING_SPACE(sp)    ((jschar *) ((sp) + UNIT_STRING_LIMIT))
-#define UNIT_STRING_SPACE_RT(rt) UNIT_STRING_SPACE((rt)->unitStrings)
-
-#define IN_UNIT_STRING_SPACE(sp,cp)                                           \
-    ((size_t)((cp) - UNIT_STRING_SPACE(sp)) < 2 * UNIT_STRING_LIMIT)
-#define IN_UNIT_STRING_SPACE_RT(rt,cp)                                        \
-    IN_UNIT_STRING_SPACE((rt)->unitStrings, cp)
-
 class TraceRecorder;
+
+enum {
+    UNIT_STRING_LIMIT        = 256U,
+    INT_STRING_LIMIT         = 256U
+};
 
 extern jschar *
 js_GetDependentStringChars(JSString *str);
-
-/*
- * Make the independent string containing only the character code c, which must
- * be less than UNIT_STRING_LIMIT, and cache it in the runtime.
- */
-extern JSString *
-js_MakeUnitString(JSContext *cx, jschar c);
 
 /*
  * The GC-thing "string" type.
@@ -132,7 +116,6 @@ struct JSString {
     friend JSString * JS_FASTCALL
     js_ConcatStrings(JSContext *cx, JSString *left, JSString *right);
 
-private:
     size_t          mLength;
     union {
         jschar      *mChars;
@@ -159,7 +142,11 @@ private:
         ATOMIZED =      JSSTRING_BIT(JS_BITS_PER_WORD - 3),
         DEFLATED =      JSSTRING_BIT(JS_BITS_PER_WORD - 4),
 
+#if JS_BITS_PER_WORD > 32
+        LENGTH_BITS =   28,
+#else
         LENGTH_BITS =   JS_BITS_PER_WORD - 4,
+#endif
         LENGTH_MASK =   JSSTRING_BITMASK(LENGTH_BITS),
 
         /*
@@ -178,7 +165,7 @@ private:
         return (mLength & flag) != 0;
     }
 
-public:
+  public:
     enum
 #if defined(_MSC_VER) && defined(_WIN64)
     : size_t /* VC++ 64-bit incorrectly defaults this enum's size to int. */
@@ -378,8 +365,39 @@ public:
         mBase = bstr;
     }
 
-    static JSString *getUnitString(JSContext *cx, jschar c);
+    static inline bool isUnitString(void *ptr) {
+        jsuword delta = reinterpret_cast<jsuword>(ptr) -
+                        reinterpret_cast<jsuword>(unitStringTable);
+        if (delta >= UNIT_STRING_LIMIT * sizeof(JSString))
+            return false;
+
+        /* If ptr points inside the static array, it must be well-aligned. */
+        JS_ASSERT(delta % sizeof(JSString) == 0);
+        return true;
+    }
+
+    static inline bool isIntString(void *ptr) {
+        jsuword delta = reinterpret_cast<jsuword>(ptr) -
+                        reinterpret_cast<jsuword>(intStringTable);
+        if (delta >= INT_STRING_LIMIT * sizeof(JSString))
+            return false;
+
+        /* If ptr points inside the static array, it must be well-aligned. */
+        JS_ASSERT(delta % sizeof(JSString) == 0);
+        return true;
+    }
+
+    static inline bool isStatic(void *ptr) {
+        return isUnitString(ptr) || isIntString(ptr);
+    }
+
+    static JSString unitStringTable[];
+    static JSString intStringTable[];
+    static const char *deflatedIntStringTable[];
+
+    static JSString *unitString(jschar c);
     static JSString *getUnitString(JSContext *cx, JSString *str, size_t index);
+    static JSString *intString(jsint i);
 };
 
 extern const jschar *
@@ -558,9 +576,6 @@ js_InitRuntimeStringState(JSContext *cx);
 
 extern JSBool
 js_InitDeflatedStringCache(JSRuntime *rt);
-
-extern void
-js_FinishUnitStrings(JSRuntime *rt);
 
 extern void
 js_FinishRuntimeStringState(JSContext *cx);

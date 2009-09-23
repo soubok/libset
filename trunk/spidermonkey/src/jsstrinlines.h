@@ -42,18 +42,11 @@
 
 #include "jsstr.h"
 
-JS_BEGIN_EXTERN_C
-
 inline JSString *
-JSString::getUnitString(JSContext *cx, jschar c)
+JSString::unitString(jschar c)
 {
     JS_ASSERT(c < UNIT_STRING_LIMIT);
-    JSRuntime *rt = cx->runtime;
-    JSString **unitStrings = rt->unitStrings;
-    JSString *ustr;
-    if (unitStrings && (ustr = unitStrings[c]) != NULL)
-        return ustr;
-    return js_MakeUnitString(cx, c);
+    return &unitStringTable[c];
 }
 
 inline JSString *
@@ -61,11 +54,22 @@ JSString::getUnitString(JSContext *cx, JSString *str, size_t index)
 {
     JS_ASSERT(index < str->length());
     jschar c = str->chars()[index];
-    if (c >= UNIT_STRING_LIMIT)
-        return js_NewDependentString(cx, str, index, 1);
-    return getUnitString(cx, c);
+    if (c < UNIT_STRING_LIMIT)
+        return unitString(c);
+    return js_NewDependentString(cx, str, index, 1);
 }
 
-JS_END_EXTERN_C
+inline JSString *
+JSString::intString(jsint i)
+{
+    jsuint u = jsuint(i);
+
+    JS_ASSERT(u < INT_STRING_LIMIT);
+    if (u < 10) {
+        /* To avoid two ATOMIZED JSString copies of 0-9. */
+        return &JSString::unitStringTable['0' + u];
+    }
+    return &JSString::intStringTable[u];
+}
 
 #endif /* jsstr_inlines_h___ */

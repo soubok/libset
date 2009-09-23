@@ -843,7 +843,7 @@ date_parseISOString(JSString *str, jsdouble *result)
  done:
     if (year > 275943 // ceil(1e8/365) + 1970
         || (month == 0 || month > 12)
-        || (day == 0 || day > DaysInMonth(year,month))
+        || (day == 0 || day > size_t(DaysInMonth(year,month)))
         || hour > 24 
         || ((hour == 24) && (min > 0 || sec > 0))
         || min > 59 
@@ -2292,7 +2292,7 @@ JS_DEFINE_TRCINFO_1(date_now,
 static JSFunctionSpec date_static_methods[] = {
     JS_FN("UTC",                 date_UTC,                MAXARGS,0),
     JS_FN("parse",               date_parse,              1,0),
-    JS_TN("now",                 date_now,                0,0, date_now_trcinfo),
+    JS_TN("now",                 date_now,                0,0, &date_now_trcinfo),
     JS_FS_END
 };
 
@@ -2349,7 +2349,7 @@ static JSFunctionSpec date_methods[] = {
     JS_FN(js_toSource_str,       date_toSource,           0,0),
 #endif
     JS_FN(js_toString_str,       date_toString,           0,0),
-    JS_TN(js_valueOf_str,        date_valueOf,            0,0, date_valueOf_trcinfo),
+    JS_TN(js_valueOf_str,        date_valueOf,            0,0, &date_valueOf_trcinfo),
     JS_FS_END
 };
 

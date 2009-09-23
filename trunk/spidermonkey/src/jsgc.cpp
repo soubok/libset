@@ -153,7 +153,6 @@ extern "C" {
 JS_STATIC_ASSERT(sizeof(JSTempValueUnion) == sizeof(jsval));
 JS_STATIC_ASSERT(sizeof(JSTempValueUnion) == sizeof(void *));
 
-
 /*
  * Check that JSTRACE_XML follows JSTRACE_OBJECT, JSTRACE_DOUBLE and
  * JSTRACE_STRING.
@@ -442,8 +441,9 @@ JS_STATIC_ASSERT(1 <= js_gcArenasPerChunk &&
     ((GC_ARENA_SIZE - (uint32) sizeof(JSGCArenaInfo)) / ((thingSize) + 1U))
 
 #define THING_TO_ARENA(thing)                                                 \
-    ((JSGCArenaInfo *)(((jsuword) (thing) | GC_ARENA_MASK) +                  \
-                       1 - sizeof(JSGCArenaInfo)))
+    (JS_ASSERT(!JSString::isStatic(thing)),                                   \
+     (JSGCArenaInfo *)(((jsuword) (thing) | GC_ARENA_MASK)                    \
+                       + 1 - sizeof(JSGCArenaInfo)))
 
 #define THING_TO_INDEX(thing, thingSize)                                      \
     ((uint32) ((jsuword) (thing) & GC_ARENA_MASK) / (uint32) (thingSize))
@@ -1146,6 +1146,8 @@ GetGCThingFlagsOrNull(void *thing)
     JSGCArenaInfo *a;
     uint32 index;
 
+    if (JSString::isStatic(thing))
+        return NULL;
     a = THING_TO_ARENA(thing);
     if (!a->list)
         return NULL;
@@ -1156,9 +1158,9 @@ GetGCThingFlagsOrNull(void *thing)
 intN
 js_GetExternalStringGCType(JSString *str)
 {
-    uintN type;
+    JS_ASSERT(!JSString::isStatic(str));
 
-    type = (uintN) *GetGCThingFlags(str) & GCF_TYPEMASK;
+    uintN type = (uintN) *GetGCThingFlags(str) & GCF_TYPEMASK;
     JS_ASSERT(type == GCX_STRING || type >= GCX_EXTERNAL_STRING);
     return (type == GCX_STRING) ? -1 : (intN) (type - GCX_EXTERNAL_STRING);
 }
@@ -1179,6 +1181,9 @@ js_GetGCThingTraceKind(void *thing)
 {
     JSGCArenaInfo *a;
     uint32 index;
+
+    if (JSString::isStatic(thing))
+        return JSTRACE_STRING;
 
     a = THING_TO_ARENA(thing);
     if (!a->list)
@@ -2251,45 +2256,6 @@ js_ReserveObjects(JSContext *cx, size_t nobjects)
 }
 #endif
 
-JSBool
-js_AddAsGCBytes(JSContext *cx, size_t sz)
-{
-    JSRuntime *rt;
-
-    rt = cx->runtime;
-    if (rt->gcBytes >= rt->gcMaxBytes ||
-        sz > (size_t) (rt->gcMaxBytes - rt->gcBytes) ||
-        IsGCThresholdReached(rt)) {
-        if (JS_ON_TRACE(cx)) {
-            /*
-             * If we can't leave the trace, signal OOM condition, otherwise
-             * exit from trace and proceed with GC.
-             */
-            if (!js_CanLeaveTrace(cx)) {
-                JS_UNLOCK_GC(rt);
-                return JS_FALSE;
-            }
-            js_LeaveTrace(cx);
-        }
-        js_GC(cx, GC_LAST_DITCH);
-        if (rt->gcBytes >= rt->gcMaxBytes ||
-            sz > (size_t) (rt->gcMaxBytes - rt->gcBytes)) {
-            JS_UNLOCK_GC(rt);
-            JS_ReportOutOfMemory(cx);
-            return JS_FALSE;
-        }
-    }
-    rt->gcBytes += (uint32) sz;
-    return JS_TRUE;
-}
-
-void
-js_RemoveAsGCBytes(JSRuntime *rt, size_t sz)
-{
-    JS_ASSERT((size_t) rt->gcBytes >= sz);
-    rt->gcBytes -= (uint32) sz;
-}
-
 /*
  * Shallow GC-things can be locked just by setting the GCF_LOCK bit, because
  * they have no descendants to mark during the GC. Currently the optimization
@@ -2638,6 +2604,8 @@ JS_CallTracer(JSTracer *trc, void *thing, uint32 kind)
 
       case JSTRACE_STRING:
         for (;;) {
+            if (JSString::isStatic(thing))
+                goto out;
             flagp = THING_TO_FLAGP(thing, sizeof(JSGCThing));
             JS_ASSERT((*flagp & GCF_FINAL) == 0);
             JS_ASSERT(kind == MapGCFlagsToTraceKind(*flagp));
@@ -2739,8 +2707,10 @@ gc_root_traversal(JSDHashTable *table, JSDHashEntryHdr *hdr, uint32 num,
     jsval *rp = (jsval *)rhe->root;
     jsval v = *rp;
 
-    /* Ignore null object and scalar values. */
-    if (!JSVAL_IS_NULL(v) && JSVAL_IS_GCTHING(v)) {
+    /* Ignore null reference, scalar values, and static strings. */
+    if (!JSVAL_IS_NULL(v) &&
+        JSVAL_IS_GCTHING(v) &&
+        !JSString::isStatic(JSVAL_TO_GCTHING(v))) {
 #ifdef DEBUG
         JSBool root_points_to_gcArenaList = JS_FALSE;
         jsuword thing = (jsuword) JSVAL_TO_GCTHING(v);
@@ -2838,7 +2808,7 @@ js_TraceStackFrame(JSTracer *trc, JSStackFrame *fp)
              * Don't mark what has not been pushed yet, or what has been
              * popped already.
              */
-            if (fp->regs) {
+            if (fp->regs && fp->regs->sp) {
                 nslots = (uintN) (fp->regs->sp - fp->slots);
                 JS_ASSERT(nslots >= fp->script->nfixed);
             } else {
@@ -2852,9 +2822,7 @@ js_TraceStackFrame(JSTracer *trc, JSStackFrame *fp)
     }
 
     /* Allow for primitive this parameter due to JSFUN_THISP_* flags. */
-    JS_ASSERT(JSVAL_IS_OBJECT((jsval)fp->thisp) ||
-              (fp->fun && JSFUN_THISP_FLAGS(fp->fun->flags)));
-    JS_CALL_VALUE_TRACER(trc, (jsval)fp->thisp, "this");
+    JS_CALL_VALUE_TRACER(trc, fp->thisv, "this");
 
     if (fp->argv) {
         JS_CALL_VALUE_TRACER(trc, fp->argv[-2], "callee");
@@ -2877,8 +2845,6 @@ js_TraceStackFrame(JSTracer *trc, JSStackFrame *fp)
     JS_CALL_VALUE_TRACER(trc, fp->rval, "rval");
     if (fp->scopeChain)
         JS_CALL_OBJECT_TRACER(trc, fp->scopeChain, "scope chain");
-    if (fp->sharpArray)
-        JS_CALL_OBJECT_TRACER(trc, fp->sharpArray, "sharp array");
 }
 
 static void
@@ -3030,6 +2996,9 @@ js_TraceContext(JSTracer *trc, JSContext *acx)
           case JSTVU_SCRIPT:
             js_TraceScript(trc, tvr->u.script);
             break;
+          case JSTVU_ENUMERATOR:
+            static_cast<JSAutoEnumStateRooter *>(tvr)->mark(trc);
+            break;
           default:
             JS_ASSERT(tvr->count >= 0);
             TRACE_JSVALS(trc, tvr->count, tvr->u.array, "tvr->u.array");
@@ -3042,8 +3011,12 @@ js_TraceContext(JSTracer *trc, JSContext *acx)
     js_TraceRegExpStatics(trc, acx);
 
 #ifdef JS_TRACER
-    if (acx->nativeVp)
-        TRACE_JSVALS(trc, acx->nativeVpLen, acx->nativeVp, "nativeVp");
+    InterpState* state = acx->interpState;
+    while (state) {
+        if (state->nativeVp)
+            TRACE_JSVALS(trc, state->nativeVpLen, state->nativeVp, "nativeVp");
+        state = state->prev;
+    }
 #endif
 }
 
@@ -3085,7 +3058,6 @@ js_TraceRuntime(JSTracer *trc, JSBool allAtoms)
     if (rt->gcLocksHash)
         JS_DHashTableEnumerate(rt->gcLocksHash, gc_lock_traversal, trc);
     js_TraceAtomState(trc, allAtoms);
-    js_TraceNativeEnumerators(trc);
     js_TraceRuntimeNumberState(trc);
 
     iter = NULL;
@@ -3233,6 +3205,7 @@ js_FinalizeStringRT(JSRuntime *rt, JSString *str, intN type, JSContext *cx)
     JSStringFinalizeOp finalizer;
 
     JS_RUNTIME_UNMETER(rt, liveStrings);
+    JS_ASSERT(!JSString::isStatic(str));
     if (str->isDependent()) {
         /* A dependent string can not be external and must be valid. */
         JS_ASSERT(type < 0);
@@ -3244,11 +3217,7 @@ js_FinalizeStringRT(JSRuntime *rt, JSString *str, intN type, JSContext *cx)
         chars = str->flatChars();
         valid = (chars != NULL);
         if (valid) {
-            if (IN_UNIT_STRING_SPACE_RT(rt, chars)) {
-                JS_ASSERT(rt->unitStrings[*chars] == str);
-                JS_ASSERT(type < 0);
-                rt->unitStrings[*chars] = NULL;
-            } else if (type < 0) {
+            if (type < 0) {
                 if (cx)
                     cx->free(chars);
                 else
