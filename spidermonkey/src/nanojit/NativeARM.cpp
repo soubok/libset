@@ -460,6 +460,7 @@ Assembler::nInit(AvmCore*)
 
 void Assembler::nBeginAssembly()
 {
+    max_out_args = 0;
 }
 
 NIns*
@@ -471,7 +472,7 @@ Assembler::genPrologue()
 
     // NJ_RESV_OFFSET is space at the top of the stack for us
     // to use for parameter passing (8 bytes at the moment)
-    uint32_t stackNeeded = max_out_args + STACK_GRANULARITY * _activation.highwatermark;
+    uint32_t stackNeeded = max_out_args + STACK_GRANULARITY * _activation.tos;
     uint32_t savingCount = 2;
 
     uint32_t savingMask = rmask(FP) | rmask(LR);
@@ -519,13 +520,7 @@ Assembler::nFragExit(LInsp guard)
         // will work correctly.
         JMP_far(_epilogue);
 
-        // Load the guard record pointer into R2. We want it in R0 but we can't
-        // do this at this stage because R0 is used for something else.
-        // I don't understand why I can't load directly into R0. It works for
-        // the JavaScript JIT but not for the Regular Expression compiler.
-        // However, I haven't pushed this further as it only saves a single MOV
-        // instruction in genEpilogue.
-        asm_ld_imm(R2, int(gr));
+        asm_ld_imm(R0, int(gr));
 
         // Set the jmp pointer to the start of the sequence so that patched
         // branches can skip the LDi sequence.
@@ -555,10 +550,6 @@ Assembler::genEpilogue()
     RegisterMask savingMask = rmask(FP) | rmask(PC);
 
     POP_mask(savingMask); // regs
-
-    // nFragExit loads the guard record pointer into R2, but we need it in R0
-    // so it must be moved here.
-    MOV(R0,R2); // return GuardRecord*
 
     return _nIns;
 }
@@ -1405,6 +1396,15 @@ Assembler::asm_mmq(Register rd, int dd, Register rs, int ds)
     }
 }
 
+// Increment the 32-bit profiling counter at pCtr, without
+// changing any registers.
+verbose_only(
+void Assembler::asm_inc_m32(uint32_t* pCtr)
+{
+    // todo: implement this
+}
+)
+
 void
 Assembler::nativePageReset()
 {
@@ -1417,9 +1417,9 @@ void
 Assembler::nativePageSetup()
 {
     if (!_nIns)
-        codeAlloc(codeStart, codeEnd, _nIns);
+        codeAlloc(codeStart, codeEnd, _nIns verbose_only(, codeBytes));
     if (!_nExitIns)
-        codeAlloc(exitStart, exitEnd, _nExitIns);
+        codeAlloc(exitStart, exitEnd, _nExitIns verbose_only(, exitBytes));
 
     // constpool starts at top of page and goes down,
     // code starts at bottom of page and moves up
@@ -1442,9 +1442,9 @@ Assembler::underrunProtect(int bytes)
         verbose_only(verbose_outputf("        %p:", _nIns);)
         NIns* target = _nIns;
         if (_inExit)
-            codeAlloc(exitStart, exitEnd, _nIns);
+            codeAlloc(exitStart, exitEnd, _nIns verbose_only(, exitBytes));
         else
-            codeAlloc(codeStart, codeEnd, _nIns);
+            codeAlloc(codeStart, codeEnd, _nIns verbose_only(, codeBytes));
 
         _nSlot = _inExit ? exitStart : codeStart;
 
@@ -1751,9 +1751,9 @@ Assembler::B_cond_chk(ConditionCode _c, NIns* _t, bool _chk)
     //      be patched, so the nPatchBranch function doesn't need to know where
     //      the literal pool is located.
     //          LDRcc   PC, #lit
-    //          ; #lit is in the literal pool at ++_nSlot
+    //          ; #lit is in the literal pool at _nSlot
     //
-    //  --- Long conditional branch (if !samepage(_nIns-1, _nSlot)).
+    //  --- Long conditional branch (if the slot isn't on the same page as the instruction).
     //          LDRcc   PC, #lit
     //          B       skip        ; Jump over the literal data.
     //  lit:    #target
@@ -1766,12 +1766,14 @@ Assembler::B_cond_chk(ConditionCode _c, NIns* _t, bool _chk)
         if(_chk) underrunProtect(8);
         *(--_nIns) = (NIns)(_t);
         *(--_nIns) = (NIns)( COND_AL | (0x51<<20) | (PC<<16) | (PC<<12) | 0x4 );
-    } else if (PC_OFFSET_FROM(_nSlot, _nIns-1) > -0x1000) {
+    } else if (PC_OFFSET_FROM(_nSlot, _nIns-1) > -0x1000 /*~(NJ_PAGE_SIZE-1)*/) {
         if(_chk) underrunProtect(8);
-        *(++_nSlot) = (NIns)(_t);
-        offs = PC_OFFSET_FROM(_nSlot,_nIns-1);
+        *(_nSlot++) = (NIns)(_t);
+        offs = PC_OFFSET_FROM(_nSlot-1,_nIns-1);
         NanoAssert(offs < 0);
-        *(--_nIns) = (NIns)( ((_c)<<28) | (0x51<<20) | (PC<<16) | (PC<<12) | ((-offs) & 0xFFFFFF) );
+        *(--_nIns) = (NIns)( ((_c)<<28) | (0x51<<20) | (PC<<16) | (PC<<12) | ((-offs) & 0xFFF) );
+        asm_output("ldr%s %s, [%s, #-%d]", condNames[_c], gpn(PC), gpn(PC), -offs);
+        NanoAssert(uintptr_t(_nIns)+8+offs == uintptr_t(_nSlot-1));
     } else {
         if(_chk) underrunProtect(12);
         // Emit a pointer to the target as a literal in the instruction stream.

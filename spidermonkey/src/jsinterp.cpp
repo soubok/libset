@@ -84,6 +84,7 @@
 #endif
 
 #include "jsatominlines.h"
+#include "jsscriptinlines.h"
 
 #include "jsautooplen.h"
 
@@ -740,7 +741,7 @@ js_GetScopeChain(JSContext *cx, JSStackFrame *fp)
     JSObject *limitBlock, *limitClone;
     if (fp->fun && !fp->callobj) {
         JS_ASSERT(OBJ_GET_CLASS(cx, fp->scopeChain) != &js_BlockClass ||
-                  fp->scopeChain->getAssignedPrivate() != fp);
+                  fp->scopeChain->getPrivate() != fp);
         if (!js_GetCallObject(cx, fp))
             return NULL;
 
@@ -830,7 +831,7 @@ js_GetScopeChain(JSContext *cx, JSStackFrame *fp)
      */
     JS_ASSERT_IF(limitBlock &&
                  OBJ_GET_CLASS(cx, limitBlock) == &js_BlockClass &&
-                 limitClone->getAssignedPrivate() == fp,
+                 limitClone->getPrivate() == fp,
                  sharedBlock);
 
     /* Place our newly cloned blocks at the head of the scope chain.  */
@@ -849,7 +850,7 @@ js_GetPrimitiveThis(JSContext *cx, jsval *vp, JSClass *clasp, jsval *thisvp)
         obj = JS_THIS_OBJECT(cx, vp);
         if (!JS_InstanceOf(cx, obj, clasp, vp + 2))
             return JS_FALSE;
-        v = obj->fslots[JSSLOT_PRIVATE];
+        v = obj->fslots[JSSLOT_PRIMITIVE_THIS];
     }
     *thisvp = v;
     return JS_TRUE;
@@ -968,8 +969,8 @@ js_ComputeThis(JSContext *cx, JSBool lazy, jsval *argv)
 
 #if JS_HAS_NO_SUCH_METHOD
 
-#define JSSLOT_FOUND_FUNCTION   JSSLOT_PRIVATE
-#define JSSLOT_SAVED_ID         (JSSLOT_PRIVATE + 1)
+const uint32 JSSLOT_FOUND_FUNCTION  = JSSLOT_PRIVATE;
+const uint32 JSSLOT_SAVED_ID        = JSSLOT_PRIVATE + 1;
 
 JSClass js_NoSuchMethodClass = {
     "NoSuchMethod",
@@ -1112,7 +1113,7 @@ js_Invoke(JSContext *cx, uintN argc, jsval *vp, uintN flags)
     JSObject *funobj, *parent;
     JSBool ok;
     JSClass *clasp;
-    JSObjectOps *ops;
+    const JSObjectOps *ops;
     JSNative native;
     JSFunction *fun;
     JSScript *script;
@@ -1297,12 +1298,8 @@ have_fun:
 
     /*
      * Initialize the frame.
-     *
-     * To set thisp we use an explicit cast and not JSVAL_TO_OBJECT, as vp[1]
-     * can be a primitive value here for those native functions specified with
-     * JSFUN_THISP_(NUMBER|STRING|BOOLEAN) flags.
      */
-    frame.thisp = (JSObject *)vp[1];
+    frame.thisv = vp[1];
     frame.varobj = NULL;
     frame.callobj = NULL;
     frame.argsobj = NULL;
@@ -1320,8 +1317,6 @@ have_fun:
     frame.regs = NULL;
     frame.imacpc = NULL;
     frame.slots = NULL;
-    frame.sharpDepth = 0;
-    frame.sharpArray = NULL;
     frame.flags = flags | rootedArgsFlag;
     frame.dormantNext = NULL;
     frame.displaySave = NULL;
@@ -1377,8 +1372,9 @@ have_fun:
 #ifdef DEBUG_NOT_THROWING
         JSBool alreadyThrowing = cx->throwing;
 #endif
-
-        ok = native(cx, frame.thisp, argc, frame.argv, &frame.rval);
+        /* Primitive |this| should not be passed to slow natives. */
+        JSObject *thisp = JSVAL_TO_OBJECT(frame.thisv);
+        ok = native(cx, thisp, argc, frame.argv, &frame.rval);
         JS_RUNTIME_METER(cx->runtime, nativeCalls);
 #ifdef DEBUG_NOT_THROWING
         if (ok && !alreadyThrowing)
@@ -1469,8 +1465,6 @@ JSBool
 js_InternalGetOrSet(JSContext *cx, JSObject *obj, jsid id, jsval fval,
                     JSAccessMode mode, uintN argc, jsval *argv, jsval *rval)
 {
-    JSSecurityCallbacks *callbacks;
-
     js_LeaveTrace(cx);
 
     /*
@@ -1478,31 +1472,6 @@ js_InternalGetOrSet(JSContext *cx, JSObject *obj, jsid id, jsval fval,
      * again, see bug 355497.
      */
     JS_CHECK_RECURSION(cx, return JS_FALSE);
-
-    /*
-     * Check general (not object-ops/class-specific) access from the running
-     * script to obj.id only if id has a scripted getter or setter that we're
-     * about to invoke.  If we don't check this case, nothing else will -- no
-     * other native code has the chance to check.
-     *
-     * Contrast this non-native (scripted) case with native getter and setter
-     * accesses, where the native itself must do an access check, if security
-     * policies requires it.  We make a checkAccess or checkObjectAccess call
-     * back to the embedding program only in those cases where we're not going
-     * to call an embedding-defined native function, getter, setter, or class
-     * hook anyway.  Where we do call such a native, there's no need for the
-     * engine to impose a separate access check callback on all embeddings --
-     * many embeddings have no security policy at all.
-     */
-    JS_ASSERT(mode == JSACC_READ || mode == JSACC_WRITE);
-    callbacks = JS_GetSecurityCallbacks(cx);
-    if (callbacks &&
-        callbacks->checkObjectAccess &&
-        VALUE_IS_FUNCTION(cx, fval) &&
-        FUN_INTERPRETED(GET_FUNCTION_PRIVATE(cx, JSVAL_TO_OBJECT(fval))) &&
-        !callbacks->checkObjectAccess(cx, obj, ID_TO_VALUE(id), mode, &fval)) {
-        return JS_FALSE;
-    }
 
     return js_InternalCall(cx, obj, fval, argc, argv, rval);
 }
@@ -1534,14 +1503,12 @@ js_Execute(JSContext *cx, JSObject *chain, JSScript *script,
         frame.argsobj = down->argsobj;
         frame.varobj = down->varobj;
         frame.fun = down->fun;
-        frame.thisp = down->thisp;
+        frame.thisv = down->thisv;
         if (down->flags & JSFRAME_COMPUTED_THIS)
             flags |= JSFRAME_COMPUTED_THIS;
         frame.argc = down->argc;
         frame.argv = down->argv;
         frame.annotation = down->annotation;
-        frame.sharpArray = down->sharpArray;
-        JS_ASSERT(script->nfixed == 0);
     } else {
         frame.callobj = NULL;
         frame.argsobj = NULL;
@@ -1552,11 +1519,10 @@ js_Execute(JSContext *cx, JSObject *chain, JSScript *script,
         }
         frame.varobj = obj;
         frame.fun = NULL;
-        frame.thisp = chain;
+        frame.thisv = OBJECT_TO_JSVAL(chain);
         frame.argc = 0;
         frame.argv = NULL;
         frame.annotation = NULL;
-        frame.sharpArray = NULL;
     }
 
     frame.imacpc = NULL;
@@ -1567,6 +1533,31 @@ js_Execute(JSContext *cx, JSObject *chain, JSScript *script,
             goto out;
         }
         memset(frame.slots, 0, script->nfixed * sizeof(jsval));
+
+#if JS_HAS_SHARP_VARS
+        JS_STATIC_ASSERT(SHARP_NSLOTS == 2);
+
+        if (script->flags & JSSF_HAS_SHARPS) {
+            JS_ASSERT(script->nfixed >= SHARP_NSLOTS);
+            jsval *sharps = &frame.slots[script->nfixed - SHARP_NSLOTS];
+
+            if (down && down->script && (down->script->flags & JSSF_HAS_SHARPS)) {
+                JS_ASSERT(down->script->nfixed >= SHARP_NSLOTS);
+                int base = (down->fun && !(down->flags & JSFRAME_SPECIAL))
+                           ? down->fun->sharpSlotBase(cx)
+                           : down->script->nfixed - SHARP_NSLOTS;
+                if (base < 0) {
+                    ok = JS_FALSE;
+                    goto out;
+                }
+                sharps[0] = down->slots[base];
+                sharps[1] = down->slots[base + 1];
+            } else {
+                sharps[0] = sharps[1] = JSVAL_VOID;
+            }
+        } else
+#endif
+            JS_ASSERT_IF(down, script->nfixed == 0);
     } else {
         frame.slots = NULL;
     }
@@ -1575,7 +1566,6 @@ js_Execute(JSContext *cx, JSObject *chain, JSScript *script,
     frame.down = down;
     frame.scopeChain = chain;
     frame.regs = NULL;
-    frame.sharpDepth = 0;
     frame.flags = flags;
     frame.dormantNext = NULL;
     frame.blockChain = NULL;
@@ -1606,11 +1596,12 @@ js_Execute(JSContext *cx, JSObject *chain, JSScript *script,
             return JS_FALSE;
         frame.scopeChain = chain;
 
-        frame.thisp = frame.thisp->thisObject(cx);
-        if (!frame.thisp) {
+        JSObject *thisp = JSVAL_TO_OBJECT(frame.thisv)->thisObject(cx);
+        if (!thisp) {
             ok = JS_FALSE;
             goto out2;
         }
+        frame.thisv = OBJECT_TO_JSVAL(thisp);
         frame.flags |= JSFRAME_COMPUTED_THIS;
     }
 
@@ -1808,6 +1799,30 @@ js_StrictlyEqual(JSContext *cx, jsval lval, jsval rval)
     return lval == rval;
 }
 
+static inline bool
+IsNegativeZero(jsval v)
+{
+    return JSVAL_IS_DOUBLE(v) && JSDOUBLE_IS_NEGZERO(*JSVAL_TO_DOUBLE(v));
+}
+
+static inline bool
+IsNaN(jsval v)
+{
+    return JSVAL_IS_DOUBLE(v) && JSDOUBLE_IS_NaN(*JSVAL_TO_DOUBLE(v));
+}
+
+JSBool
+js_SameValue(jsval v1, jsval v2, JSContext *cx)
+{
+    if (IsNegativeZero(v1))
+        return IsNegativeZero(v2);
+    if (IsNegativeZero(v2))
+        return JS_FALSE;
+    if (IsNaN(v1) && IsNaN(v2))
+        return JS_TRUE;
+    return js_StrictlyEqual(cx, v1, v2);
+}
+
 JS_REQUIRES_STACK JSBool
 js_InvokeConstructor(JSContext *cx, uintN argc, JSBool clampReturn, jsval *vp)
 {
@@ -1953,7 +1968,7 @@ js_LeaveWith(JSContext *cx)
 
     withobj = cx->fp->scopeChain;
     JS_ASSERT(OBJ_GET_CLASS(cx, withobj) == &js_WithClass);
-    JS_ASSERT(withobj->getAssignedPrivate() == cx->fp);
+    JS_ASSERT(withobj->getPrivate() == cx->fp);
     JS_ASSERT(OBJ_BLOCK_DEPTH(cx, withobj) >= 0);
     cx->fp->scopeChain = OBJ_GET_PARENT(cx, withobj);
     withobj->setPrivate(NULL);
@@ -1966,7 +1981,7 @@ js_IsActiveWithOrBlock(JSContext *cx, JSObject *obj, int stackDepth)
 
     clasp = OBJ_GET_CLASS(cx, obj);
     if ((clasp == &js_WithClass || clasp == &js_BlockClass) &&
-        obj->getAssignedPrivate() == cx->fp &&
+        obj->getPrivate() == cx->fp &&
         OBJ_BLOCK_DEPTH(cx, obj) >= stackDepth) {
         return clasp;
     }
@@ -2841,10 +2856,10 @@ js_Interpret(JSContext *cx)
     (atoms - script->atomMap.vector + GET_INDEX(regs.pc + PCOFF))
 
 #define LOAD_OBJECT(PCOFF)                                                    \
-    JS_GET_SCRIPT_OBJECT(script, GET_FULL_INDEX(PCOFF), obj)
+    (obj = script->getObject(GET_FULL_INDEX(PCOFF)))
 
 #define LOAD_FUNCTION(PCOFF)                                                  \
-    JS_GET_SCRIPT_FUNCTION(script, GET_FULL_INDEX(PCOFF), fun)
+    (fun = script->getFunction(GET_FULL_INDEX(PCOFF)))
 
 #ifdef JS_TRACER
 
@@ -2916,7 +2931,7 @@ js_Interpret(JSContext *cx)
                 } else {                                                      \
                     op = (JSOp) *++regs.pc;                                   \
                 }                                                             \
-            } else if (op == JSOP_LOOP) {                                     \
+            } else if (op == JSOP_TRACE) {                                    \
                 MONITOR_BRANCH();                                             \
                 op = (JSOp) *regs.pc;                                         \
             }                                                                 \
@@ -3126,8 +3141,8 @@ js_Interpret(JSContext *cx)
             goto no_catch;
 
         offset = (uint32)(regs.pc - script->main);
-        tn = JS_SCRIPT_TRYNOTES(script)->vector;
-        tnlimit = tn + JS_SCRIPT_TRYNOTES(script)->length;
+        tn = script->trynotes()->vector;
+        tnlimit = tn + script->trynotes()->length;
         do {
             if (offset - tn->start >= tn->length)
                 continue;

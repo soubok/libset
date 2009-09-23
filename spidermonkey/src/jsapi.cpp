@@ -642,7 +642,7 @@ JS_TypeOfValue(JSContext *cx, jsval v)
 {
     JSType type;
     JSObject *obj;
-    JSObjectOps *ops;
+    const JSObjectOps *ops;
     JSClass *clasp;
 
     CHECK_REQUEST(cx);
@@ -709,6 +709,12 @@ JS_PUBLIC_API(JSBool)
 JS_StrictlyEqual(JSContext *cx, jsval v1, jsval v2)
 {
     return js_StrictlyEqual(cx, v1, v2);
+}
+
+JS_PUBLIC_API(JSBool)
+JS_SameValue(JSContext *cx, jsval v1, jsval v2)
+{
+    return js_SameValue(v1, v2, cx);
 }
 
 /************************************************************************/
@@ -844,10 +850,6 @@ JS_DestroyRuntime(JSRuntime *rt)
 {
 #ifdef DEBUG
     /* Don't hurt everyone in leaky ol' Mozilla with a fatal JS_ASSERT! */
-    if (rt->nativeEnumerators) {
-        fprintf(stderr,
-                "JS engine warning: leak of native enumerators is detected.\n");
-    }
     if (!JS_CLIST_IS_EMPTY(&rt->contextList)) {
         JSContext *cx, *iter = NULL;
         uintN cxcount = 0;
@@ -866,13 +868,6 @@ JS_DestroyRuntime(JSRuntime *rt)
     js_FinishThreads(rt);
     js_FreeRuntimeScriptState(rt);
     js_FinishAtomState(rt);
-
-    /*
-     * Free unit string storage only after all strings have been finalized, so
-     * that js_FinalizeString can detect unit strings and avoid calling free
-     * on their chars storage.
-     */
-    js_FinishUnitStrings(rt);
 
     /*
      * Finish the deflated string cache after the last GC and after
@@ -2627,12 +2622,21 @@ JS_NewExternalString(JSContext *cx, jschar *chars, size_t length, intN type)
     if (!str)
         return NULL;
     str->initFlat(chars, length);
+    cx->updateMallocCounter((length + 1) * sizeof(jschar));
     return str;
 }
 
 JS_PUBLIC_API(intN)
 JS_GetExternalStringGCType(JSRuntime *rt, JSString *str)
 {
+    /*
+     * No need to test this in js_GetExternalStringGCType, which asserts its
+     * inverse instead of wasting cycles on testing a condition we can ensure
+     * by auditing in-VM calls to the js_... helper.
+     */
+    if (JSString::isStatic(str))
+        return -1;
+
     return js_GetExternalStringGCType(str);
 }
 
@@ -2783,9 +2787,8 @@ JS_GetPrivate(JSContext *cx, JSObject *obj)
 JS_PUBLIC_API(JSBool)
 JS_SetPrivate(JSContext *cx, JSObject *obj, void *data)
 {
-    JS_ASSERT(OBJ_GET_CLASS(cx, obj)->flags & JSCLASS_HAS_PRIVATE);
-    obj->fslots[JSSLOT_PRIVATE] = PRIVATE_TO_JSVAL(data);
-    return JS_TRUE;
+    obj->setPrivate(data);
+    return true;
 }
 
 JS_PUBLIC_API(void *)
@@ -2794,7 +2797,7 @@ JS_GetInstancePrivate(JSContext *cx, JSObject *obj, JSClass *clasp,
 {
     if (!JS_InstanceOf(cx, obj, clasp, argv))
         return NULL;
-    return JS_GetPrivate(cx, obj);
+    return obj->getPrivate();
 }
 
 JS_PUBLIC_API(JSObject *)
@@ -3780,7 +3783,7 @@ JS_NewArrayObject(JSContext *cx, jsint length, jsval *vector)
 JS_PUBLIC_API(JSBool)
 JS_IsArrayObject(JSContext *cx, JSObject *obj)
 {
-    return OBJ_IS_ARRAY(cx, obj);
+    return OBJ_IS_ARRAY(cx, js_GetWrappedObject(cx, obj));
 }
 
 JS_PUBLIC_API(JSBool)
@@ -3950,6 +3953,7 @@ JS_Enumerate(JSContext *cx, JSObject *obj)
 
     ida = NULL;
     iter_state = JSVAL_NULL;
+    JSAutoEnumStateRooter tvr(cx, obj, &iter_state);
 
     /* Get the number of properties to enumerate. */
     if (!obj->enumerate(cx, JSENUMERATE_INIT, &iter_state, &num_properties))
@@ -3990,7 +3994,7 @@ JS_Enumerate(JSContext *cx, JSObject *obj)
     return SetIdArrayLength(cx, ida, i);
 
 error:
-    if (iter_state != JSVAL_NULL)
+    if (!JSVAL_IS_NULL(iter_state))
         obj->enumerate(cx, JSENUMERATE_DESTROY, &iter_state, 0);
     if (ida)
         JS_DestroyIdArray(cx, ida);
@@ -4105,7 +4109,7 @@ JS_NextProperty(JSContext *cx, JSObject *iterobj, jsid *idp)
         obj = OBJ_GET_PARENT(cx, iterobj);
         JS_ASSERT(OBJ_IS_NATIVE(obj));
         scope = OBJ_SCOPE(obj);
-        sprop = (JSScopeProperty *) iterobj->getAssignedPrivate();
+        sprop = (JSScopeProperty *) iterobj->getPrivate();
 
         /*
          * If the next property mapped by scope in the property tree ancestor
@@ -4129,7 +4133,7 @@ JS_NextProperty(JSContext *cx, JSObject *iterobj, jsid *idp)
         }
     } else {
         /* Non-native case: use the ida enumerated when iterobj was created. */
-        ida = (JSIdArray *) iterobj->getAssignedPrivate();
+        ida = (JSIdArray *) iterobj->getPrivate();
         JS_ASSERT(i <= ida->length);
         if (i == 0) {
             *idp = JSVAL_VOID;
@@ -4270,7 +4274,7 @@ JS_CloneFunctionObject(JSContext *cx, JSObject *funobj, JSObject *parent)
             return NULL;
         }
 
-        JSUpvarArray *uva = JS_SCRIPT_UPVARS(fun->u.i.script);
+        JSUpvarArray *uva = fun->u.i.script->upvars();
         JS_ASSERT(uva->length <= size_t(clone->dslots[-1]));
 
         void *mark = JS_ARENA_MARK(&cx->tempPool);
@@ -4399,8 +4403,8 @@ js_generic_fast_native_method_dispatcher(JSContext *cx, uintN argc, jsval *vp)
 
     native =
 #ifdef JS_TRACER
-             (fs->flags & JSFUN_TRACEABLE)
-             ? JS_FUNC_TO_DATA_PTR(JSTraceableNative *, fs->call)->native
+             (fs->flags & JSFUN_TRCINFO)
+             ? JS_FUNC_TO_DATA_PTR(JSNativeTraceInfo *, fs->call)->native
              :
 #endif
                (JSFastNative) fs->call;
@@ -4451,7 +4455,7 @@ js_generic_native_method_dispatcher(JSContext *cx, JSObject *obj,
      */
     if (!js_ComputeThis(cx, JS_TRUE, argv))
         return JS_FALSE;
-    js_GetTopStackFrame(cx)->thisp = JSVAL_TO_OBJECT(argv[-1]);
+    js_GetTopStackFrame(cx)->thisv = argv[-1];
     JS_ASSERT(cx->fp->argv == argv);
 
     /*
@@ -4498,7 +4502,7 @@ JS_DefineFunctions(JSContext *cx, JSObject *obj, JSFunctionSpec *fs)
                                       js_generic_fast_native_method_dispatcher
                                     : js_generic_native_method_dispatcher,
                                     fs->nargs + 1,
-                                    flags & ~JSFUN_TRACEABLE);
+                                    flags & ~JSFUN_TRCINFO);
             if (!fun)
                 return JS_FALSE;
             fun->u.n.extra = (uint16)fs->extra;
@@ -5672,6 +5676,10 @@ JS_ClearRegExpStatics(JSContext *cx)
     res->parenCount = 0;
     res->lastMatch = res->lastParen = js_EmptySubString;
     res->leftContext = res->rightContext = js_EmptySubString;
+    if (res->moreParens) {
+      cx->free(res->moreParens);
+      res->moreParens = NULL;
+    }
     cx->runtime->gcPoke = JS_TRUE;
 }
 

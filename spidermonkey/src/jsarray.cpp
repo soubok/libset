@@ -85,6 +85,7 @@
 #include "jsatom.h"
 #include "jsbit.h"
 #include "jsbool.h"
+#include "jstracer.h"
 #include "jsbuiltins.h"
 #include "jscntxt.h"
 #include "jsversion.h"
@@ -1227,7 +1228,7 @@ array_trace(JSTracer *trc, JSObject *obj)
 
 extern JSObjectOps js_ArrayObjectOps;
 
-static const JSObjectMap SharedArrayMap = { &js_ArrayObjectOps };
+static const JSObjectMap SharedArrayMap(&js_ArrayObjectOps, JSObjectMap::SHAPELESS);
 
 JSObjectOps js_ArrayObjectOps = {
     &SharedArrayMap,
@@ -1340,7 +1341,7 @@ js_MakeArraySlow(JSContext *cx, JSObject *obj)
     obj->classword ^= (jsuword) &js_ArrayClass;
     obj->classword |= (jsuword) &js_SlowArrayClass;
 
-    obj->map = &scope->map;
+    obj->map = scope;
     return JS_TRUE;
 
   out_bad:
@@ -3316,7 +3317,7 @@ array_isArray(JSContext *cx, uintN argc, jsval *vp)
 {
     *vp = BOOLEAN_TO_JSVAL(argc > 0 &&
                            !JSVAL_IS_PRIMITIVE(vp[2]) &&
-                           OBJ_IS_ARRAY(cx, JSVAL_TO_OBJECT(vp[2])));
+                           OBJ_IS_ARRAY(cx, js_GetWrappedObject(cx, JSVAL_TO_OBJECT(vp[2]))));
     return JS_TRUE;
 }
 
@@ -3339,15 +3340,15 @@ static JSFunctionSpec array_methods[] = {
 #if JS_HAS_TOSOURCE
     JS_FN(js_toSource_str,      array_toSource,     0,0),
 #endif
-    JS_TN(js_toString_str,      array_toString,     0,0, array_toString_trcinfo),
+    JS_TN(js_toString_str,      array_toString,     0,0, &array_toString_trcinfo),
     JS_FN(js_toLocaleString_str,array_toLocaleString,0,0),
 
     /* Perl-ish methods. */
-    JS_TN("join",               array_join,         1,JSFUN_GENERIC_NATIVE, array_join_trcinfo),
+    JS_TN("join",               array_join,         1,JSFUN_GENERIC_NATIVE, &array_join_trcinfo),
     JS_FN("reverse",            array_reverse,      0,JSFUN_GENERIC_NATIVE),
     JS_FN("sort",               array_sort,         1,JSFUN_GENERIC_NATIVE),
-    JS_TN("push",               array_push,         1,JSFUN_GENERIC_NATIVE, array_push_trcinfo),
-    JS_TN("pop",                array_pop,          0,JSFUN_GENERIC_NATIVE, array_pop_trcinfo),
+    JS_TN("push",               array_push,         1,JSFUN_GENERIC_NATIVE, &array_push_trcinfo),
+    JS_TN("pop",                array_pop,          0,JSFUN_GENERIC_NATIVE, &array_pop_trcinfo),
     JS_FN("shift",              array_shift,        0,JSFUN_GENERIC_NATIVE),
     JS_FN("unshift",            array_unshift,      1,JSFUN_GENERIC_NATIVE),
     JS_FN("splice",             array_splice,       2,JSFUN_GENERIC_NATIVE),
@@ -3411,14 +3412,11 @@ js_Array(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 JS_STATIC_ASSERT(JSSLOT_PRIVATE == JSSLOT_ARRAY_LENGTH);
 JS_STATIC_ASSERT(JSSLOT_ARRAY_LENGTH + 1 == JSSLOT_ARRAY_COUNT);
 
-#ifdef JS_TRACER
-
-JSObject* FASTCALL
+JSObject* JS_FASTCALL
 js_NewEmptyArray(JSContext* cx, JSObject* proto)
 {
     JS_ASSERT(OBJ_IS_ARRAY(cx, proto));
 
-    JS_ASSERT(JS_ON_TRACE(cx));
     JSObject* obj = js_NewGCObject(cx, GCX_OBJECT);
     if (!obj)
         return NULL;
@@ -3436,12 +3434,13 @@ js_NewEmptyArray(JSContext* cx, JSObject* proto)
     obj->dslots = NULL;
     return obj;
 }
+#ifdef JS_TRACER
 JS_DEFINE_CALLINFO_2(extern, OBJECT, js_NewEmptyArray, CONTEXT, OBJECT, 0, 0)
+#endif
 
-JSObject* FASTCALL
-js_NewUninitializedArray(JSContext* cx, JSObject* proto, uint32 len)
+JSObject* JS_FASTCALL
+js_NewArrayWithSlots(JSContext* cx, JSObject* proto, uint32 len)
 {
-    JS_ASSERT(JS_ON_TRACE(cx));
     JSObject* obj = js_NewEmptyArray(cx, proto);
     if (!obj)
         return NULL;
@@ -3450,9 +3449,9 @@ js_NewUninitializedArray(JSContext* cx, JSObject* proto, uint32 len)
         return NULL;
     return obj;
 }
-JS_DEFINE_CALLINFO_3(extern, OBJECT, js_NewUninitializedArray, CONTEXT, OBJECT, UINT32, 0, 0)
-
-#endif /* JS_TRACER */
+#ifdef JS_TRACER
+JS_DEFINE_CALLINFO_3(extern, OBJECT, js_NewArrayWithSlots, CONTEXT, OBJECT, UINT32, 0, 0)
+#endif
 
 JSObject *
 js_InitArrayClass(JSContext *cx, JSObject *obj)

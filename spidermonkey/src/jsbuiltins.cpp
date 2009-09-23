@@ -191,6 +191,13 @@ js_StringToInt32(JSContext* cx, JSString* str)
     const jschar* end;
     const jschar* ep;
     jsdouble d;
+    
+    if (str->length() == 1) {
+        jschar c = str->chars()[0];
+        if ('0' <= c && c <= '9')
+            return c - '0';
+        return 0;	
+    }
 
     str->getCharsAndEnd(bp, end);
     if ((!js_strtod(cx, bp, end, &ep, &d) ||
@@ -388,18 +395,13 @@ js_NewNullClosure(JSContext* cx, JSObject* funobj, JSObject* proto, JSObject* pa
 
     JSScope *scope = OBJ_SCOPE(proto)->getEmptyScope(cx, &js_FunctionClass);
     if (!scope) {
-        closure->map = NULL;
+        JS_ASSERT(!closure->map);
         return NULL;
     }
 
-    closure->map = &scope->map;
-    closure->classword = jsuword(&js_FunctionClass);
-    closure->setProto(proto);
-    closure->setParent(parent);
-    closure->setPrivate(fun);
-    for (unsigned i = JSSLOT_PRIVATE + 1; i != JS_INITIAL_NSLOTS; ++i)
-        closure->fslots[i] = JSVAL_VOID;
-    closure->dslots = NULL;
+    closure->map = scope;
+    closure->init(&js_FunctionClass, proto, parent,
+                  reinterpret_cast<jsval>(fun));
     return closure;
 }
 JS_DEFINE_CALLINFO_4(extern, OBJECT, js_NewNullClosure, CONTEXT, OBJECT, OBJECT, OBJECT, 0, 0)

@@ -196,15 +196,14 @@ JS_BEGIN_EXTERN_C
  * to find a given id, and save on the space overhead of a hash table.
  */
 
-struct JSScope {
-    JSObjectMap     map;                /* base class state */
+struct JSScope : public JSObjectMap
+{
 #ifdef JS_THREADSAFE
     JSTitle         title;              /* lock state */
 #endif
     JSObject        *object;            /* object that owns this scope */
     jsrefcount      nrefs;              /* count of all referencing objects */
     uint32          freeslot;           /* index of next free slot in object */
-    uint32          shape;              /* property cache shape identifier */
     JSScope         *emptyScope;        /* cache for getEmptyScope below */
     uint8           flags;              /* flags, see below */
     int8            hashShift;          /* multiplicative hash shift */
@@ -226,9 +225,12 @@ struct JSScope {
     JSScope *createEmptyScope(JSContext *cx, JSClass *clasp);
 
   public:
+    explicit JSScope(const JSObjectOps *ops, JSObject *obj = NULL)
+      : JSObjectMap(ops, 0), object(obj) {}
+
     /* Create a mutable, owned, empty scope. */
-    static JSScope *create(JSContext *cx, JSObjectOps *ops, JSClass *clasp, JSObject *obj,
-                           uint32 shape);
+    static JSScope *create(JSContext *cx, const JSObjectOps *ops, JSClass *clasp,
+                           JSObject *obj, uint32 shape);
 
     static void destroy(JSContext *cx, JSScope *scope);
 
@@ -237,7 +239,7 @@ struct JSScope {
      * and the same freeslot as this had when empty.
      *
      * If |this| is the scope of an object |proto|, the resulting scope can be
-     * used the scope of a new object whose prototype is |proto|.
+     * used as the scope of a new object whose prototype is |proto|.
      */
     JSScope *getEmptyScope(JSContext *cx, JSClass *clasp) {
         if (emptyScope) {
@@ -392,36 +394,55 @@ struct JSScope {
     bool owned()                { return object != NULL; }
 };
 
-#define JS_IS_SCOPE_LOCKED(cx, scope)   JS_IS_TITLE_LOCKED(cx, &(scope)->title)
+inline bool
+JS_IS_SCOPE_LOCKED(JSContext *cx, JSScope *scope)
+{
+    return JS_IS_TITLE_LOCKED(cx, &scope->title);
+}
 
-#define OBJ_SCOPE(obj)                  (JS_ASSERT(OBJ_IS_NATIVE(obj)),       \
-                                         (JSScope *) (obj)->map)
-#define OBJ_SHAPE(obj)                  (OBJ_SCOPE(obj)->shape)
+inline JSScope *
+OBJ_SCOPE(JSObject *obj)
+{
+    JS_ASSERT(OBJ_IS_NATIVE(obj));
+    return (JSScope *) obj->map;
+}
+
+inline uint32
+OBJ_SHAPE(JSObject *obj)
+{
+    JS_ASSERT(obj->map->shape != JSObjectMap::SHAPELESS);
+    return obj->map->shape;
+}
 
 /*
  * A little information hiding for scope->lastProp, in case it ever becomes
  * a tagged pointer again.
  */
-#define SCOPE_LAST_PROP(scope)          ((scope)->lastProp)
-#define SCOPE_REMOVE_LAST_PROP(scope)   ((scope)->lastProp =                  \
-                                         (scope)->lastProp->parent)
+#define SCOPE_LAST_PROP(scope)                                                \
+    (JS_ASSERT_IF((scope)->lastProp, !JSVAL_IS_NULL((scope)->lastProp->id)),  \
+     (scope)->lastProp)
+#define SCOPE_REMOVE_LAST_PROP(scope)                                         \
+    (JS_ASSERT_IF((scope)->lastProp->parent,                                  \
+                  !JSVAL_IS_NULL((scope)->lastProp->parent->id)),             \
+     (scope)->lastProp = (scope)->lastProp->parent)
+
 /*
  * Helpers for reinterpreting JSPropertyOp as JSObject* for scripted getters
  * and setters.
  */
-static inline JSObject *
+inline JSObject *
 js_CastAsObject(JSPropertyOp op)
 {
     return JS_FUNC_TO_DATA_PTR(JSObject *, op);
 }
 
-static inline jsval
+inline jsval
 js_CastAsObjectJSVal(JSPropertyOp op)
 {
     return OBJECT_TO_JSVAL(JS_FUNC_TO_DATA_PTR(JSObject *, op));
 }
 
-static inline JSPropertyOp
+inline JSPropertyOp
 js_CastAsPropertyOp(JSObject *object)
 {
     return JS_DATA_TO_FUNC_PTR(JSPropertyOp, object);
@@ -747,6 +768,7 @@ inline bool
 JSScopeProperty::get(JSContext* cx, JSObject* obj, JSObject *pobj, jsval* vp)
 {
     JS_ASSERT(!SPROP_HAS_STUB_GETTER(this));
+    JS_ASSERT(!JSVAL_IS_NULL(this->id));
 
     if (attrs & JSPROP_GETTER) {
         JS_ASSERT(!isMethod());

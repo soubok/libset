@@ -115,6 +115,7 @@
           ADD_EMPTY_CASE(JSOP_NOP)
           ADD_EMPTY_CASE(JSOP_CONDSWITCH)
           ADD_EMPTY_CASE(JSOP_TRY)
+          ADD_EMPTY_CASE(JSOP_TRACE)
 #if JS_HAS_XML_SUPPORT
           ADD_EMPTY_CASE(JSOP_STARTXML)
           ADD_EMPTY_CASE(JSOP_STARTXMLEXPR)
@@ -145,7 +146,7 @@
                 clasp = OBJ_GET_CLASS(cx, obj);
                 if (clasp != &js_BlockClass && clasp != &js_WithClass)
                     continue;
-                if (obj->getAssignedPrivate() != fp)
+                if (obj->getPrivate() != fp)
                     break;
                 JS_ASSERT(StackBase(fp) + OBJ_BLOCK_DEPTH(cx, obj)
                                      + ((clasp == &js_BlockClass)
@@ -222,7 +223,7 @@
                                          js_ValueToPrintableString(cx, rval));
                     goto error;
                 }
-                fp->rval = OBJECT_TO_JSVAL(fp->thisp);
+                fp->rval = fp->thisv;
             }
             ok = JS_TRUE;
             if (inlineCallCount)
@@ -284,7 +285,7 @@
                  */
                 if (fp->flags & JSFRAME_CONSTRUCTING) {
                     if (JSVAL_IS_PRIMITIVE(fp->rval))
-                        fp->rval = OBJECT_TO_JSVAL(fp->thisp);
+                        fp->rval = fp->thisv;
                     JS_RUNTIME_METER(cx->runtime, constructs);
                 }
 
@@ -2133,8 +2134,6 @@
                     newifp->frame.down = fp;
                     newifp->frame.annotation = NULL;
                     newifp->frame.scopeChain = parent = OBJ_GET_PARENT(cx, obj);
-                    newifp->frame.sharpDepth = 0;
-                    newifp->frame.sharpArray = NULL;
                     newifp->frame.flags = flags;
                     newifp->frame.dormantNext = NULL;
                     newifp->frame.blockChain = NULL;
@@ -2147,8 +2146,7 @@
 
                     /* Compute the 'this' parameter now that argv is set. */
                     JS_ASSERT(!JSFUN_BOUND_METHOD_TEST(fun->flags));
-                    JS_ASSERT(JSVAL_IS_OBJECT(vp[1]));
-                    newifp->frame.thisp = (JSObject *)vp[1];
+                    newifp->frame.thisv = vp[1];
 
                     newifp->frame.regs = NULL;
                     newifp->frame.imacpc = NULL;
@@ -2395,6 +2393,10 @@
           END_CASE(JSOP_RESETBASE)
 
           BEGIN_CASE(JSOP_DOUBLE)
+            JS_ASSERT(!fp->imacpc);
+            JS_ASSERT(size_t(atoms - script->atomMap.vector) < script->atomMap.length);
+            /* FALL THROUGH */
+
           BEGIN_CASE(JSOP_STRING)
             LOAD_ATOM(0);
             PUSH_OPND(ATOM_KEY(atom));
@@ -2434,20 +2436,20 @@
              * push cloning down under JSObjectOps and reuse code here.
              */
             index = GET_FULL_INDEX(0);
-            JS_ASSERT(index < JS_SCRIPT_REGEXPS(script)->length);
+            JS_ASSERT(index < script->regexps()->length);
 
             slot = index;
             if (fp->fun) {
                 /*
                  * We're in function code, not global or eval code (in eval
                  * code, JSOP_REGEXP is never emitted). The cloned funobj
-                 * contains JS_SCRIPT_REGEXPS(script)->length reserved slots
+                 * contains script->regexps()->length reserved slots
                  * for the cloned regexps; see fun_reserveSlots, jsfun.c.
                  */
                 funobj = JSVAL_TO_OBJECT(fp->argv[-2]);
                 slot += JSCLASS_RESERVED_SLOTS(&js_FunctionClass);
                 if (script->upvarsOffset != 0)
-                    slot += JS_SCRIPT_UPVARS(script)->length;
+                    slot += script->upvars()->length;
                 if (!JS_GetReservedSlot(cx, funobj, slot, &rval))
                     goto error;
                 if (JSVAL_IS_VOID(rval))
@@ -2498,7 +2500,7 @@
                  * objects and separate compilation and execution, even though
                  * it is not specified fully in ECMA.
                  */
-                JS_GET_SCRIPT_REGEXP(script, index, obj);
+                obj = script->getRegExp(index);
                 if (OBJ_GET_PARENT(cx, obj) != obj2) {
                     obj = js_CloneRegExpObject(cx, obj, obj2);
                     if (!obj)
@@ -2617,6 +2619,7 @@
              * JSOP_LOOKUPSWITCH and JSOP_LOOKUPSWITCHX are never used if
              * any atom index in it would exceed 64K limit.
              */
+            JS_ASSERT(!fp->imacpc);
             JS_ASSERT(atoms == script->atomMap.vector);
             pc2 = regs.pc;
             lval = POP_OPND();
@@ -2761,7 +2764,7 @@
           BEGIN_CASE(JSOP_GETUPVAR)
           BEGIN_CASE(JSOP_CALLUPVAR)
           {
-            JSUpvarArray *uva = JS_SCRIPT_UPVARS(script);
+            JSUpvarArray *uva = script->upvars();
 
             index = GET_UINT16(regs.pc);
             JS_ASSERT(index < uva->length);
@@ -3435,14 +3438,10 @@
             }
 
             PUSH_OPND(OBJECT_TO_JSVAL(obj));
-            fp->sharpDepth++;
             CHECK_INTERRUPT_HANDLER();
           END_CASE(JSOP_NEWINIT)
 
           BEGIN_CASE(JSOP_ENDINIT)
-            if (--fp->sharpDepth == 0)
-                fp->sharpArray = NULL;
-
             /* Re-set the newborn root to the top of this object tree. */
             JS_ASSERT(regs.sp - StackBase(fp) >= 1);
             lval = FETCH_OPND(-1);
@@ -3653,15 +3652,18 @@
           END_CASE(JSOP_INITELEM)
 
 #if JS_HAS_SHARP_VARS
+
           BEGIN_CASE(JSOP_DEFSHARP)
-            obj = fp->sharpArray;
-            if (!obj) {
+            slot = GET_UINT16(regs.pc);
+            JS_ASSERT(slot + 1 < fp->script->nfixed);
+            lval = fp->slots[slot];
+            if (JSVAL_IS_VOID(lval)) {
                 obj = js_NewArrayObject(cx, 0, NULL);
                 if (!obj)
                     goto error;
-                fp->sharpArray = obj;
+                fp->slots[slot] = OBJECT_TO_JSVAL(obj);
             }
-            i = (jsint) GET_UINT16(regs.pc);
+            i = (jsint) GET_UINT16(regs.pc + UINT16_LEN);
             id = INT_TO_JSID(i);
             rval = FETCH_OPND(-1);
             if (JSVAL_IS_PRIMITIVE(rval)) {
@@ -3676,12 +3678,15 @@
           END_CASE(JSOP_DEFSHARP)
 
           BEGIN_CASE(JSOP_USESHARP)
-            i = (jsint) GET_UINT16(regs.pc);
-            id = INT_TO_JSID(i);
-            obj = fp->sharpArray;
-            if (!obj) {
+            slot = GET_UINT16(regs.pc);
+            JS_ASSERT(slot + 1 < fp->script->nfixed);
+            lval = fp->slots[slot];
+            i = (jsint) GET_UINT16(regs.pc + UINT16_LEN);
+            if (JSVAL_IS_VOID(lval)) {
                 rval = JSVAL_VOID;
             } else {
+                obj = JSVAL_TO_OBJECT(fp->slots[slot]);
+                id = INT_TO_JSID(i);
                 if (!obj->getProperty(cx, id, &rval))
                     goto error;
             }
@@ -3695,6 +3700,30 @@
             }
             PUSH_OPND(rval);
           END_CASE(JSOP_USESHARP)
+
+          BEGIN_CASE(JSOP_SHARPINIT)
+            slot = GET_UINT16(regs.pc);
+            JS_ASSERT(slot + 1 < fp->script->nfixed);
+            vp = &fp->slots[slot];
+            rval = vp[1];
+
+            /*
+             * We peek ahead safely here because empty initialisers get zero
+             * JSOP_SHARPINIT ops, and non-empty ones get two: the first comes
+             * immediately after JSOP_NEWINIT followed by one or more property
+             * initialisers; and the second comes directly before JSOP_ENDINIT.
+             */
+            if (regs.pc[JSOP_SHARPINIT_LENGTH] != JSOP_ENDINIT) {
+                rval = JSVAL_IS_VOID(rval) ? JSVAL_ONE : rval + 2;
+            } else {
+                JS_ASSERT(JSVAL_IS_INT(rval));
+                rval -= 2;
+                if (rval == JSVAL_ZERO)
+                    vp[0] = JSVAL_VOID;
+            }
+            vp[1] = rval;
+          END_CASE(JSOP_SHARPINIT)
+
 #endif /* JS_HAS_SHARP_VARS */
 
           BEGIN_CASE(JSOP_GOSUB)
@@ -4109,7 +4138,7 @@
             while ((clasp = OBJ_GET_CLASS(cx, obj2)) == &js_WithClass)
                 obj2 = OBJ_GET_PARENT(cx, obj2);
             if (clasp == &js_BlockClass &&
-                obj2->getAssignedPrivate() == fp) {
+                obj2->getPrivate() == fp) {
                 JSObject *youngestProto = OBJ_GET_PROTO(cx, obj2);
                 JS_ASSERT(!OBJ_IS_CLONED_BLOCK(youngestProto));
                 parent = obj;
@@ -4215,9 +4244,6 @@
           END_CASE(JSOP_ARRAYPUSH)
 #endif /* JS_HAS_GENERATORS */
 
-          BEGIN_CASE(JSOP_LOOP)
-          END_CASE(JSOP_LOOP)
-
 #if JS_THREADED_INTERP
           L_JSOP_BACKPATCH:
           L_JSOP_BACKPATCH_POP:
@@ -4231,6 +4257,7 @@
 # if !JS_HAS_SHARP_VARS
           L_JSOP_DEFSHARP:
           L_JSOP_USESHARP:
+          L_JSOP_SHARPINIT:
 # endif
 
 # if !JS_HAS_DESTRUCTURING

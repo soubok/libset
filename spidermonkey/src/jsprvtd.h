@@ -128,7 +128,8 @@ typedef struct JSScopeOps           JSScopeOps;
 typedef struct JSScopeProperty      JSScopeProperty;
 typedef struct JSStackHeader        JSStackHeader;
 typedef struct JSSubString          JSSubString;
-typedef struct JSTraceableNative    JSTraceableNative;
+typedef struct JSNativeTraceInfo    JSNativeTraceInfo;
+typedef struct JSSpecializedNative  JSSpecializedNative;
 typedef struct JSXML                JSXML;
 typedef struct JSXMLArray           JSXMLArray;
 typedef struct JSXMLArrayCursor     JSXMLArrayCursor;
@@ -266,7 +267,6 @@ typedef void
 typedef union JSTempValueUnion {
     jsval               value;
     JSObject            *object;
-    JSString            *string;
     JSXML               *xml;
     JSTempValueTrace    trace;
     JSScopeProperty     *sprop;
