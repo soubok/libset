@@ -106,7 +106,8 @@ script_toSource(JSContext *cx, uintN argc, jsval *vp)
     JSScript *script;
     size_t i, j, k, n;
     char buf[16];
-    jschar *s, *t;
+    const jschar *s;
+    jschar *t;
     JSString *str;
 
     obj = JS_THIS_OBJECT(cx, vp);
