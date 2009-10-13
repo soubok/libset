@@ -233,7 +233,7 @@ struct JSObject {
 
     /* The map field is not initialized here and should be set separately. */
     void init(JSClass *clasp, JSObject *proto, JSObject *parent,
-              jsval privateSlotValue) {
+              jsval privateSlotValue, jsval *nullPtr) {
         JS_ASSERT(((jsuword) clasp & 3) == 0);
         JS_STATIC_ASSERT(JSSLOT_PRIVATE + 3 == JS_INITIAL_NSLOTS);
         JS_ASSERT_IF(clasp->flags & JSCLASS_HAS_PRIVATE,
@@ -248,7 +248,7 @@ struct JSObject {
         fslots[JSSLOT_PRIVATE] = privateSlotValue;
         fslots[JSSLOT_PRIVATE + 1] = JSVAL_VOID;
         fslots[JSSLOT_PRIVATE + 2] = JSVAL_VOID;
-        dslots = NULL;
+        dslots = nullPtr;
     }
 
     JSBool lookupProperty(JSContext *cx, jsid id,
@@ -257,8 +257,9 @@ struct JSObject {
     }
 
     JSBool defineProperty(JSContext *cx, jsid id, jsval value,
-                          JSPropertyOp getter, JSPropertyOp setter,
-                          uintN attrs) {
+                          JSPropertyOp getter = JS_PropertyStub,
+                          JSPropertyOp setter = JS_PropertyStub,
+                          uintN attrs = JSPROP_ENUMERATE) {
         return map->ops->defineProperty(cx, this, id, value, getter, setter, attrs);
     }
 
@@ -348,19 +349,27 @@ struct JSObject {
  */
 
 #define STOBJ_NSLOTS(obj)                                                     \
-    ((obj)->dslots ? (uint32)(obj)->dslots[-1] : (uint32)JS_INITIAL_NSLOTS)
+    (DSLOTS_IS_NOT_NULL(obj) ? (uint32)(obj)->dslots[-1] : (uint32)JS_INITIAL_NSLOTS)
 
-#define STOBJ_GET_SLOT(obj,slot)                                              \
-    ((slot) < JS_INITIAL_NSLOTS                                               \
-     ? (obj)->fslots[(slot)]                                                  \
-     : (JS_ASSERT((slot) < (uint32)(obj)->dslots[-1]),                        \
-        (obj)->dslots[(slot) - JS_INITIAL_NSLOTS]))
+inline jsval&
+STOBJ_GET_SLOT(JSObject *obj, uintN slot)
+{
+    return (slot < JS_INITIAL_NSLOTS)
+           ? obj->fslots[slot]
+           : (JS_ASSERT(slot < (uint32)obj->dslots[-1]),
+              obj->dslots[slot - JS_INITIAL_NSLOTS]);
+}
 
-#define STOBJ_SET_SLOT(obj,slot,value)                                        \
-    ((slot) < JS_INITIAL_NSLOTS                                               \
-     ? (obj)->fslots[(slot)] = (value)                                        \
-     : (JS_ASSERT((slot) < (uint32)(obj)->dslots[-1]),                        \
-        (obj)->dslots[(slot) - JS_INITIAL_NSLOTS] = (value)))
+inline void
+STOBJ_SET_SLOT(JSObject *obj, uintN slot, jsval value)
+{
+    if (slot < JS_INITIAL_NSLOTS) {
+        obj->fslots[slot] = value;
+    } else {
+        JS_ASSERT(slot < (uint32)obj->dslots[-1]);
+        obj->dslots[slot - JS_INITIAL_NSLOTS] = value;
+    }
+}
 
 inline JSClass*
 STOBJ_GET_CLASS(const JSObject* obj)
@@ -492,7 +501,7 @@ OBJ_IS_CLONED_BLOCK(JSObject *obj)
 }
 
 extern JSBool
-js_DefineBlockVariable(JSContext *cx, JSObject *obj, jsid id, int16 index);
+js_DefineBlockVariable(JSContext *cx, JSObject *obj, jsid id, intN index);
 
 #define OBJ_BLOCK_COUNT(cx,obj)                                               \
     (OBJ_SCOPE(obj)->entryCount)
@@ -654,7 +663,7 @@ js_ShrinkSlots(JSContext *cx, JSObject *obj, size_t nslots);
 static inline void
 js_FreeSlots(JSContext *cx, JSObject *obj)
 {
-    if (obj->dslots)
+    if (DSLOTS_IS_NOT_NULL(obj))
         js_ShrinkSlots(cx, obj, 0);
 }
 
@@ -979,19 +988,32 @@ js_GetterOnlyPropertyStub(JSContext *cx, JSObject *obj, jsval id, jsval *vp);
 
 /*
  * If an object is "similar" to its prototype, it can share OBJ_SCOPE(proto)->emptyScope.
- * Similar objects have the same JSObjectOps and the same JSClass.
+ * Similar objects have the same JSObjectOps and the same private and reserved slots.
  *
  * We assume that if prototype and object are of the same class, they always
  * have the same number of computed reserved slots (returned via
  * clasp->reserveSlots). This is true for builtin classes (except Block, and
  * for this reason among others Blocks must never be exposed to scripts).
+ *
+ * Otherwise, prototype and object classes must have the same (null or not)
+ * reserveSlots hook.
+ *
+ * FIXME: This fails to distinguish between objects with different addProperty
+ * hooks. See bug 505523.
  */
 static inline bool
 js_ObjectIsSimilarToProto(JSContext *cx, JSObject *obj, const JSObjectOps *ops,
                           JSClass *clasp, JSObject *proto)
 {
     JS_ASSERT(proto == OBJ_GET_PROTO(cx, obj));
-    return (proto->map->ops == ops && OBJ_GET_CLASS(cx, proto) == clasp);
+
+    JSClass *protoclasp;
+    return (proto->map->ops == ops &&
+            ((protoclasp = OBJ_GET_CLASS(cx, proto)) == clasp ||
+             (!((protoclasp->flags ^ clasp->flags) &
+                (JSCLASS_HAS_PRIVATE |
+                 (JSCLASS_RESERVED_SLOTS_MASK << JSCLASS_RESERVED_SLOTS_SHIFT))) &&
+              protoclasp->reserveSlots == clasp->reserveSlots)));
 }
 
 #ifdef DEBUG

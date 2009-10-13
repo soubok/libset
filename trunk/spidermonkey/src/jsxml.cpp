@@ -3385,9 +3385,9 @@ Descendants(JSContext *cx, JSXML *xml, jsval id)
 
     /*
      * Protect nameqn's object and strings from GC by linking list to it
-     * temporarily.  The cx->newborn[GCX_OBJECT] GC root protects listobj,
-     * which protects list.  Any other object allocations occuring beneath
-     * DescendantsHelper use local roots.
+     * temporarily.  The newborn GC root for the last allocated object
+     * protects listobj, which protects list. Any other object allocations
+     * occurring beneath DescendantsHelper use local roots.
      */
     list->name = nameqn;
     if (!js_EnterLocalRootScope(cx))
@@ -5466,20 +5466,14 @@ xml_attribute(JSContext *cx, uintN argc, jsval *vp)
 static JSBool
 xml_attributes(JSContext *cx, uintN argc, jsval *vp)
 {
-    jsval name;
-    JSObject *qn;
-    JSTempValueRooter tvr;
-    JSBool ok;
-
-    name = ATOM_KEY(cx->runtime->atomState.starAtom);
-    qn = ToAttributeName(cx, name);
+    jsval name = ATOM_KEY(cx->runtime->atomState.starAtom);
+    JSObject *qn = ToAttributeName(cx, name);
     if (!qn)
         return JS_FALSE;
     name = OBJECT_TO_JSVAL(qn);
-    JS_PUSH_SINGLE_TEMP_ROOT(cx, name, &tvr);
-    ok = GetProperty(cx, JS_THIS_OBJECT(cx, vp), name, vp);
-    JS_POP_TEMP_ROOT(cx, &tvr);
-    return ok;
+
+    JSAutoTempValueRooter tvr(cx, name);
+    return GetProperty(cx, JS_THIS_OBJECT(cx, vp), name, vp);
 }
 
 static JSXML *
@@ -7188,9 +7182,7 @@ uint32  xml_serial;
 JSXML *
 js_NewXML(JSContext *cx, JSXMLClass xml_class)
 {
-    JSXML *xml;
-
-    xml = (JSXML *) js_NewGCXML(cx, GCX_XML);
+    JSXML *xml = js_NewGCXML(cx);
     if (!xml)
         return NULL;
 

@@ -91,7 +91,6 @@
 
 namespace nanojit
 {
-    const int NJ_LOG2_PAGE_SIZE = 12;       // 4K
     const int NJ_MAX_REGISTERS = 24; // gpregs, x87 regs, xmm regs
 
     #define NJ_MAX_STACK_ENTRY 256
@@ -153,6 +152,10 @@ namespace nanojit
 
     static const RegisterMask AllowableFlagRegs = 1<<EAX |1<<ECX | 1<<EDX | 1<<EBX;
 
+    static inline bool isValidDisplacement(int32_t d) {
+        return true;
+    }
+
     #define _rmask_(r)      (1<<(r))
     #define _is_xmm_reg_(r) ((_rmask_(r)&XmmRegs)!=0)
     #define _is_x87_reg_(r) ((_rmask_(r)&x87Regs)!=0)
@@ -168,15 +171,16 @@ namespace nanojit
     #define DECLARE_PLATFORM_REGALLOC()
 
     #define DECLARE_PLATFORM_ASSEMBLER()    \
-        const static Register argRegs[2], retRegs[2]; \
-        bool x87Dirty;                      \
-        bool pad[3];\
+        const static Register argRegs[2], retRegs[2];\
+        int32_t max_stk_args;\
         void nativePageReset();\
         void nativePageSetup();\
         void underrunProtect(int);\
-        void asm_farg(LInsp);\
+        void asm_stkarg(LInsp p, int32_t& stkd);\
+        void asm_farg(LInsp, int32_t& stkd);\
+        void asm_arg(ArgSize sz, LInsp p, Register r, int32_t& stkd);\
+        void asm_fcmp(LIns *cond);\
         void asm_cmp(LIns *cond);\
-        void asm_fcmp(LIns *cond); \
         void asm_div_mod(LIns *cond);
 
     #define swapptrs()  { NIns* _tins = _nIns; _nIns=_nExitIns; _nExitIns=_tins; }
@@ -447,9 +451,7 @@ namespace nanojit
     } while (0)
 
 // load 8-bit, zero extend
-// note, only 5-bit offsets (!) are supported for this, but that's all we need at the moment
-// (movzx actually allows larger offsets mode but 5-bit gives us advantage in Thumb mode)
-#define LD8Z(r,d,b)    do { count_ld(); NanoAssert((d)>=0&&(d)<=31); ALU2m(0x0fb6,r,d,b); asm_output("movzx %s,%d(%s)", gpn(r),d,gpn(b)); } while(0)
+#define LD8Z(r,d,b)    do { count_ld(); ALU2m(0x0fb6,r,d,b); asm_output("movzx %s,%d(%s)", gpn(r),d,gpn(b)); } while(0)
 
 #define LD8Zdm(r,addr) do { \
     count_ld(); \
@@ -513,11 +515,6 @@ namespace nanojit
     NanoAssert(((unsigned)r)<8); \
     *(--_nIns) = (uint8_t) ( 0x50 | (r) );  \
     asm_output("push %s",gpn(r)); } while(0)
-
-#define PUSHm(d,b) do { \
-    count_pushld();\
-    ALUm(0xff, 6, d, b);        \
-    asm_output("push %d(%s)",d,gpn(b)); } while(0)
 
 #define POPr(r) do { \
     count_pop();\
@@ -700,7 +697,7 @@ namespace nanojit
 
 #define SSE_MOVDm(d,b,xrs) do {\
     count_st();\
-    NanoAssert(_is_xmm_reg_(xrs) && _is_gp_reg_(b));\
+    NanoAssert(_is_xmm_reg_(xrs) && (_is_gp_reg_(b) || b==FP));\
     SSEm(0x660f7e, (xrs)&7, d, b);\
     asm_output("movd %d(%s),%s", d, gpn(b), gpn(xrs));\
     } while(0)

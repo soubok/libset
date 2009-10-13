@@ -1012,19 +1012,14 @@ namespace nanojit
 
     class LirWriter
     {
+        LInsp insDisp(LInsp base, int32_t& d) {
+            if (!isValidDisplacement(d)) {
+                base = ins2i(LIR_piadd, base, d);
+                d = 0;
+            }
+            return base;
+        }
     public:
-        inline void*
-        operator new(size_t size)
-        {
-            return calloc(1, size);
-        }
-
-        inline void
-        operator delete(void *p)
-        {
-            free(p);
-        }
-
         LirWriter *out;
 
         LirWriter(LirWriter* out)
@@ -1064,9 +1059,11 @@ namespace nanojit
             return out->insImmf(d);
         }
         virtual LInsp insLoad(LOpcode op, LIns* base, int32_t d) {
+            base = insDisp(base, d);
             return out->insLoad(op, base, d);
         }
         virtual LInsp insStorei(LIns* value, LIns* base, int32_t d) {
+            base = insDisp(base, d);
             return out->insStorei(value, base, d);
         }
         virtual LInsp insCall(const CallInfo *call, LInsp args[]) {
@@ -1078,6 +1075,13 @@ namespace nanojit
         }
         virtual LInsp insSkip(size_t size) {
             return out->insSkip(size);
+        }
+        void insAssert(LIns* expr) {
+            #if defined DEBUG
+            LIns* branch = insBranch(LIR_jt, expr, NULL);
+            ins0(LIR_dbreak);
+            branch->setTarget(ins0(LIR_label));
+            #endif
         }
 
         // convenience functions
@@ -1113,6 +1117,7 @@ namespace nanojit
         class Entry
         {
         public:
+            Entry(int) : name(0), size(0), align(0) {}
             Entry(char *n, size_t s, size_t a) : name(n),size(s),align(a) {}
             char* name;
             size_t size:29, align:3;
@@ -1151,6 +1156,7 @@ namespace nanojit
         class Entry
         {
         public:
+            Entry(int) : name(0) {}
             Entry(char* n) : name(n) {}
             char* name;
         };
@@ -1356,6 +1362,9 @@ namespace nanojit
             LInsp state,param1,sp,rp;
             LInsp savedRegs[NumSavedRegs];
 
+        protected:
+            friend class LirBufWriter;
+
             /** each chunk is just a raw area of LIns instances, with no header
                 and no more than 8-byte alignment.  The chunk size is somewhat arbitrary
                 as long as it's well larger than 2*sizeof(LInsSk) */
@@ -1370,9 +1379,6 @@ namespace nanojit
              *  size.  We require that a skip's payload be adjacent to the skip LIns
              *  itself. */
             static const size_t MAX_SKIP_PAYLOAD_SZB = MAX_LINS_SZB - sizeof(LInsSk);
-
-        protected:
-            friend class LirBufWriter;
 
             /** get CHUNK_SZB more memory for LIR instructions */
             void        chunkAlloc();
@@ -1446,7 +1452,7 @@ namespace nanojit
 
     class Assembler;
 
-    void compile(Assembler *assm, Fragment *frag, Allocator& alloc verbose_only(, LabelMap*));
+    void compile(Assembler *assm, Fragment *frag verbose_only(, Allocator& alloc, LabelMap*));
     verbose_only(void live(Allocator& alloc, Fragment *frag, LirBuffer *lirbuf);)
 
     class StackFilter: public LirFilter

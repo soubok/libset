@@ -2270,7 +2270,7 @@ enumerateNextChars(JSContext *cx, RENode *node, CharSet &set)
 
 class RegExpNativeCompiler {
  private:
-    VMAllocator      tempAlloc;
+    VMAllocator&     tempAlloc;
     JSContext*       cx;
     JSRegExp*        re;
     CompilerState*   cs;            /* RegExp to compile */
@@ -3083,16 +3083,16 @@ class RegExpNativeCompiler {
 
         Allocator &alloc = *JS_TRACE_MONITOR(cx).dataAlloc;
 
-        GuardRecord* guard = (GuardRecord *)
-            alloc.alloc(sizeof(GuardRecord) +
-                        sizeof(SideExit) +
-                        (re_length-1) * sizeof(jschar));
-        memset(guard, 0, sizeof(*guard));
-        SideExit* exit = (SideExit*)(guard+1);
+        /* Must only create a VMSideExit; see StackFilter::getTops. */
+        size_t len = (sizeof(GuardRecord) +
+                      sizeof(VMSideExit) +
+                      (re_length-1) * sizeof(jschar));
+        GuardRecord* guard = (GuardRecord *) alloc.alloc(len);
+        VMSideExit* exit = (VMSideExit*)(guard+1);
         guard->exit = exit;
         guard->exit->target = fragment;
         fragment->lastIns = lir->insGuard(LIR_x, NULL, guard);
-        // guard->profCount is memset'd to zero
+        // guard->profCount is calloc'd to zero
         verbose_only(
             guard->profGuardID = fragment->guardNumberer++;
             guard->nextInFrag = fragment->guardsForFrag;
@@ -3103,7 +3103,14 @@ class RegExpNativeCompiler {
 
  public:
     RegExpNativeCompiler(JSContext* cx, JSRegExp* re, CompilerState* cs, Fragment* fragment)
-        : cx(cx), re(re), cs(cs), fragment(fragment), lir(NULL), lirBufWriter(NULL) {  }
+        : tempAlloc(*JS_TRACE_MONITOR(cx).reTempAlloc), cx(cx),
+          re(re), cs(cs), fragment(fragment), lir(NULL), lirBufWriter(NULL) {  }
+
+    ~RegExpNativeCompiler() {
+        /* Purge the tempAlloc used during recording. */
+        tempAlloc.reset();
+        JS_TRACE_MONITOR(cx).reLirBuf->clear();
+    }
 
     JSBool compile()
     {
@@ -3190,7 +3197,16 @@ class RegExpNativeCompiler {
 
         if (outOfMemory())
             goto fail;
-        ::compile(assm, fragment, tempAlloc verbose_only(, tm->labels));
+
+        /*
+         * Deep in the nanojit compiler, the StackFilter is trying to throw
+         * away stores above the VM interpreter/native stacks. We have no such
+         * stacks, so rely on the fact that lirbuf->sp and lirbuf->rp are null
+         * to ensure our stores are ignored.
+         */
+        JS_ASSERT(!lirbuf->sp && !lirbuf->rp);
+
+        ::compile(assm, fragment verbose_only(, tempAlloc, tm->labels));
         if (assm->error() != nanojit::None)
             goto fail;
 
@@ -3220,6 +3236,9 @@ class RegExpNativeCompiler {
             re->flags |= JSREG_NOCOMPILE;
             delete lirBufWriter;
         }
+#ifdef DEBUG
+        delete sanity_filter;
+#endif
 #ifdef NJ_VERBOSE
         debug_only_stmt( if (js_LogController.lcbits & LC_TMRegexp)
                              delete lir; )
@@ -4900,17 +4919,13 @@ js_ExecuteRegExp(JSContext *cx, JSRegExp *re, JSString *str, size_t *indexp,
     ok = js_DefineProperty(cx, obj, id, val,                                  \
                            JS_PropertyStub, JS_PropertyStub,                  \
                            JSPROP_ENUMERATE);                                 \
-    if (!ok) {                                                                \
-        cx->weakRoots.newborn[GCX_OBJECT] = NULL;                             \
-        cx->weakRoots.newborn[GCX_STRING] = NULL;                             \
+    if (!ok)                                                                  \
         goto out;                                                             \
-    }                                                                         \
 }
 
         matchstr = js_NewDependentString(cx, str, cp - str->chars(),
                                          matchlen);
         if (!matchstr) {
-            cx->weakRoots.newborn[GCX_OBJECT] = NULL;
             ok = JS_FALSE;
             goto out;
         }
@@ -4947,8 +4962,6 @@ js_ExecuteRegExp(JSContext *cx, JSRegExp *re, JSString *str, size_t *indexp,
                                     res->moreLength * sizeof(JSSubString));
                 }
                 if (!morepar) {
-                    cx->weakRoots.newborn[GCX_OBJECT] = NULL;
-                    cx->weakRoots.newborn[GCX_STRING] = NULL;
                     ok = JS_FALSE;
                     goto out;
                 }
@@ -4972,19 +4985,14 @@ js_ExecuteRegExp(JSContext *cx, JSRegExp *re, JSString *str, size_t *indexp,
                                                str->chars(),
                                                parsub->length);
                 if (!parstr) {
-                    cx->weakRoots.newborn[GCX_OBJECT] = NULL;
-                    cx->weakRoots.newborn[GCX_STRING] = NULL;
                     ok = JS_FALSE;
                     goto out;
                 }
                 ok = js_DefineProperty(cx, obj, INT_TO_JSID(num + 1), STRING_TO_JSVAL(parstr),
                                        NULL, NULL, JSPROP_ENUMERATE);
             }
-            if (!ok) {
-                cx->weakRoots.newborn[GCX_OBJECT] = NULL;
-                cx->weakRoots.newborn[GCX_STRING] = NULL;
+            if (!ok)
                 goto out;
-            }
         }
         if (parsub->index == -1) {
             res->lastParen = js_EmptySubString;
@@ -5826,3 +5834,19 @@ js_CloneRegExpObject(JSContext *cx, JSObject *obj, JSObject *parent)
     return clone;
 }
 
+bool
+js_ContainsRegExpMetaChars(const jschar *chars, size_t length)
+{
+    for (size_t i = 0; i < length; ++i) {
+        jschar c = chars[i];
+        switch (c) {
+          /* Taken from the PatternCharacter production in 15.10.1. */
+          case '^': case '$': case '\\': case '.': case '*': case '+':
+          case '?': case '(': case ')': case '[': case ']': case '{':
+          case '}': case '|':
+            return true;
+          default:;
+        }
+    }
+    return false;
+}

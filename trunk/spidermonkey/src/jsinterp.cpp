@@ -246,6 +246,8 @@ js_FillPropertyCache(JSContext *cx, JSObject *obj,
             SPROP_HAS_VALID_SLOT(sprop, scope)) {
             /* Great, let's cache sprop's slot and use it on cache hit. */
             vword = SLOT_TO_PCVAL(sprop->slot);
+            if (sprop->slot >= JS_INITIAL_NSLOTS && !DSLOTS_IS_NOT_NULL(obj))
+                DSLOTS_BUMP(obj);
         } else {
             /* Best we can do is to cache sprop (still a nice speedup). */
             vword = SPROP_TO_PCVAL(sprop);
@@ -997,49 +999,35 @@ JSClass js_NoSuchMethodClass = {
 JS_STATIC_INTERPRET JSBool
 js_OnUnknownMethod(JSContext *cx, jsval *vp)
 {
-    JSObject *obj;
-    jsid id;
-    JSTempValueRooter tvr;
-    JSBool ok;
-
     JS_ASSERT(!JSVAL_IS_PRIMITIVE(vp[1]));
-    obj = JSVAL_TO_OBJECT(vp[1]);
-    JS_PUSH_SINGLE_TEMP_ROOT(cx, JSVAL_NULL, &tvr);
 
-    MUST_FLOW_THROUGH("out");
-    id = ATOM_TO_JSID(cx->runtime->atomState.noSuchMethodAtom);
-    ok = js_GetMethod(cx, obj, id, JSGET_NO_METHOD_BARRIER, &tvr.u.value);
-    if (!ok)
-        goto out;
-    if (JSVAL_IS_PRIMITIVE(tvr.u.value)) {
-        vp[0] = tvr.u.value;
+    JSObject *obj = JSVAL_TO_OBJECT(vp[1]);
+    jsid id = ATOM_TO_JSID(cx->runtime->atomState.noSuchMethodAtom);
+    JSAutoTempValueRooter tvr(cx, JSVAL_NULL);
+    if (!js_GetMethod(cx, obj, id, JSGET_NO_METHOD_BARRIER, tvr.addr()))
+        return false;
+    if (JSVAL_IS_PRIMITIVE(tvr.value())) {
+        vp[0] = tvr.value();
     } else {
 #if JS_HAS_XML_SUPPORT
         /* Extract the function name from function::name qname. */
         if (!JSVAL_IS_PRIMITIVE(vp[0])) {
             obj = JSVAL_TO_OBJECT(vp[0]);
-            ok = js_IsFunctionQName(cx, obj, &id);
-            if (!ok)
-                goto out;
+            if (!js_IsFunctionQName(cx, obj, &id))
+                return false;
             if (id != 0)
                 vp[0] = ID_TO_VALUE(id);
         }
 #endif
         obj = js_NewObjectWithGivenProto(cx, &js_NoSuchMethodClass,
                                          NULL, NULL);
-        if (!obj) {
-            ok = JS_FALSE;
-            goto out;
-        }
-        obj->fslots[JSSLOT_FOUND_FUNCTION] = tvr.u.value;
+        if (!obj)
+            return false;
+        obj->fslots[JSSLOT_FOUND_FUNCTION] = tvr.value();
         obj->fslots[JSSLOT_SAVED_ID] = vp[0];
         vp[0] = OBJECT_TO_JSVAL(obj);
     }
-    ok = JS_TRUE;
-
-  out:
-    JS_POP_TEMP_ROOT(cx, &tvr);
-    return ok;
+    return true;
 }
 
 static JS_REQUIRES_STACK JSBool
@@ -1502,7 +1490,7 @@ js_Execute(JSContext *cx, JSObject *chain, JSScript *script,
         frame.callobj = down->callobj;
         frame.argsobj = down->argsobj;
         frame.varobj = down->varobj;
-        frame.fun = down->fun;
+        frame.fun = (script->staticLevel > 0) ? down->fun : NULL;
         frame.thisv = down->thisv;
         if (down->flags & JSFRAME_COMPUTED_THIS)
             flags |= JSFRAME_COMPUTED_THIS;
@@ -1537,11 +1525,11 @@ js_Execute(JSContext *cx, JSObject *chain, JSScript *script,
 #if JS_HAS_SHARP_VARS
         JS_STATIC_ASSERT(SHARP_NSLOTS == 2);
 
-        if (script->flags & JSSF_HAS_SHARPS) {
+        if (script->hasSharps) {
             JS_ASSERT(script->nfixed >= SHARP_NSLOTS);
             jsval *sharps = &frame.slots[script->nfixed - SHARP_NSLOTS];
 
-            if (down && down->script && (down->script->flags & JSSF_HAS_SHARPS)) {
+            if (down && down->script && down->script->hasSharps) {
                 JS_ASSERT(down->script->nfixed >= SHARP_NSLOTS);
                 int base = (down->fun && !(down->flags & JSFRAME_SPECIAL))
                            ? down->fun->sharpSlotBase(cx)
@@ -1555,9 +1543,8 @@ js_Execute(JSContext *cx, JSObject *chain, JSScript *script,
             } else {
                 sharps[0] = sharps[1] = JSVAL_VOID;
             }
-        } else
+        }
 #endif
-            JS_ASSERT_IF(down, script->nfixed == 0);
     } else {
         frame.slots = NULL;
     }
@@ -1876,10 +1863,8 @@ js_InvokeConstructor(JSContext *cx, uintN argc, JSBool clampReturn, jsval *vp)
 
     /* Now we have an object with a constructor method; call it. */
     vp[1] = OBJECT_TO_JSVAL(obj);
-    if (!js_Invoke(cx, argc, vp, JSINVOKE_CONSTRUCT)) {
-        cx->weakRoots.newborn[GCX_OBJECT] = NULL;
+    if (!js_Invoke(cx, argc, vp, JSINVOKE_CONSTRUCT))
         return JS_FALSE;
-    }
 
     /* Check the return value and if it's primitive, force it to be obj. */
     rval = *vp;
@@ -2554,7 +2539,7 @@ AssertValidPropertyCacheHit(JSContext *cx, JSScript *script, JSFrameRegs& regs,
 
     JSObject *obj, *pobj;
     JSProperty *prop;
-    bool ok;
+    JSBool ok;
 
     if (JOF_OPMODE(*regs.pc) == JOF_NAME) {
         ok = js_FindProperty(cx, ATOM_TO_JSID(atom), &obj, &pobj, &prop);
@@ -2804,21 +2789,6 @@ js_Interpret(JSContext *cx)
 
 #endif /* !JS_THREADED_INTERP */
 
-#ifdef JS_TRACER
-    /* We had better not be entering the interpreter from JIT-compiled code. */
-    TraceRecorder *tr = TRACE_RECORDER(cx);
-    SET_TRACE_RECORDER(cx, NULL);
-
-    /* If a recorder is pending and we try to re-enter the interpreter, flag
-       the recorder to be destroyed when we return. */
-    if (tr) {
-        if (tr->wasDeepAborted())
-            tr->removeFragmentReferences();
-        else
-            tr->pushAbortStack();
-    }
-#endif
-
     /* Check for too deep of a native thread stack. */
     JS_CHECK_RECURSION(cx, return JS_FALSE);
 
@@ -2880,27 +2850,32 @@ js_Interpret(JSContext *cx)
 #define MONITOR_BRANCH_TRACEVIS
 #endif
 
-#define MONITOR_BRANCH()                                                      \
+#define RESTORE_INTERP_VARS()                                                 \
+    JS_BEGIN_MACRO                                                            \
+        fp = cx->fp;                                                          \
+        script = fp->script;                                                  \
+        atoms = FrameAtomBase(cx, fp);                                        \
+        currentVersion = (JSVersion) script->version;                         \
+        JS_ASSERT(fp->regs == &regs);                                         \
+        if (cx->throwing)                                                     \
+            goto error;                                                       \
+    JS_END_MACRO
+
+#define MONITOR_BRANCH(reason)                                                \
     JS_BEGIN_MACRO                                                            \
         if (TRACING_ENABLED(cx)) {                                            \
-            if (js_MonitorLoopEdge(cx, inlineCallCount)) {                    \
+            if (js_MonitorLoopEdge(cx, inlineCallCount, reason)) {            \
                 JS_ASSERT(TRACE_RECORDER(cx));                                \
                 MONITOR_BRANCH_TRACEVIS;                                      \
                 ENABLE_INTERRUPTS();                                          \
             }                                                                 \
-            fp = cx->fp;                                                      \
-            script = fp->script;                                              \
-            atoms = FrameAtomBase(cx, fp);                                    \
-            currentVersion = (JSVersion) script->version;                     \
-            JS_ASSERT(fp->regs == &regs);                                     \
-            if (cx->throwing)                                                 \
-                goto error;                                                   \
+            RESTORE_INTERP_VARS();                                            \
         }                                                                     \
     JS_END_MACRO
 
 #else /* !JS_TRACER */
 
-#define MONITOR_BRANCH() ((void) 0)
+#define MONITOR_BRANCH(reason) ((void) 0)
 
 #endif /* !JS_TRACER */
 
@@ -2926,13 +2901,13 @@ js_Interpret(JSContext *cx)
             CHECK_BRANCH();                                                   \
             if (op == JSOP_NOP) {                                             \
                 if (TRACE_RECORDER(cx)) {                                     \
-                    MONITOR_BRANCH();                                         \
+                    MONITOR_BRANCH(Monitor_Branch);                           \
                     op = (JSOp) *regs.pc;                                     \
                 } else {                                                      \
                     op = (JSOp) *++regs.pc;                                   \
                 }                                                             \
             } else if (op == JSOP_TRACE) {                                    \
-                MONITOR_BRANCH();                                             \
+                MONITOR_BRANCH(Monitor_Branch);                               \
                 op = (JSOp) *regs.pc;                                         \
             }                                                                 \
         }                                                                     \
@@ -3014,6 +2989,15 @@ js_Interpret(JSContext *cx)
         }
     }
 #endif /* JS_HAS_GENERATORS */
+
+#ifdef JS_TRACER
+    /*
+     * We cannot reenter the interpreter while recording; wait to abort until
+     * after cx->fp->regs is set.
+     */
+    if (TRACE_RECORDER(cx))
+        js_AbortRecording(cx, "attempt to reenter interpreter while recording");
+#endif
 
     /*
      * It is important that "op" be initialized before calling DO_OP because
@@ -3308,15 +3292,6 @@ js_Interpret(JSContext *cx)
         js_SetVersion(cx, originalVersion);
     --cx->interpLevel;
 
-#ifdef JS_TRACER
-    if (tr) {
-        SET_TRACE_RECORDER(cx, tr);
-        if (!tr->wasDeepAborted()) {
-            tr->popAbortStack();
-            tr->deepAbort();
-        }
-    }
-#endif
     return ok;
 
   atom_not_defined:
