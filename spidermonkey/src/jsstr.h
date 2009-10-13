@@ -68,6 +68,8 @@ enum {
 extern jschar *
 js_GetDependentStringChars(JSString *str);
 
+JS_STATIC_ASSERT(JS_BITS_PER_WORD >= 32);
+
 /*
  * The GC-thing "string" type.
  *
@@ -154,7 +156,7 @@ struct JSString {
          * enumeration type requires an explicit cast" unless we cast to size_t
          * here.
          */
-        DEPENDENT_LENGTH_BITS = size_t(LENGTH_BITS) / 2,
+        DEPENDENT_LENGTH_BITS = 8,
         DEPENDENT_LENGTH_MASK = JSSTRING_BITMASK(DEPENDENT_LENGTH_BITS),
         DEPENDENT_START_BITS =  LENGTH_BITS - DEPENDENT_LENGTH_BITS,
         DEPENDENT_START_SHIFT = DEPENDENT_LENGTH_BITS,
@@ -680,20 +682,17 @@ js_CompareStrings(JSString *str1, JSString *str2);
 
 /*
  * Boyer-Moore-Horspool superlinear search for pat:patlen in text:textlen.
- * The patlen argument must be positive and no greater than BMH_PATLEN_MAX.
- * The start argument tells where in text to begin the search.
+ * The patlen argument must be positive and no greater than sBMHPatLenMax.
  *
  * Return the index of pat in text, or -1 if not found.
  */
-#define BMH_CHARSET_SIZE 256    /* ISO-Latin-1 */
-#define BMH_PATLEN_MAX   255    /* skip table element is uint8 */
-
-#define BMH_BAD_PATTERN  (-2)   /* return value if pat is not ISO-Latin-1 */
+static const jsuint sBMHCharSetSize = 256; /* ISO-Latin-1 */
+static const jsuint sBMHPatLenMax   = 255; /* skip table element is uint8 */
+static const jsint  sBMHBadPattern  = -2;  /* return value if pat is not ISO-Latin-1 */
 
 extern jsint
-js_BoyerMooreHorspool(const jschar *text, jsint textlen,
-                      const jschar *pat, jsint patlen,
-                      jsint start);
+js_BoyerMooreHorspool(const jschar *text, jsuint textlen,
+                      const jschar *pat, jsuint patlen);
 
 extern size_t
 js_strlen(const jschar *s);

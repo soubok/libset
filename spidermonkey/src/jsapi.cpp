@@ -572,61 +572,51 @@ JS_ValueToSource(JSContext *cx, jsval v)
 JS_PUBLIC_API(JSBool)
 JS_ValueToNumber(JSContext *cx, jsval v, jsdouble *dp)
 {
-    JSTempValueRooter tvr;
-
     CHECK_REQUEST(cx);
-    JS_PUSH_SINGLE_TEMP_ROOT(cx, v, &tvr);
-    *dp = js_ValueToNumber(cx, &tvr.u.value);
-    JS_POP_TEMP_ROOT(cx, &tvr);
-    return !JSVAL_IS_NULL(tvr.u.value);
+
+    JSAutoTempValueRooter tvr(cx, v);
+    *dp = js_ValueToNumber(cx, tvr.addr());
+    return !JSVAL_IS_NULL(tvr.value());
 }
 
 JS_PUBLIC_API(JSBool)
 JS_ValueToECMAInt32(JSContext *cx, jsval v, int32 *ip)
 {
-    JSTempValueRooter tvr;
-
     CHECK_REQUEST(cx);
-    JS_PUSH_SINGLE_TEMP_ROOT(cx, v, &tvr);
-    *ip = js_ValueToECMAInt32(cx, &tvr.u.value);
-    JS_POP_TEMP_ROOT(cx, &tvr);
-    return !JSVAL_IS_NULL(tvr.u.value);
+
+    JSAutoTempValueRooter tvr(cx, v);
+    *ip = js_ValueToECMAInt32(cx, tvr.addr());
+    return !JSVAL_IS_NULL(tvr.value());
 }
 
 JS_PUBLIC_API(JSBool)
 JS_ValueToECMAUint32(JSContext *cx, jsval v, uint32 *ip)
 {
-    JSTempValueRooter tvr;
-
     CHECK_REQUEST(cx);
-    JS_PUSH_SINGLE_TEMP_ROOT(cx, v, &tvr);
-    *ip = js_ValueToECMAUint32(cx, &tvr.u.value);
-    JS_POP_TEMP_ROOT(cx, &tvr);
-    return !JSVAL_IS_NULL(tvr.u.value);
+
+    JSAutoTempValueRooter tvr(cx, v);
+    *ip = js_ValueToECMAUint32(cx, tvr.addr());
+    return !JSVAL_IS_NULL(tvr.value());
 }
 
 JS_PUBLIC_API(JSBool)
 JS_ValueToInt32(JSContext *cx, jsval v, int32 *ip)
 {
-    JSTempValueRooter tvr;
-
     CHECK_REQUEST(cx);
-    JS_PUSH_SINGLE_TEMP_ROOT(cx, v, &tvr);
-    *ip = js_ValueToInt32(cx, &tvr.u.value);
-    JS_POP_TEMP_ROOT(cx, &tvr);
-    return !JSVAL_IS_NULL(tvr.u.value);
+
+    JSAutoTempValueRooter tvr(cx, v);
+    *ip = js_ValueToInt32(cx, tvr.addr());
+    return !JSVAL_IS_NULL(tvr.value());
 }
 
 JS_PUBLIC_API(JSBool)
 JS_ValueToUint16(JSContext *cx, jsval v, uint16 *ip)
 {
-    JSTempValueRooter tvr;
-
     CHECK_REQUEST(cx);
-    JS_PUSH_SINGLE_TEMP_ROOT(cx, v, &tvr);
-    *ip = js_ValueToUint16(cx, &tvr.u.value);
-    JS_POP_TEMP_ROOT(cx, &tvr);
-    return !JSVAL_IS_NULL(tvr.u.value);
+
+    JSAutoTempValueRooter tvr(cx, v);
+    *ip = js_ValueToUint16(cx, tvr.addr());
+    return !JSVAL_IS_NULL(tvr.value());
 }
 
 JS_PUBLIC_API(JSBool)
@@ -2613,12 +2603,10 @@ JS_RemoveExternalStringFinalizer(JSStringFinalizeOp finalizer)
 JS_PUBLIC_API(JSString *)
 JS_NewExternalString(JSContext *cx, jschar *chars, size_t length, intN type)
 {
-    JSString *str;
-
     CHECK_REQUEST(cx);
-    JS_ASSERT((uintN) type < (uintN) (GCX_NTYPES - GCX_EXTERNAL_STRING));
+    JS_ASSERT(uintN(type) < JS_EXTERNAL_STRING_LIMIT);
 
-    str = js_NewGCString(cx, (uintN) type + GCX_EXTERNAL_STRING);
+    JSString *str = js_NewGCExternalString(cx, uintN(type));
     if (!str)
         return NULL;
     str->initFlat(chars, length);
@@ -3042,7 +3030,6 @@ JS_DefineObject(JSContext *cx, JSObject *obj, const char *name, JSClass *clasp,
         return NULL;
     if (!DefineProperty(cx, obj, name, OBJECT_TO_JSVAL(nobj), NULL, NULL, attrs,
                         0, 0)) {
-        cx->weakRoots.newborn[GCX_OBJECT] = NULL;
         return NULL;
     }
     return nobj;
@@ -4268,7 +4255,7 @@ JS_CloneFunctionObject(JSContext *cx, JSObject *funobj, JSObject *parent)
      * but looking up the property by name instead of frame slot.
      */
     if (FUN_FLAT_CLOSURE(fun)) {
-        JS_ASSERT(funobj->dslots);
+        JS_ASSERT(DSLOTS_IS_NOT_NULL(funobj));
         if (!js_EnsureReservedSlots(cx, clone,
                                     fun->countInterpretedReservedSlots())) {
             return NULL;
@@ -4880,7 +4867,7 @@ JS_CompileUCFunctionForPrincipals(JSContext *cx, JSObject *obj,
 #endif
 
   out:
-    cx->weakRoots.newborn[JSTRACE_OBJECT] = FUN_OBJECT(fun);
+    cx->weakRoots.newbornObject = FUN_OBJECT(fun);
     JS_POP_TEMP_ROOT(cx, &tvr);
 
   out2:
@@ -5378,6 +5365,18 @@ JS_PUBLIC_API(size_t)
 JS_GetStringLength(JSString *str)
 {
     return str->length();
+}
+
+JS_PUBLIC_API(const char *)
+JS_GetStringBytesZ(JSContext *cx, JSString *str)
+{
+    return js_GetStringBytes(cx, str);
+}
+
+JS_PUBLIC_API(const jschar *)
+JS_GetStringCharsZ(JSContext *cx, JSString *str)
+{
+    return js_UndependString(cx, str);
 }
 
 JS_PUBLIC_API(intN)

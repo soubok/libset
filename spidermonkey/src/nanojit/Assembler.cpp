@@ -41,6 +41,10 @@
 
 #ifdef FEATURE_NANOJIT
 
+#ifdef VTUNE
+#include "../core/CodegenLIR.h"
+#endif
+
 namespace nanojit
 {
 #ifdef NJ_VERBOSE
@@ -96,12 +100,21 @@ namespace nanojit
      *    - merging paths ( build a graph? ), possibly use external rep to drive codegen
      */
     Assembler::Assembler(CodeAlloc& codeAlloc, Allocator& alloc, AvmCore* core, LogControl* logc)
-        : codeList(0)
+        : codeList(NULL)
         , alloc(alloc)
         , _codeAlloc(codeAlloc)
+        , _thisfrag(NULL)
         , _branchStateMap(alloc)
         , _patches(alloc)
         , _labels(alloc)
+        , _epilogue(NULL)
+        , _err(None)
+    #if PEDANTIC
+        , pedanticTop(NULL)
+    #endif
+    #ifdef VTUNE
+        , cgen(NULL)
+    #endif
         , config(core->config)
     {
         VMPI_memset(&_stats, 0, sizeof(_stats));
@@ -190,6 +203,14 @@ namespace nanojit
         verbose_only( nBytes += (end - start) * sizeof(NIns); )
         NanoAssert(uintptr_t(end) - uintptr_t(start) >= (size_t)LARGEST_UNDERRUN_PROT);
         eip = end;
+
+        #ifdef VTUNE
+        if (_nIns && _nExitIns) {
+            //cgen->jitAddRecord((uintptr_t)list->code, 0, 0, true); // add placeholder record for top of page
+            cgen->jitCodePosUpdate((uintptr_t)list->code);
+            cgen->jitPushInfo(); // new page requires new entry
+        }
+        #endif
     }
 
     void Assembler::reset()
@@ -220,7 +241,7 @@ namespace nanojit
 
     void Assembler::resourceConsistencyCheck()
     {
-        if (error()) return;
+        NanoAssert(!error());
 
 #ifdef NANOJIT_IA32
         NanoAssert((_allocator.active[FST0] && _fpuStkDepth == -1) ||
@@ -266,7 +287,7 @@ namespace nanojit
     {
         // check registers
         RegAlloc *regs = &_allocator;
-        uint32_t managed = regs->managed;
+        RegisterMask managed = regs->managed;
         Register r = FirstReg;
         while(managed)
         {
@@ -334,10 +355,14 @@ namespace nanojit
 
     Register Assembler::getBaseReg(LIns *i, int &d, RegisterMask allow)
     {
+    #if !PEDANTIC
         if (i->isop(LIR_alloc)) {
             d += findMemFor(i);
             return FP;
         }
+    #else
+        (void) d;
+    #endif
         return findRegFor(i, allow);
     }
 
@@ -390,6 +415,15 @@ namespace nanojit
             {
                 // x87 <-> xmm copy required
                 //_nvprof("fpu-evict",1);
+                evict(r, ins);
+                r = registerAlloc(prefer);
+                ins->setReg(r);
+                _allocator.addActive(r, ins);
+            } else
+#elif defined(NANOJIT_PPC)
+            if (((rmask(r)&GpRegs) && !(allow&GpRegs)) ||
+                ((rmask(r)&FpRegs) && !(allow&FpRegs)))
+            {
                 evict(r, ins);
                 r = registerAlloc(prefer);
                 ins->setReg(r);
@@ -835,7 +869,6 @@ namespace nanojit
 #define countlir_label() _nvprof("lir-label",1)
 #define countlir_xcc() _nvprof("lir-xcc",1)
 #define countlir_x() _nvprof("lir-x",1)
-#define countlir_loop() _nvprof("lir-loop",1)
 #define countlir_call() _nvprof("lir-call",1)
 #else
 #define countlir_live()
@@ -861,7 +894,6 @@ namespace nanojit
 #define countlir_label()
 #define countlir_xcc()
 #define countlir_x()
-#define countlir_loop()
 #define countlir_call()
 #endif
 
@@ -869,7 +901,7 @@ namespace nanojit
     {
         NanoAssert(_thisfrag->nStaticExits == 0);
 
-        // trace must end with LIR_x, LIR_loop, LIR_[f]ret, LIR_xtbl, or LIR_[f]live
+        // trace must end with LIR_x, LIR_[f]ret, LIR_xtbl, or LIR_[f]live
         NanoAssert(reader->pos()->isop(LIR_x) ||
                    reader->pos()->isop(LIR_ret) ||
                    reader->pos()->isop(LIR_fret) ||
@@ -1337,7 +1369,29 @@ namespace nanojit
                     evictScratchRegs();
 
                     asm_call(ins);
+                    break;
                 }
+
+                #ifdef VTUNE
+                case LIR_file:
+                {
+                    // we traverse backwards so we are now hitting the file
+                    // that is associated with a bunch of LIR_lines we already have seen
+                    uintptr_t currentFile = ins->oprnd1()->imm32();
+                    cgen->jitFilenameUpdate(currentFile);
+                    break;
+                }
+                case LIR_line:
+                {
+                    // add a new table entry, we don't yet knwo which file it belongs
+                    // to so we need to add it to the update table too
+                    // note the alloc, actual act is delayed; see above
+                    uint32_t currentLine = (uint32_t) ins->oprnd1()->imm32();
+                    cgen->jitLineNumUpdate(currentLine);
+                    cgen->jitAddRecord((uintptr_t)_nIns, 0, currentLine, true);
+                    break;
+                }
+                #endif // VTUNE
             }
 
 #ifdef NJ_VERBOSE
@@ -1383,6 +1437,10 @@ namespace nanojit
 
             if (error())
                 return;
+
+        #ifdef VTUNE
+            cgen->jitCodePosUpdate((uintptr_t)_nIns);
+        #endif
 
             // check that all is well (don't check in exit paths since its more complicated)
             debug_only( pageValidate(); )
@@ -1460,8 +1518,11 @@ namespace nanojit
 
     void Assembler::arFree(uint32_t idx)
     {
+        verbose_only( printActivationState(" >FP"); )
+
         AR &ar = _activation;
         LIns *i = ar.entry[idx];
+        NanoAssert(i != 0);
         do {
             ar.entry[idx] = 0;
             idx--;
@@ -1469,51 +1530,43 @@ namespace nanojit
     }
 
 #ifdef NJ_VERBOSE
-    void Assembler::printActivationState()
+    void Assembler::printActivationState(const char* what)
     {
-        bool verbose_activation = false;
-        if (!verbose_activation)
+        if (!(_logc->lcbits & LC_Activation))
             return;
 
-#ifdef NANOJIT_ARM
-        // @todo Why is there here?!?  This routine should be indep. of platform
-        verbose_only(
-            if (_logc->lcbits & LC_Assembly) {
-                char* s = &outline[0];
-                VMPI_memset(s, ' ', 51);  s[51] = '\0';
-                s += VMPI_strlen(s);
-                sprintf(s, " SP ");
-                s += VMPI_strlen(s);
-                for(uint32_t i=_activation.lowwatermark; i<_activation.tos;i++) {
-                    LInsp ins = _activation.entry[i];
-                    if (ins && ins !=_activation.entry[i+1]) {
-                        sprintf(s, "%d(%s) ", 4*i, _thisfrag->lirbuf->names->formatRef(ins));
-                        s += VMPI_strlen(s);
-                    }
-                }
-                output(&outline[0]);
-            }
-        )
-#else
-        verbose_only(
-            char* s = &outline[0];
-            if (_logc->lcbits & LC_Assembly) {
-                VMPI_memset(s, ' ', 51);  s[51] = '\0';
-                s += VMPI_strlen(s);
-                sprintf(s, " ebp ");
-                s += VMPI_strlen(s);
+        char* s = &outline[0];
+        VMPI_memset(s, ' ', 45);  s[45] = '\0';
+        s += VMPI_strlen(s);
+        VMPI_sprintf(s, "%s", what);
+        s += VMPI_strlen(s);
 
-                for(uint32_t i=_activation.lowwatermark; i<_activation.tos;i++) {
-                    LInsp ins = _activation.entry[i];
-                    if (ins) {
-                        sprintf(s, "%d(%s) ", -4*i,_thisfrag->lirbuf->names->formatRef(ins));
-                        s += VMPI_strlen(s);
+        int32_t max = _activation.tos < NJ_MAX_STACK_ENTRY ? _activation.tos : NJ_MAX_STACK_ENTRY;
+        for(int32_t i = _activation.lowwatermark; i < max; i++) {
+            LIns *ins = _activation.entry[i];
+            if (ins) {
+                const char* n = _thisfrag->lirbuf->names->formatRef(ins);
+                if (ins->isop(LIR_alloc)) {
+                    int32_t count = ins->size()>>2;
+                    VMPI_sprintf(s," %d-%d(%s)", 4*i, 4*(i+count-1), n);
+                    count += i-1;
+                    while (i < count) {
+                        NanoAssert(_activation.entry[i] == ins);
+                        i++;
                     }
                 }
-                output(&outline[0]);
+                else if (ins->isQuad()) {
+                    VMPI_sprintf(s," %d+(%s)", 4*i, n);
+                    NanoAssert(_activation.entry[i+1] == ins);
+                    i++;
+                }
+                else {
+                    VMPI_sprintf(s," %d(%s)", 4*i, n);
+                }
             }
-        )
-#endif
+            s += VMPI_strlen(s);
+        }
+        output(&outline[0]);
     }
 #endif
 
@@ -1533,6 +1586,7 @@ namespace nanojit
         int32_t start = ar.lowwatermark;
         int32_t i = 0;
         NanoAssert(start>0);
+        verbose_only( printActivationState(" <FP"); )
 
         if (size == 1) {
             // easy most common case -- find a hole, or make the frame bigger

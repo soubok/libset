@@ -471,7 +471,9 @@ WrapEscapingClosure(JSContext *cx, JSStackFrame *fp, JSObject *funobj, JSFunctio
      * Fill in the rest of wscript. This means if you add members to JSScript
      * you must update this code. FIXME: factor into JSScript::clone method.
      */
-    wscript->flags = script->flags;
+    wscript->noScriptRval = script->noScriptRval;
+    wscript->savedCallerFun = script->savedCallerFun;
+    wscript->hasSharps = script->hasSharps;
     wscript->version = script->version;
     wscript->nfixed = script->nfixed;
     wscript->filename = script->filename;
@@ -1410,10 +1412,14 @@ fun_resolve(JSContext *cx, JSObject *obj, jsval id, uintN flags,
     fun = GET_FUNCTION_PRIVATE(cx, obj);
 
     /*
-     * No need to reflect fun.prototype in 'fun.prototype = ... '.
+     * No need to reflect fun.prototype in 'fun.prototype = ... '. Assert that
+     * fun is not a compiler-created function object, which must never leak to
+     * script or embedding code and then be mutated.
      */
-    if (flags & JSRESOLVE_ASSIGNING)
+    if (flags & JSRESOLVE_ASSIGNING) {
+        JS_ASSERT(!js_IsInternalFunctionObject(obj));
         return JS_TRUE;
+    }
 
     /*
      * Ok, check whether id is 'prototype' and bootstrap the function object's
@@ -1421,7 +1427,7 @@ fun_resolve(JSContext *cx, JSObject *obj, jsval id, uintN flags,
      */
     atom = cx->runtime->atomState.classPrototypeAtom;
     if (id == ATOM_KEY(atom)) {
-        JSObject *proto;
+        JS_ASSERT(!js_IsInternalFunctionObject(obj));
 
         /*
          * Beware of the wacky case of a user function named Object -- trying
@@ -1434,7 +1440,8 @@ fun_resolve(JSContext *cx, JSObject *obj, jsval id, uintN flags,
          * Make the prototype object to have the same parent as the function
          * object itself.
          */
-        proto = js_NewObject(cx, &js_ObjectClass, NULL, OBJ_GET_PARENT(cx, obj));
+        JSObject *proto =
+            js_NewObject(cx, &js_ObjectClass, NULL, OBJ_GET_PARENT(cx, obj));
         if (!proto)
             return JS_FALSE;
 
@@ -1457,6 +1464,8 @@ fun_resolve(JSContext *cx, JSObject *obj, jsval id, uintN flags,
 
         atom = OFFSET_TO_ATOM(cx->runtime, lfp->atomOffset);
         if (id == ATOM_KEY(atom)) {
+            JS_ASSERT(!js_IsInternalFunctionObject(obj));
+
             if (!js_DefineNativeProperty(cx, obj,
                                          ATOM_TO_JSID(atom), JSVAL_VOID,
                                          fun_getProperty, JS_PropertyStub,
@@ -1555,7 +1564,7 @@ js_XDRFunctionObject(JSXDRState *xdr, JSObject **objp)
         nupvars = flagsword >> 16;
         fun->flags = uint16(flagsword);
         fun->u.i.skipmin = uint16(firstword >> 2);
-        fun->u.i.wrapper = (firstword >> 1) & 1;
+        fun->u.i.wrapper = JSPackedBool((firstword >> 1) & 1);
     }
 
     /* do arguments and local vars */
@@ -2342,20 +2351,16 @@ js_InitFunctionClass(JSContext *cx, JSObject *obj)
         return NULL;
     fun = js_NewFunction(cx, proto, NULL, 0, JSFUN_INTERPRETED, obj, NULL);
     if (!fun)
-        goto bad;
+        return NULL;
     fun->u.i.script = js_NewScript(cx, 1, 1, 0, 0, 0, 0, 0);
     if (!fun->u.i.script)
-        goto bad;
+        return NULL;
     fun->u.i.script->code[0] = JSOP_STOP;
     *fun->u.i.script->notes() = SRC_NULL;
 #ifdef CHECK_SCRIPT_OWNER
     fun->u.i.script->owner = NULL;
 #endif
     return proto;
-
-bad:
-    cx->weakRoots.newborn[GCX_OBJECT] = NULL;
-    return NULL;
 }
 
 JSFunction *
@@ -2920,7 +2925,7 @@ get_local_names_enumerator(JSDHashTable *table, JSDHashEntryHdr *hdr,
                   entry->localKind == JSLOCAL_CONST ||
                   entry->localKind == JSLOCAL_UPVAR);
         JS_ASSERT(entry->index < args->fun->u.i.nvars + args->fun->u.i.nupvars);
-        JS_ASSERT(args->nCopiedVars++ < args->fun->u.i.nvars + args->fun->u.i.nupvars);
+        JS_ASSERT(args->nCopiedVars++ < unsigned(args->fun->u.i.nvars + args->fun->u.i.nupvars));
         i = args->fun->nargs;
         if (entry->localKind == JSLOCAL_UPVAR)
            i += args->fun->u.i.nvars;

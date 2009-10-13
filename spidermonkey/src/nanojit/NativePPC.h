@@ -54,8 +54,6 @@
 
 namespace nanojit
 {
-    const int NJ_LOG2_PAGE_SIZE = 12;       // 4K
-
 #define NJ_MAX_STACK_ENTRY              256
 #define NJ_ALIGN_STACK                  16
 
@@ -256,6 +254,9 @@ namespace nanojit
     static const int NumSavedRegs = 18; // R13-R30
 #endif
 
+    static inline bool isValidDisplacement(int32_t d) {
+        return true;
+    }
     static inline bool IsFpReg(Register r) {
         return r >= F0;
     }

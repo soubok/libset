@@ -107,6 +107,10 @@ namespace nanojit
     typedef SeqBuilder<NIns*> NInsList;
     typedef HashMap<NIns*, LIns*> NInsMap;
 
+#ifdef VTUNE
+    class avmplus::CodegenLIR;
+#endif
+
     class LabelState
     {
     public:
@@ -157,7 +161,7 @@ namespace nanojit
             void output_asm(const char* s);
 
             bool outputAddr, vpad[3];  // if outputAddr=true then next asm instr. will include address in output
-            void printActivationState();
+            void printActivationState(const char* what);
 
             StringList* _outputCache;
 
@@ -166,10 +170,13 @@ namespace nanojit
             LogControl* _logc;
             size_t codeBytes;
             size_t exitBytes;
+            #endif // NJ_VERBOSE
+
+            #ifdef VTUNE
+            avmplus::CodegenLIR *cgen;
             #endif
 
             Assembler(CodeAlloc& codeAlloc, Allocator& alloc, AvmCore* core, LogControl* logc);
-            ~Assembler() {}
 
             void        endAssembly(Fragment* frag);
             void        assemble(Fragment* frag);
@@ -253,6 +260,9 @@ namespace nanojit
             NIns*       _nExitIns;      // current instruction in exit fragment page
             NIns*       _epilogue;
             AssmError   _err;           // 0 = means assemble() appears ok, otherwise it failed
+        #if PEDANTIC
+            NIns*       pedanticTop;
+        #endif
 
             AR          _activation;
             RegAlloc    _allocator;
@@ -273,7 +283,6 @@ namespace nanojit
             void        asm_spilli(LInsp i, bool pop);
             void        asm_spill(Register rr, int d, bool pop, bool quad);
             void        asm_load64(LInsp i);
-            void        asm_pusharg(LInsp p);
             void        asm_ret(LInsp p);
             void        asm_quad(LInsp i);
             void        asm_fcond(LInsp i);
@@ -284,7 +293,6 @@ namespace nanojit
             void        asm_cmov(LInsp i);
             void        asm_param(LInsp i);
             void        asm_int(LInsp i);
-            void        asm_short(LInsp i);
             void        asm_qlo(LInsp i);
             void        asm_qhi(LInsp i);
             void        asm_fneg(LInsp ins);
@@ -295,7 +303,6 @@ namespace nanojit
             Register    asm_prep_fcall(Reservation *rR, LInsp ins);
             void        asm_nongp_copy(Register r, Register s);
             void        asm_call(LInsp);
-            void        asm_arg(ArgSize, LInsp, Register);
             Register    asm_binop_rhs_reg(LInsp ins);
             NIns*       asm_branch(bool branchOnFalse, LInsp cond, NIns* targ);
             void        asm_switch(LIns* ins, NIns* target);
