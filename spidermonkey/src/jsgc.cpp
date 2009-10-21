@@ -898,7 +898,7 @@ DestroyGCChunk(jsuword chunk)
 #endif
 
 #if HAS_POSIX_MEMALIGN
-    js_free((void *) chunk);
+    free((void *) chunk);
 #else
     /* See comments in NewGCChunk. */
     JS_ASSERT(*GetMallocedChunkGapPtr(chunk) < GC_ARENA_SIZE);
