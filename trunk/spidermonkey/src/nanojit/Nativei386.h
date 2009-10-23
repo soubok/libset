@@ -101,9 +101,12 @@ namespace nanojit
         // then by the C functions it calls).
     const int NJ_ALIGN_STACK = 16;
 
-    const int32_t LARGEST_UNDERRUN_PROT = 3200;  // largest value passed to underrunProtect
+    const int32_t LARGEST_UNDERRUN_PROT = 32;  // largest value passed to underrunProtect
 
     typedef uint8_t NIns;
+
+    // Bytes of icache to flush after Assembler::patch
+    const size_t LARGEST_BRANCH_PATCH = 16 * sizeof(NIns);
 
     // These are used as register numbers in various parts of the code
     typedef enum
@@ -152,7 +155,7 @@ namespace nanojit
 
     static const RegisterMask AllowableFlagRegs = 1<<EAX |1<<ECX | 1<<EDX | 1<<EBX;
 
-    static inline bool isValidDisplacement(int32_t d) {
+    static inline bool isValidDisplacement(int32_t) {
         return true;
     }
 
@@ -189,6 +192,8 @@ namespace nanojit
     _nIns -= 4;     \
     *((int32_t*)_nIns) = (int32_t)(i)
 
+// XXX rearrange NanoAssert() expression to workaround apparent gcc 4.3 bug:
+// XXX "error: logical && with non-zero constant will always evaluate as true"
 #define MODRMs(r,d,b,l,i) \
         NanoAssert(unsigned(i)<8 && unsigned(b)<8 && unsigned(r)<8); \
         if ((d) == 0 && (b) != EBP) { \

@@ -40,15 +40,9 @@
  * ***** END LICENSE BLOCK ***** */
 #include "nanojit.h"
 
-#ifdef _MAC
-// for MakeDataExecutable
-#include <CoreServices/CoreServices.h>
-#endif
-
-#if defined AVMPLUS_UNIX || defined AVMPLUS_MAC
-#include <sys/mman.h>
-#include <errno.h>
-#include <stdlib.h>
+#ifdef _MSC_VER
+    // disable some specific warnings which are normally useful, but pervasive in the code-gen macros
+    #pragma warning(disable:4310) // cast truncates constant value
 #endif
 
 namespace nanojit
@@ -279,10 +273,8 @@ namespace nanojit
         intptr_t offset = intptr_t(targ) - intptr_t(branch);
         if (branch[0] == JMP32) {
             *(int32_t*)&branch[1] = offset - 5;
-            VALGRIND_DISCARD_TRANSLATIONS(&branch[1], sizeof(int32_t));
         } else if (branch[0] == JCC32) {
             *(int32_t*)&branch[2] = offset - 6;
-            VALGRIND_DISCARD_TRANSLATIONS(&branch[2], sizeof(int32_t));
         } else
             NanoAssertMsg(0, "Unknown branch type in nPatchBranch");
     }
@@ -1731,8 +1723,6 @@ namespace nanojit
         NIns *eip = _nIns;
         NanoAssertMsg(n<=LARGEST_UNDERRUN_PROT, "constant LARGEST_UNDERRUN_PROT is too small");
         if (eip - n < (_inExit ? exitStart : codeStart)) {
-            // We are done with the current page.  Tell Valgrind that new code
-            // has been generated.
             if (_inExit)
                 codeAlloc(exitStart, exitEnd, _nIns verbose_only(, exitBytes));
             else

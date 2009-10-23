@@ -75,7 +75,7 @@ public:
             memcpy(tmp, _data, _len * sizeof(T));
             _data = tmp;
         } else {
-            _data = (T*)js_realloc(_data, _max * sizeof(T));
+            _data = (T*)realloc(_data, _max * sizeof(T));
         }
 #if defined(DEBUG)
         memset(&_data[_len], 0xcd, _max - _len);
@@ -92,7 +92,7 @@ public:
 
     ~Queue() {
         if (!alloc)
-            js_free(_data);
+            free(_data);
     }
 
     bool contains(T a) {
@@ -202,7 +202,7 @@ public:
     void            clear();
 };
 
-#if defined(JS_JIT_SPEW) || defined(MOZ_NO_VARADIC_MACROS)
+#if defined(JS_JIT_SPEW) || defined(NJ_NO_VARIADIC_MACROS)
 
 enum LC_TMBits {
     /*
@@ -220,7 +220,7 @@ enum LC_TMBits {
 
 #endif
 
-#ifdef MOZ_NO_VARADIC_MACROS
+#ifdef NJ_NO_VARIADIC_MACROS
 
 #define debug_only_stmt(action)            /* */
 static void debug_only_printf(int mask, const char *fmt, ...) {}
@@ -717,7 +717,6 @@ struct InterpState
     FrameInfo**    callstackBase;       // call stack base
     uintN*         inlineCallCountp;    // inline call count counter
     VMSideExit**   innermostNestedGuardp;
-    void*          stackMark;
     VMSideExit*    innermost;
 #ifdef EXECUTE_TREE_TIMER
     uint64         startTime;
@@ -1206,13 +1205,13 @@ public:
     inline void*
     operator new(size_t size)
     {
-        return js_calloc(size);
+        return calloc(1, size);
     }
 
     inline void
     operator delete(void *p)
     {
-        js_free(p);
+        free(p);
     }
 
     JS_REQUIRES_STACK
@@ -1267,7 +1266,6 @@ public:
     unsigned getCallDepth() const;
 
     JS_REQUIRES_STACK void determineGlobalTypes(JSTraceType* typeMap);
-    nanojit::LIns* demoteIns(nanojit::LIns* ins);
 
     JS_REQUIRES_STACK VMSideExit* downSnapshot(FrameInfo* downFrame);
     JS_REQUIRES_STACK AbortableRecordingStatus upRecursion();
@@ -1315,6 +1313,7 @@ public:
     friend class SlotMap;
     friend class DefaultSlotMap;
     friend class RecursiveSlotMap;
+    friend class UpRecursiveSlotMap;
     friend jsval *js_ConcatPostImacroStackCleanup(uint32 argc, JSFrameRegs &regs,
                                                   TraceRecorder *recorder);
 };

@@ -1253,6 +1253,7 @@ obj_eval(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 #if JS_HAS_EVAL_THIS_SCOPE
     JSObject *callerScopeChain = NULL, *callerVarObj = NULL;
     JSBool setCallerScopeChain = JS_FALSE, setCallerVarObj = JS_FALSE;
+    JSTempValueRooter scopetvr, varobjtvr;
 #endif
 
     fp = js_GetTopStackFrame(cx);
@@ -1320,6 +1321,17 @@ obj_eval(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
     MUST_FLOW_THROUGH("out");
     uintN staticLevel = caller->script->staticLevel + 1;
     if (!scopeobj) {
+
+        /*
+         * Bring fp->scopeChain up to date. We're either going to use
+         * it (direct call) or save it and restore it (indirect call).
+         */
+        callerScopeChain = js_GetScopeChain(cx, caller);
+        if (!callerScopeChain) {
+            ok = JS_FALSE;
+            goto out;
+        }
+
 #if JS_HAS_EVAL_THIS_SCOPE
         /*
          * If we see an indirect call, then run eval in the global scope. We do
@@ -1329,12 +1341,6 @@ obj_eval(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
         if (indirectCall) {
             /* Pretend that we're top level. */
             staticLevel = 0;
-
-            callerScopeChain = js_GetScopeChain(cx, caller);
-            if (!callerScopeChain) {
-                ok = JS_FALSE;
-                goto out;
-            }
 
             OBJ_TO_INNER_OBJECT(cx, obj);
             if (!obj) {
@@ -1357,27 +1363,25 @@ obj_eval(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 
             /* Remember scopeobj so we can null its private when done. */
             setCallerScopeChain = JS_TRUE;
+            JS_PUSH_TEMP_ROOT_OBJECT(cx, callerScopeChain, &scopetvr);
 
             callerVarObj = caller->varobj;
             if (obj != callerVarObj) {
                 /* Set fp->varobj too, for the compiler. */
                 caller->varobj = fp->varobj = obj;
                 setCallerVarObj = JS_TRUE;
+                JS_PUSH_TEMP_ROOT_OBJECT(cx, callerVarObj, &varobjtvr);
             }
+        } else {
+            /*
+             * Compile using the caller's current scope object.
+             *
+             * NB: This means that native callers (who reach this point through
+             * the C API) must use the two parameter form.
+             */
+            scopeobj = callerScopeChain;
         }
 #endif
-
-        /*
-         * Compile using caller's current scope object.
-         *
-         * NB: This means that native callers (who reach this point through
-         * the C API) must use the two parameter form.
-         */
-        scopeobj = js_GetScopeChain(cx, caller);
-        if (!scopeobj) {
-            ok = JS_FALSE;
-            goto out;
-        }
     } else {
         scopeobj = js_GetWrappedObject(cx, scopeobj);
         OBJ_TO_INNER_OBJECT(cx, scopeobj);
@@ -1426,8 +1430,7 @@ obj_eval(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
                  * Get the prior (cache-filling) eval's saved caller function.
                  * See JSCompiler::compileScript in jsparse.cpp.
                  */
-                JSFunction *fun;
-                fun = script->getFunction(0);
+                JSFunction *fun = script->getFunction(0);
 
                 if (fun == caller->fun) {
                     /*
@@ -1446,6 +1449,7 @@ obj_eval(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
                          */
                         JSObjectArray *objarray = script->objects();
                         int i = 1;
+
                         if (objarray->length == 1) {
                             if (script->regexpsOffset != 0) {
                                 objarray = script->regexps();
@@ -1483,7 +1487,8 @@ obj_eval(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
     callerFrame = (staticLevel != 0) ? caller : NULL;
     if (!script) {
         script = JSCompiler::compileScript(cx, scopeobj, callerFrame,
-                                           principals, TCF_COMPILE_N_GO,
+                                           principals,
+                                           TCF_COMPILE_N_GO | TCF_NEED_MUTABLE_SCRIPT,
                                            str->chars(), str->length(),
                                            NULL, file, line, str, staticLevel);
         if (!script) {
@@ -1515,10 +1520,14 @@ obj_eval(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
 out:
 #if JS_HAS_EVAL_THIS_SCOPE
     /* Restore OBJ_GET_PARENT(scopeobj) not callerScopeChain in case of Call. */
-    if (setCallerScopeChain)
-        caller->scopeChain = callerScopeChain;
-    if (setCallerVarObj)
+    if (setCallerVarObj) {
         caller->varobj = callerVarObj;
+        JS_POP_TEMP_ROOT(cx, &varobjtvr);
+    }
+    if (setCallerScopeChain) {
+        caller->scopeChain = callerScopeChain;
+        JS_POP_TEMP_ROOT(cx, &scopetvr);
+    }
 #endif
     return ok;
 }
@@ -2247,9 +2256,6 @@ js_NewObjectWithGivenProto(JSContext *cx, JSClass *clasp, JSObject *proto,
         obj->map = const_cast<JSObjectMap *>(ops->objectMap);
     }
 
-    /* Check that the newborn root still holds the object. */
-    JS_ASSERT_IF(!cx->localRootStack, cx->weakRoots.newbornObject == obj);
-
     /*
      * Do not call debug hooks on trace, because we might be in a non-_FAIL
      * builtin. See bug 481444.
@@ -2260,7 +2266,7 @@ js_NewObjectWithGivenProto(JSContext *cx, JSClass *clasp, JSObject *proto,
         cx->debugHooks->objectHook(cx, obj, JS_TRUE,
                                    cx->debugHooks->objectHookData);
         JS_UNKEEP_ATOMS(cx->runtime);
-        cx->weakRoots.newbornObject = obj;
+        cx->weakRoots.finalizableNewborns[FINALIZE_OBJECT] = obj;
     }
 
 out:
@@ -5514,7 +5520,8 @@ js_GetClassPrototype(JSContext *cx, JSObject *scope, jsid id,
              * instance that delegates to this object, or just query the
              * prototype for its class.
              */
-            cx->weakRoots.newbornObject = JSVAL_TO_OBJECT(v);
+            cx->weakRoots.finalizableNewborns[FINALIZE_OBJECT] =
+                JSVAL_TO_OBJECT(v);
         }
     }
     *protop = JSVAL_IS_OBJECT(v) ? JSVAL_TO_OBJECT(v) : NULL;

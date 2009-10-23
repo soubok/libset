@@ -45,6 +45,11 @@
 #include "../core/CodegenLIR.h"
 #endif
 
+#ifdef _MSC_VER
+    // disable some specific warnings which are normally useful, but pervasive in the code-gen macros
+    #pragma warning(disable:4310) // cast truncates constant value
+#endif
+
 namespace nanojit
 {
 #ifdef NJ_VERBOSE
@@ -482,11 +487,10 @@ namespace nanojit
     {
         int d = disp(ins);
         Register r = ins->getReg();
-        bool quad = ins->opcode() == LIR_iparam || ins->isQuad();
         verbose_only( if (d && (_logc->lcbits & LC_RegAlloc)) {
                          outputForEOL("  <= spill %s",
                                       _thisfrag->lirbuf->names->formatRef(ins)); } )
-        asm_spill(r, d, pop, quad);
+        asm_spill(r, d, pop, ins->isQuad());
     }
 
     // NOTE: Because this function frees slots on the stack, it is not safe to
@@ -552,6 +556,7 @@ namespace nanojit
         Fragment *frag = lr->exit->target;
         NanoAssert(frag->fragEntry != 0);
         nPatchBranch((NIns*)lr->jmp, frag->fragEntry);
+        CodeAlloc::flushICache(lr->jmp, LARGEST_BRANCH_PATCH);
         verbose_only(verbose_outputf("patching jump at %p to target %p\n",
             lr->jmp, frag->fragEntry);)
     }
@@ -810,7 +815,7 @@ namespace nanojit
 
         // at this point all our new code is in the d-cache and not the i-cache,
         // so flush the i-cache on cpu's that need it.
-        _codeAlloc.flushICache(codeList);
+        CodeAlloc::flushICache(codeList);
 
         // save entry point pointers
         frag->fragEntry = fragEntry;
@@ -1455,13 +1460,9 @@ namespace nanojit
      */
     void Assembler::emitJumpTable(SwitchInfo* si, NIns* target)
     {
-        underrunProtect(si->count * sizeof(NIns*) + 20);
-        _nIns = reinterpret_cast<NIns*>(uintptr_t(_nIns) & ~(sizeof(NIns*) - 1));
-        for (uint32_t i = 0; i < si->count; ++i) {
-            _nIns = (NIns*) (((intptr_t) _nIns) - sizeof(NIns*));
-            *(NIns**) _nIns = target;
-        }
-        si->table = (NIns**) _nIns;
+        si->table = (NIns **) alloc.alloc(si->count * sizeof(NIns*));
+        for (uint32_t i = 0; i < si->count; ++i)
+            si->table[i] = target;
     }
 
     void Assembler::assignSavedRegs()

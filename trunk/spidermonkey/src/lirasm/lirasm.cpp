@@ -967,7 +967,7 @@ FragmentAssembler::assembleFragment(LirTokenStream &in, bool implicitBegin, cons
 static inline size_t
 rnd(size_t lim)
 {
-    size_t i = size_t(random());
+    size_t i = size_t(rand());
     return i % lim;
 }
 
@@ -975,7 +975,7 @@ rnd(size_t lim)
 static inline int32_t
 rndI32()
 {
-    return (rnd(2) ? 1 : -1) * random();
+    return (rnd(2) ? 1 : -1) * rand();
 }
 
 // The maximum number of live values (per type, ie. B/I/Q/F) that are
@@ -988,7 +988,7 @@ const size_t maxLiveValuesPerType = 20;
 static inline uint32_t
 rndU32()
 {
-    return uint32_t(rnd(2) ? 0 : RAND_MAX) + uint32_t(random());
+    return uint32_t(rnd(2) ? 0 : RAND_MAX) + uint32_t(rand());
 }
 
 template<typename t> t
@@ -1119,7 +1119,6 @@ const CallInfo ci_N_IQF = CI(f_N_IQF, argMask(I32, 1, 3) |
 //   sufficiently big that it's spread across multiple chunks.
 //
 // The following instructions aren't generated yet:
-// - dbreak (hard to test, and not implemented in NJ)
 // - iparam/qparam (hard to test beyond what is auto-generated in fragment
 //   prologues)
 // - ialloc/qalloc (except for the load/store scratch space;  hard to do so

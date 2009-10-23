@@ -297,7 +297,7 @@ namespace nanojit
             // To make sure floating point operations stay in FPU registers
             // as much as possible, make sure that only a few opcodes are
             // reserving GPRs.
-            NanoAssert(a->isop(LIR_quad) || a->isop(LIR_ldq) || a->isop(LIR_ldqc));
+            NanoAssert(a->isop(LIR_quad) || a->isop(LIR_ldq) || a->isop(LIR_ldqc)|| a->isop(LIR_u2f) || a->isop(LIR_float));
             allow &= ~rmask(rr);
             ra = findRegFor(a, allow);
         }
@@ -1432,8 +1432,9 @@ namespace nanojit
     // Increment the 32-bit profiling counter at pCtr, without
     // changing any registers.
     verbose_only(
-    void Assembler::asm_inc_m32(uint32_t* pCtr)
+    void Assembler::asm_inc_m32(uint32_t* /*pCtr*/)
     {
+        // todo: implement this
     }
     )
 
