@@ -78,6 +78,9 @@ namespace nanojit
 
     typedef uint32_t NIns;
 
+    // Bytes of icache to flush after Assembler::patch
+    const size_t LARGEST_BRANCH_PATCH = 2 * sizeof(NIns);
+
     // These are used as register numbers in various parts of the code
     typedef enum
         {
@@ -181,7 +184,7 @@ namespace nanojit
     1<<F22;
     static const RegisterMask AllowableFlagRegs = GpRegs;
 
-    static inline bool isValidDisplacement(int32_t d) {
+    static inline bool isValidDisplacement(int32_t) {
         return true;
     }
 

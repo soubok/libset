@@ -45,12 +45,23 @@
     typedef void *maddr_ptr;
 #endif
 
+#if defined(AVMPLUS_ARM) && defined(UNDER_CE)
+extern "C" bool
+blx_lr_broken() {
+    return false;
+}
+#endif
+
 using namespace avmplus;
 
 Config AvmCore::config;
 
 void
 avmplus::AvmLog(char const *msg, ...) {
+    va_list ap;
+    va_start(ap, msg);
+    VMPI_vfprintf(stderr, msg, ap);
+    va_end(ap);
 }
 
 #ifdef _DEBUG

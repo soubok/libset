@@ -320,7 +320,7 @@ namespace nanojit
     static const int NumArgRegs = 6;
 #endif
 
-    static inline bool isValidDisplacement(int32_t d) {
+    static inline bool isValidDisplacement(int32_t) {
         return true;
     }
     static inline bool IsFpReg(Register r) {
@@ -382,6 +382,9 @@ namespace nanojit
     const int LARGEST_UNDERRUN_PROT = 32;  // largest value passed to underrunProtect
 
     typedef uint8_t NIns;
+
+    // Bytes of icache to flush after Assembler::patch
+    const size_t LARGEST_BRANCH_PATCH = 16 * sizeof(NIns);
 
     inline Register nextreg(Register r) {
         return Register(r+1);
