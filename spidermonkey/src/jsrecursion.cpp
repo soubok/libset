@@ -167,7 +167,7 @@ TraceRecorder::downSnapshot(FrameInfo* downFrame)
     memset(exit, 0, sizeof(VMSideExit));
     exit->from = fragment;
     exit->calldepth = 0;
-    JS_ASSERT(unsigned(exit->calldepth) == getCallDepth());
+    JS_ASSERT(unsigned(exit->calldepth) == callDepth);
     exit->numGlobalSlots = ngslots;
     exit->numStackSlots = downPostSlots + 1;
     exit->numStackSlotsBelowCurrentFrame = cx->fp->down->argv ?
@@ -204,7 +204,7 @@ TraceRecorder::upRecursion()
     if (anchor && (anchor->exitType == RECURSIVE_EMPTY_RP_EXIT ||
         anchor->exitType == RECURSIVE_SLURP_MISMATCH_EXIT ||
         anchor->exitType == RECURSIVE_SLURP_FAIL_EXIT)) {
-        return InjectStatus(slurpDownFrames(cx->fp->down->regs->pc));
+        return slurpDownFrames(cx->fp->down->regs->pc);
     }
 
     jsbytecode* return_pc = cx->fp->down->regs->pc;
@@ -427,8 +427,8 @@ TraceRecorder::slurpDownFrames(jsbytecode* return_pc)
     unsigned numGlobalSlots = treeInfo->globalSlots->length();
     unsigned safeSlots = NativeStackSlots(cx, frameDepth) + 1 + numGlobalSlots;
     jsbytecode* recursive_pc = return_pc + JSOP_CALL_LENGTH;
-    LIns* data = lir->insSkip(sizeof(VMSideExit) + sizeof(JSTraceType) * safeSlots);
-    VMSideExit* exit = (VMSideExit*)data->payload();
+    VMSideExit* exit = (VMSideExit*)
+        traceMonitor->traceAlloc->alloc(sizeof(VMSideExit) + sizeof(JSTraceType) * safeSlots);
     memset(exit, 0, sizeof(VMSideExit));
     exit->pc = (jsbytecode*)recursive_pc;
     exit->from = fragment;
@@ -447,7 +447,10 @@ TraceRecorder::slurpDownFrames(jsbytecode* return_pc)
     cx->fp->regs->pc = exit->pc;
     js_CaptureStackTypes(cx, frameDepth, typeMap);
     cx->fp->regs->pc = oldpc;
-    typeMap[downPostSlots] = determineSlotType(&stackval(-1));
+    if (!anchor || anchor->exitType != RECURSIVE_SLURP_FAIL_EXIT)
+        typeMap[downPostSlots] = determineSlotType(&stackval(-1));
+    else
+        typeMap[downPostSlots] = anchor->stackTypeMap()[anchor->numStackSlots - 1];
     determineGlobalTypes(&typeMap[exit->numStackSlots]);
 #if defined JS_JIT_SPEW
     TreevisLogExit(cx, exit);
@@ -553,7 +556,7 @@ TraceRecorder::slurpDownFrames(jsbytecode* return_pc)
     RecursiveSlotMap slotMap(*this, downPostSlots, rval_ins);
     for (unsigned i = 0; i < downPostSlots; i++)
         slotMap.addSlot(typeMap[i]);
-    slotMap.addSlot(&stackval(-1));
+    slotMap.addSlot(&stackval(-1), typeMap[downPostSlots]);
     VisitGlobalSlots(slotMap, cx, *treeInfo->globalSlots);
     debug_only_print0(LC_TMTracer, "Compiling up-recursive slurp...\n");
     exit = copy(exit);

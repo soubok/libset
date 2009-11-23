@@ -475,6 +475,7 @@ WrapEscapingClosure(JSContext *cx, JSStackFrame *fp, JSObject *funobj, JSFunctio
     wscript->noScriptRval = script->noScriptRval;
     wscript->savedCallerFun = script->savedCallerFun;
     wscript->hasSharps = script->hasSharps;
+    wscript->strictModeCode = script->strictModeCode;
     wscript->version = script->version;
     wscript->nfixed = script->nfixed;
     wscript->filename = script->filename;
@@ -555,17 +556,23 @@ ArgGetter(JSContext *cx, JSObject *obj, jsval idval, jsval *vp)
 static JSBool
 ArgSetter(JSContext *cx, JSObject *obj, jsval idval, jsval *vp)
 {
+#ifdef JS_TRACER
+    // To be able to set a property here on trace, we would have to make
+    // sure any updates also get written back to the trace native stack.
+    // For simplicity, we just leave trace, since this is presumably not
+    // a common operation.
+    if (JS_ON_TRACE(cx)) {
+        js_DeepBail(cx);
+        return false;
+    }
+#endif
+
     if (!JS_InstanceOf(cx, obj, &js_ArgumentsClass, NULL))
         return true;
 
     if (JSVAL_IS_INT(idval)) {
         uintN arg = uintN(JSVAL_TO_INT(idval));
         if (arg < GetArgsLength(obj)) {
-            if (js_GetArgsPrivateNative(obj)) {
-                js_LeaveTrace(cx);
-                return false;
-            }
-
             JSStackFrame *fp = (JSStackFrame *) obj->getPrivate();
             if (fp) {
                 fp->argv[arg] = *vp;
@@ -808,7 +815,7 @@ js_GetCallObject(JSContext *cx, JSStackFrame *fp)
         fp->scopeChain = env;
         JS_ASSERT(fp->argv);
         if (!js_DefineNativeProperty(cx, fp->scopeChain, ATOM_TO_JSID(lambdaName),
-                                     fp->argv[-2],
+                                     fp->calleeValue(),
                                      CalleeGetter, NULL,
                                      JSPROP_PERMANENT | JSPROP_READONLY,
                                      0, 0, NULL)) {
@@ -824,8 +831,8 @@ js_GetCallObject(JSContext *cx, JSStackFrame *fp)
 
     callobj->setPrivate(fp);
     JS_ASSERT(fp->argv);
-    JS_ASSERT(fp->fun == GET_FUNCTION_PRIVATE(cx, JSVAL_TO_OBJECT(fp->argv[-2])));
-    STOBJ_SET_SLOT(callobj, JSSLOT_CALLEE, fp->argv[-2]);
+    JS_ASSERT(fp->fun == GET_FUNCTION_PRIVATE(cx, fp->calleeObject()));
+    STOBJ_SET_SLOT(callobj, JSSLOT_CALLEE, fp->calleeValue());
     fp->callobj = callobj;
 
     /*
@@ -1191,7 +1198,7 @@ call_convert(JSContext *cx, JSObject *obj, JSType type, jsval *vp)
         if (fp) {
             JS_ASSERT(fp->fun);
             JS_ASSERT(fp->argv);
-            *vp = fp->argv[-2];
+            *vp = fp->calleeValue();
         }
     }
     return JS_TRUE;
@@ -1325,7 +1332,7 @@ fun_getProperty(JSContext *cx, JSObject *obj, jsval id, jsval *vp)
             }
 
             JS_ASSERT(fp->down->argv);
-            *vp = fp->down->argv[-2];
+            *vp = fp->down->calleeValue();
         } else {
             *vp = JSVAL_NULL;
         }
@@ -2917,7 +2924,7 @@ get_local_names_enumerator(JSDHashTable *table, JSDHashEntryHdr *hdr,
     return JS_DHASH_NEXT;
 }
 
-jsuword *
+JS_FRIEND_API(jsuword *)
 js_GetLocalNameArray(JSContext *cx, JSFunction *fun, JSArenaPool *pool)
 {
     uintN n;
@@ -3053,4 +3060,33 @@ js_FreezeLocalNames(JSContext *cx, JSFunction *fun)
     if (n > MAX_ARRAY_LOCALS)
         JS_DHashMarkTableImmutable(&fun->u.i.names.map->names);
 #endif
+}
+
+extern JSAtom *
+js_FindDuplicateFormal(JSFunction *fun)
+{
+    unsigned nargs = fun->nargs;
+    if (nargs <= 1)
+        return NULL;
+
+    /* Function with two to MAX_ARRAY_LOCALS parameters use an aray. */
+    if (nargs <= MAX_ARRAY_LOCALS) {
+        jsuword *array = fun->u.i.names.array;
+        /* Quadratic, but MAX_ARRAY_LOCALS is 8, so at most 28 comparisons. */
+        for (unsigned i = 0; i < nargs; i++) {
+            for (unsigned j = i + 1; j < nargs; j++) {
+                if (array[i] == array[j])
+                    return JS_LOCAL_NAME_TO_ATOM(array[i]);
+            }
+        }
+        return NULL;
+    }
+
+    /* 
+     * Functions with more than MAX_ARRAY_LOCALS parameters use a hash
+     * table. Hashed local name maps have already made a list of any
+     * duplicate argument names for us.
+     */
+    JSNameIndexPair *dup = fun->u.i.names.map->lastdup;
+    return dup ? dup->name : NULL;
 }

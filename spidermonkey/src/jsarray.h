@@ -123,14 +123,14 @@ static JS_INLINE uint32
 js_DenseArrayCapacity(JSObject *obj)
 {
     JS_ASSERT(js_IsDenseArray(obj));
-    return DSLOTS_IS_NOT_NULL(obj) ? (uint32) obj->dslots[-1] : 0;
+    return obj->dslots ? (uint32) obj->dslots[-1] : 0;
 }
 
 static JS_INLINE void
 js_SetDenseArrayCapacity(JSObject *obj, uint32 capacity)
 {
     JS_ASSERT(js_IsDenseArray(obj));
-    JS_ASSERT(DSLOTS_IS_NOT_NULL(obj));
+    JS_ASSERT(obj->dslots);
     obj->dslots[-1] = (jsval) capacity;
 }
 
@@ -214,6 +214,20 @@ js_GetDenseArrayElementValue(JSContext *cx, JSObject *obj, JSProperty *prop,
 /* Array constructor native. Exposed only so the JIT can know its address. */
 JSBool
 js_Array(JSContext* cx, JSObject* obj, uintN argc, jsval* argv, jsval* rval);
+
+/*
+ * Friend api function that allows direct creation of an array object with a
+ * given capacity.  Non-null return value means allocation of the internal
+ * buffer for a capacity of at least |capacity| succeeded.  A pointer to the
+ * first element of this internal buffer is returned in the |vector| out
+ * parameter.  The caller promises to fill in the first |capacity| values
+ * starting from that pointer immediately after this function returns and
+ * without triggering GC (so this method is allowed to leave those
+ * uninitialized) and to set them to non-JSVAL_HOLE values, so that the
+ * resulting array has length and count both equal to |capacity|.
+ */
+JS_FRIEND_API(JSObject *)
+js_NewArrayObjectWithCapacity(JSContext *cx, jsuint capacity, jsval **vector);
 
 JS_END_EXTERN_C
 

@@ -310,7 +310,7 @@ namespace nanojit
         underrunProtect(20);
         if (value->isconst())
             {
-                Register rb = getBaseReg(base, dr, GpRegs);
+                Register rb = getBaseReg(LIR_sti, base, dr, GpRegs);
                 int c = value->imm32();
                 STW32(L2, dr, rb);
                 SET32(c, L2);
@@ -442,8 +442,7 @@ namespace nanojit
         // value is either a 64bit struct or maybe a float
         // that isn't live in an FPU reg.  Either way, don't
         // put it in an FPU reg just to load & store it.
-        Register t = registerAlloc(GpRegs & ~(rmask(rd)|rmask(rs)));
-        _allocator.addFree(t);
+        Register t = registerAllocTmp(GpRegs & ~(rmask(rd)|rmask(rs)));
         STW32(t, dd+4, rd);
         LDSW32(rs, ds+4, t);
         STW32(t, dd, rd);
@@ -457,7 +456,7 @@ namespace nanojit
         NanoAssert(cond->isCond());
         if (condop >= LIR_feq && condop <= LIR_fge)
             {
-                return asm_jmpcc(branchOnFalse, cond, targ);
+                return asm_fbranch(branchOnFalse, cond, targ);
             }
 
         underrunProtect(32);
@@ -549,7 +548,7 @@ namespace nanojit
                     ANDCC(r, r, G0);
                 }
                 else if (!rhs->isQuad()) {
-                    Register r = getBaseReg(lhs, c, GpRegs);
+                    Register r = getBaseReg(condop, lhs, c, GpRegs);
                     SUBCC(r, L2, G0);
                     SET32(c, L2);
                 }
@@ -566,7 +565,21 @@ namespace nanojit
     {
         // only want certain regs
         Register r = prepResultReg(ins, AllowableFlagRegs);
-        asm_setcc(r, ins);
+        underrunProtect(8);
+        LOpcode condop = ins->opcode();
+        NanoAssert(condop >= LIR_feq && condop <= LIR_fge);
+        if (condop == LIR_feq)
+            MOVFEI(1, 0, 0, 0, r);
+        else if (condop == LIR_fle)
+            MOVFLEI(1, 0, 0, 0, r);
+        else if (condop == LIR_flt)
+            MOVFLI(1, 0, 0, 0, r);
+        else if (condop == LIR_fge)
+            MOVFGEI(1, 0, 0, 0, r);
+        else // if (condop == LIR_fgt)
+            MOVFGI(1, 0, 0, 0, r);
+        ORI(G0, 0, r);
+        asm_fcmp(ins);
     }
 
     void Assembler::asm_cond(LInsp ins)
@@ -716,7 +729,7 @@ namespace nanojit
         LIns* base = ins->oprnd1();
         int d = ins->disp();
         Register rr = prepResultReg(ins, GpRegs);
-        Register ra = getBaseReg(base, d, GpRegs);
+        Register ra = getBaseReg(ins->opcode(), base, d, GpRegs);
         if (op == LIR_ldcb) {
             LDUB32(ra, d, rr);
         } else if (op == LIR_ldcs) {
@@ -891,8 +904,7 @@ namespace nanojit
         underrunProtect(72);
         // where our result goes
         Register rr = prepResultReg(ins, FpRegs);
-        Register rt = registerAlloc(FpRegs & ~(rmask(rr)));
-        _allocator.addFree(rt);
+        Register rt = registerAllocTmp(FpRegs & ~(rmask(rr)));
         Register gr = findRegFor(ins->oprnd1(), GpRegs);
         int disp = -8;
 
@@ -913,7 +925,7 @@ namespace nanojit
         FMOVD(s, r);
     }
 
-    NIns * Assembler::asm_jmpcc(bool branchOnFalse, LIns *cond, NIns *targ)
+    NIns * Assembler::asm_fbranch(bool branchOnFalse, LIns *cond, NIns *targ)
     {
         NIns *at = 0;
         LOpcode condop = cond->opcode();
@@ -959,25 +971,6 @@ namespace nanojit
             }
         asm_fcmp(cond);
         return at;
-    }
-
-    void Assembler::asm_setcc(Register r, LIns *cond)
-    {
-        underrunProtect(8);
-        LOpcode condop = cond->opcode();
-        NanoAssert(condop >= LIR_feq && condop <= LIR_fge);
-        if (condop == LIR_feq)
-            MOVFEI(1, 0, 0, 0, r);
-        else if (condop == LIR_fle)
-            MOVFLEI(1, 0, 0, 0, r);
-        else if (condop == LIR_flt)
-            MOVFLI(1, 0, 0, 0, r);
-        else if (condop == LIR_fge)
-            MOVFGEI(1, 0, 0, 0, r);
-        else // if (condop == LIR_fgt)
-            MOVFGI(1, 0, 0, 0, r);
-        ORI(G0, 0, r);
-        asm_fcmp(cond);
     }
 
     void Assembler::asm_fcmp(LIns *cond)

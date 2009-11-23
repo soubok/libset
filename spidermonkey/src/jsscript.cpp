@@ -82,7 +82,7 @@ GetScriptExecDepth(JSContext *cx, JSObject *obj)
 
     JS_ASSERT(JS_IS_OBJ_LOCKED(cx, obj));
     v = LOCKED_OBJ_GET_SLOT(obj, JSSLOT_START(&js_ScriptClass));
-    return JSVAL_TO_INT(v);
+    return JSVAL_IS_VOID(v) ? 0 : JSVAL_TO_INT(v);
 }
 
 static void
@@ -106,8 +106,7 @@ script_toSource(JSContext *cx, uintN argc, jsval *vp)
     JSScript *script;
     size_t i, j, k, n;
     char buf[16];
-    const jschar *s;
-    jschar *t;
+    jschar *s, *t;
     JSString *str;
 
     obj = JS_THIS_OBJECT(cx, vp);
@@ -138,7 +137,9 @@ script_toSource(JSContext *cx, uintN argc, jsval *vp)
         str = js_QuoteString(cx, str, '\'');
         if (!str)
             return JS_FALSE;
-        str->getCharsAndLength(s, k);
+        const jschar *cs;
+        str->getCharsAndLength(cs, k);
+        s = const_cast<jschar *>(cs);
         n += k;
     }
 
@@ -412,7 +413,7 @@ static const jsbytecode emptyScriptCode[] = {JSOP_STOP, SRC_NULL};
 
 /* static */ const JSScript JSScript::emptyScriptConst = {
     const_cast<jsbytecode*>(emptyScriptCode),
-    1, JSVERSION_DEFAULT, 0, 0, 0, 0, 0, 1, 0, 0,
+    1, JSVERSION_DEFAULT, 0, 0, 0, 0, 0, true, false, false, false,
     const_cast<jsbytecode*>(emptyScriptCode),
     {0, NULL}, NULL, 0, 0, 0, NULL
 };
@@ -462,15 +463,14 @@ js_XDRScript(JSXDRState *xdr, JSScript **scriptp, bool needMutableScript,
 
     /*
      * Since the shortest possible script has JSOP_STOP as its only bytecode,
-     * encode only the length 1 for the emptyScript singleton, and return the
-     * emptyScript instead of a new script when decoding a script of length 1.
+     * encode only the length 0 for the emptyScript singleton, and return the
+     * emptyScript instead of a new script when decoding a script of length 0.
      */
     if (xdr->mode == JSXDR_ENCODE)
-        length = (script == JSScript::emptyScript()) ? 1 : script->length;
+        length = (script == JSScript::emptyScript()) ? 0 : script->length;
     if (!JS_XDRUint32(xdr, &length))
         return JS_FALSE;
-    JS_ASSERT(length != 0);
-    if (length == 1) {
+    if (length == 0) {
         if (xdr->mode == JSXDR_ENCODE) {
             JS_ASSERT(*scriptp == JSScript::emptyScript());
             return JS_TRUE;
@@ -479,10 +479,26 @@ js_XDRScript(JSXDRState *xdr, JSScript **scriptp, bool needMutableScript,
         /* Decoding: check whether we need a mutable empty script. */
         if (cx->debugHooks->newScriptHook)
             needMutableScript = true;
-        if (!needMutableScript) {
-            *scriptp = JSScript::emptyScript();
+        if (needMutableScript) {
+            /*
+             * We need a mutable empty script but the encoder serialized only
+             * the shorthand (0 length word) for us. Make a new mutable empty
+             * script here and return it immediately.
+             */
+            script = js_NewScript(cx, 1, 1, 0, 0, 0, 0, 0);
+            if (!script)
+                return JS_FALSE;
+
+            script->version = JSVERSION_DEFAULT;
+            script->noScriptRval = true;
+            script->code[0] = JSOP_STOP;
+            script->code[1] = SRC_NULL;
+            *scriptp = script;
             return JS_TRUE;
         }
+
+        *scriptp = JSScript::emptyScript();
+        return JS_TRUE;
     }
 
     if (xdr->mode == JSXDR_ENCODE) {
@@ -785,8 +801,7 @@ script_thaw(JSContext *cx, uintN argc, jsval *vp)
     JSXDRState *xdr;
     JSString *str;
     void *buf;
-    uint32 len;
-    jsval v;
+    size_t len;
     JSScript *script, *oldscript;
     JSBool ok, hasMagic;
     jsint execDepth;
@@ -807,7 +822,9 @@ script_thaw(JSContext *cx, uintN argc, jsval *vp)
     if (!xdr)
         return JS_FALSE;
 
-    str->getCharsAndLength(buf, len);
+    const jschar *cs;
+    str->getCharsAndLength(cs, len);
+    buf = const_cast<jschar *>(cs);
 #if IS_BIG_ENDIAN
   {
     jschar *from, *to;
@@ -1401,16 +1418,6 @@ js_NewScript(JSContext *cx, uint32 length, uint32 nsrcnotes, uint32 natoms,
     JSScript *script;
     uint8 *cursor;
 
-    if (length == 1) {
-        JS_ASSERT(nsrcnotes == 1);
-        JS_ASSERT(natoms == 0);
-        JS_ASSERT(nobjects == 0);
-        JS_ASSERT(nupvars == 0);
-        JS_ASSERT(nregexps == 0);
-        JS_ASSERT(ntrynotes == 0);
-        return JSScript::emptyScript();
-    }
-
     size = sizeof(JSScript) +
            sizeof(JSAtom *) * natoms +
            length * sizeof(jsbytecode) +
@@ -1528,9 +1535,7 @@ js_NewScriptFromCG(JSContext *cx, JSCodeGenerator *cg)
     mainLength = CG_OFFSET(cg);
     prologLength = CG_PROLOG_OFFSET(cg);
 
-    if (!cx->debugHooks->newScriptHook &&
-        !(cg->flags & TCF_NEED_MUTABLE_SCRIPT) &&
-        prologLength + mainLength <= 3) {
+    if (prologLength + mainLength <= 3) {
         /*
          * Check very short scripts to see whether they are "empty" and return
          * the const empty-script singleton if so. We are deliberately flexible
@@ -1545,7 +1550,15 @@ js_NewScriptFromCG(JSContext *cx, JSCodeGenerator *cg)
         }
         if ((cg->flags & TCF_NO_SCRIPT_RVAL) && JSOp(*pc) == JSOP_FALSE)
             ++pc;
-        if (JSOp(*pc) == JSOP_STOP) {
+
+        if (JSOp(*pc) == JSOP_STOP &&
+            !cx->debugHooks->newScriptHook &&
+            !(cg->flags & TCF_NEED_MUTABLE_SCRIPT))
+        {
+            /*
+             * We can probably use the immutable empty script singleton, just
+             * one hard case (nupvars != 0) may stand in our way.
+             */
             JSScript *empty = JSScript::emptyScript();
 
             if (cg->flags & TCF_IN_FUNCTION) {
@@ -1626,6 +1639,8 @@ js_NewScriptFromCG(JSContext *cx, JSCodeGenerator *cg)
         script->noScriptRval = true;
     if (cg->hasSharps())
         script->hasSharps = true;
+    if (cg->flags & TCF_STRICT_MODE_CODE)
+        script->strictModeCode = true;
 
     if (cg->upvarList.count != 0) {
         JS_ASSERT(cg->upvarList.count <= cg->upvarMap.length);

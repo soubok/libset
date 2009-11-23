@@ -73,6 +73,10 @@
 #include "jstracer.h"
 #include "jslibmath.h"
 #include "jsvector.h"
+
+#include "jsatominlines.h"
+#include "jsscopeinlines.h"
+#include "jsscriptinlines.h"
 #include "jsstrinlines.h"
 
 #ifdef INCLUDE_MOZILLA_DTRACE
@@ -82,9 +86,6 @@
 #if JS_HAS_XML_SUPPORT
 #include "jsxml.h"
 #endif
-
-#include "jsatominlines.h"
-#include "jsscriptinlines.h"
 
 #include "jsautooplen.h"
 
@@ -121,7 +122,7 @@ js_FillPropertyCache(JSContext *cx, JSObject *obj,
      * from pobj's scope (via unwatch or delete, e.g.).
      */
     scope = OBJ_SCOPE(pobj);
-    if (!scope->has(sprop)) {
+    if (!scope->hasProperty(sprop)) {
         PCMETER(cache->oddfills++);
         return JS_NO_PROP_CACHE_FILL;
     }
@@ -131,8 +132,8 @@ js_FillPropertyCache(JSContext *cx, JSObject *obj,
      * and setter hooks can change the prototype chain using JS_SetPrototype
      * after js_LookupPropertyWithFlags has returned the nominal protoIndex,
      * we have to validate protoIndex if it is non-zero. If it is zero, then
-     * we know thanks to the scope->has test above, combined with the fact that
-     * obj == pobj, that protoIndex is invariant.
+     * we know thanks to the scope->hasProperty test above, combined with the
+     * fact that obj == pobj, that protoIndex is invariant.
      *
      * The scopeIndex can't be wrong. We require JS_SetParent calls to happen
      * before any running script might consult a parent-linked scope chain. If
@@ -246,13 +247,11 @@ js_FillPropertyCache(JSContext *cx, JSObject *obj,
             SPROP_HAS_VALID_SLOT(sprop, scope)) {
             /* Great, let's cache sprop's slot and use it on cache hit. */
             vword = SLOT_TO_PCVAL(sprop->slot);
-            if (sprop->slot >= JS_INITIAL_NSLOTS && !DSLOTS_IS_NOT_NULL(obj))
-                DSLOTS_BUMP(obj);
         } else {
             /* Best we can do is to cache sprop (still a nice speedup). */
             vword = SPROP_TO_PCVAL(sprop);
             if (adding &&
-                sprop == scope->lastProp &&
+                sprop == scope->lastProperty() &&
                 scope->shape == sprop->shape) {
                 /*
                  * Our caller added a new property. We also know that a setter
@@ -296,8 +295,7 @@ js_FillPropertyCache(JSContext *cx, JSObject *obj,
                         return JS_NO_PROP_CACHE_FILL;
                     JSScope *protoscope = OBJ_SCOPE(proto);
                     if (!protoscope->emptyScope ||
-                        !js_ObjectIsSimilarToProto(cx, obj, obj->map->ops, OBJ_GET_CLASS(cx, obj),
-                                                   proto)) {
+                        protoscope->emptyScope->clasp != obj->getClass()) {
                         return JS_NO_PROP_CACHE_FILL;
                     }
                     kshape = protoscope->emptyScope->shape;
@@ -316,6 +314,7 @@ js_FillPropertyCache(JSContext *cx, JSObject *obj,
         kshape = OBJ_SHAPE(obj);
         vshape = scope->shape;
     }
+    JS_ASSERT(kshape < SHAPE_OVERFLOW_BIT);
 
     khash = PROPERTY_CACHE_HASH_PC(pc, kshape);
     if (obj == pobj) {
@@ -355,6 +354,7 @@ js_FillPropertyCache(JSContext *cx, JSObject *obj,
             obj->setDelegate();
         }
     }
+    JS_ASSERT(vshape < SHAPE_OVERFLOW_BIT);
 
     entry = &cache->table[khash];
     PCMETER(PCVAL_IS_NULL(entry->vword) || cache->recycles++);
@@ -964,6 +964,7 @@ ComputeThis(JSContext *cx, JSBool lazy, jsval *argv)
 JSObject *
 js_ComputeThis(JSContext *cx, JSBool lazy, jsval *argv)
 {
+    JS_ASSERT(argv[-1] != JSVAL_HOLE);  // check for SynthesizeFrame poisoning
     if (JSVAL_IS_NULL(argv[-1]))
         return js_ComputeGlobalThis(cx, lazy, argv);
     return ComputeThis(cx, lazy, argv);
@@ -1447,8 +1448,9 @@ js_InternalInvoke(JSContext *cx, JSObject *obj, jsval fval, uintN flags,
          */
         *rval = *invokevp;
         if (JSVAL_IS_GCTHING(*rval) && *rval != JSVAL_NULL) {
-            if (cx->localRootStack) {
-                if (js_PushLocalRoot(cx, cx->localRootStack, *rval) < 0)
+            JSLocalRootStack *lrs = JS_THREAD_DATA(cx)->localRootStack;
+            if (lrs) {
+                if (js_PushLocalRoot(cx, lrs, *rval) < 0)
                     ok = JS_FALSE;
             } else {
                 cx->weakRoots.lastInternalResult = *rval;
@@ -2584,7 +2586,7 @@ AssertValidPropertyCacheHit(JSContext *cx, JSScript *script, JSFrameRegs& regs,
         jsval v;
         JS_ASSERT(PCVAL_IS_OBJECT(entry->vword));
         JS_ASSERT(entry->vword != PCVAL_NULL);
-        JS_ASSERT(OBJ_SCOPE(pobj)->branded());
+        JS_ASSERT(OBJ_SCOPE(pobj)->brandedOrHasMethodBarrier());
         JS_ASSERT(SPROP_HAS_STUB_GETTER_OR_IS_METHOD(sprop));
         JS_ASSERT(SPROP_HAS_VALID_SLOT(sprop, OBJ_SCOPE(pobj)));
         v = LOCKED_OBJ_GET_SLOT(pobj, sprop->slot);
@@ -2917,13 +2919,13 @@ js_Interpret(JSContext *cx)
             CHECK_BRANCH();                                                   \
             if (op == JSOP_NOP) {                                             \
                 if (TRACE_RECORDER(cx)) {                                     \
-                    MONITOR_BRANCH(Monitor_Branch);                           \
+                    MONITOR_BRANCH(Record_Branch);                           \
                     op = (JSOp) *regs.pc;                                     \
                 } else {                                                      \
                     op = (JSOp) *++regs.pc;                                   \
                 }                                                             \
             } else if (op == JSOP_TRACE) {                                    \
-                MONITOR_BRANCH(Monitor_Branch);                               \
+                MONITOR_BRANCH(Record_Branch);                               \
                 op = (JSOp) *regs.pc;                                         \
             }                                                                 \
         }                                                                     \

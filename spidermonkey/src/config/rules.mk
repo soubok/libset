@@ -360,6 +360,13 @@ endif # GNU_CC
 endif # ENABLE_CXX_EXCEPTIONS
 endif # WINNT
 
+ifeq ($(SOLARIS_SUNPRO_CXX),1)
+CXXFLAGS += -features=extensions -D__FUNCTION__=__func__
+ifeq (86,$(findstring 86,$(OS_TEST)))
+OS_LDFLAGS += -M $(topsrcdir)/config/solaris_ia32.map
+endif # x86
+endif # Solaris Sun Studio C++
+
 ifeq (,$(filter-out WINNT WINCE,$(HOST_OS_ARCH)))
 HOST_PDBFILE=$(basename $(@F)).pdb
 endif
@@ -883,6 +890,7 @@ ifdef SHARED_LIBRARY
 ifdef IS_COMPONENT
 	$(INSTALL) $(IFLAGS2) $(SHARED_LIBRARY) $(FINAL_TARGET)/components
 	$(ELF_DYNSTR_GC) $(FINAL_TARGET)/components/$(SHARED_LIBRARY)
+	@$(PERL) -I$(MOZILLA_DIR)/config $(MOZILLA_DIR)/config/build-list.pl $(FINAL_TARGET)/components/components.list $(SHARED_LIBRARY)
 ifdef BEOS_ADDON_WORKAROUND
 	( cd $(FINAL_TARGET)/components && $(CC) -nostart -o $(SHARED_LIBRARY).stub $(SHARED_LIBRARY) )
 endif
@@ -1803,6 +1811,7 @@ ifdef EXTRA_COMPONENTS
 libs:: $(EXTRA_COMPONENTS)
 ifndef NO_DIST_INSTALL
 	$(INSTALL) $(IFLAGS1) $^ $(FINAL_TARGET)/components
+	@$(PERL) -I$(MOZILLA_DIR)/config $(MOZILLA_DIR)/config/build-list.pl $(FINAL_TARGET)/components/components.list $(notdir $^)
 endif
 
 endif
@@ -1813,9 +1822,11 @@ ifndef NO_DIST_INSTALL
 	$(EXIT_ON_ERROR) \
 	$(NSINSTALL) -D $(FINAL_TARGET)/components; \
 	for i in $^; do \
-	  dest=$(FINAL_TARGET)/components/`basename $$i`; \
+	  fname=`basename $$i`; \
+	  dest=$(FINAL_TARGET)/components/$${fname}; \
 	  $(RM) -f $$dest; \
 	  $(PYTHON) $(topsrcdir)/config/Preprocessor.py $(DEFINES) $(ACDEFINES) $(XULPPFLAGS) $$i > $$dest; \
+	  $(PERL) -I$(MOZILLA_DIR)/config $(MOZILLA_DIR)/config/build-list.pl $(FINAL_TARGET)/components/components.list $$fname; \
 	done
 endif
 
@@ -2064,21 +2075,14 @@ ifneq (,$(OBJS)$(XPIDLSRCS)$(SIMPLE_PROGRAMS))
 MDDEPEND_FILES		:= $(strip $(wildcard $(MDDEPDIR)/*.pp))
 
 ifneq (,$(MDDEPEND_FILES))
-ifdef PERL
 # The script mddepend.pl checks the dependencies and writes to stdout
 # one rule to force out-of-date objects. For example,
 #   foo.o boo.o: FORCE
 # The script has an advantage over including the *.pp files directly
 # because it handles the case when header files are removed from the build.
 # 'make' would complain that there is no way to build missing headers.
-ifeq (,$(MAKE_RESTARTS))
-$(MDDEPDIR)/.all.pp: FORCE
-	@$(PERL) $(BUILD_TOOLS)/mddepend.pl $@ $(MDDEPEND_FILES)
-endif
--include $(MDDEPDIR)/.all.pp
-else
-include $(MDDEPEND_FILES)
-endif
+ALL_PP_RESULTS = $(shell $(PERL) $(BUILD_TOOLS)/mddepend.pl - $(MDDEPEND_FILES))
+$(eval $(ALL_PP_RESULTS))
 endif
 
 endif

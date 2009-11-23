@@ -56,6 +56,7 @@ namespace nanojit
 {
 #define NJ_MAX_STACK_ENTRY              256
 #define NJ_ALIGN_STACK                  16
+#define NJ_JTBL_SUPPORTED               1
 
     enum ConditionRegister {
         CR0 = 0,
@@ -243,7 +244,6 @@ namespace nanojit
 
     static const RegisterMask GpRegs = 0xffffffff;
     static const RegisterMask FpRegs = 0xffffffff00000000LL;
-    static const bool CalleeRegsNeedExplicitSaving = true;
     // R31 is a saved reg too, but we use it as our Frame ptr FP
 #ifdef NANOJIT_64BIT
     // R13 reserved for thread-specific storage on ppc64-darwin
@@ -254,7 +254,7 @@ namespace nanojit
     static const int NumSavedRegs = 18; // R13-R30
 #endif
 
-    static inline bool isValidDisplacement(int32_t) {
+    static inline bool isValidDisplacement(LOpcode, int32_t) {
         return true;
     }
     static inline bool IsFpReg(Register r) {
@@ -294,12 +294,12 @@ namespace nanojit
             NIns* _tins = _nIns; _nIns=_nExitIns; _nExitIns=_tins;          \
         } while (0) /* no semi */
 
-    const int LARGEST_UNDERRUN_PROT = 32;  // largest value passed to underrunProtect
+    const int LARGEST_UNDERRUN_PROT = 9*4;  // largest value passed to underrunProtect
 
     typedef uint32_t NIns;
 
     // Bytes of icache to flush after Assembler::patch
-    const size_t LARGEST_BRANCH_PATCH = 4 * sizeof(Nins);
+    const size_t LARGEST_BRANCH_PATCH = 4 * sizeof(NIns);
 
     inline Register nextreg(Register r) {
         return Register(r+1);

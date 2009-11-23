@@ -119,6 +119,7 @@ struct JSScript {
                                        expression statement */
     bool            savedCallerFun:1; /* object 0 is caller function */
     bool            hasSharps:1;      /* script uses sharp variables */
+    bool            strictModeCode:1;   /* code is in strict mode */
 
     jsbytecode      *main;      /* main entry point, after predef'ing prolog */
     JSAtomMap       atomMap;    /* maps immediate index to literal struct */
@@ -275,6 +276,12 @@ js_SweepScriptFilenames(JSRuntime *rt);
  * to the newly made script's function, if any -- so callers of js_NewScript
  * are responsible for notifying the debugger after successfully creating any
  * kind (function or other) of new JSScript.
+ *
+ * NB: js_NewScript always creates a new script; it never returns the empty
+ * script singleton (JSScript::emptyScript()). Callers who know they can use
+ * that read-only singleton are responsible for choosing it instead of calling
+ * js_NewScript with length and nsrcnotes equal to 1 and other parameters save
+ * cx all zero.
  */
 extern JSScript *
 js_NewScript(JSContext *cx, uint32 length, uint32 nsrcnotes, uint32 natoms,
