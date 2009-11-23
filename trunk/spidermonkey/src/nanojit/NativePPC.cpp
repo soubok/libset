@@ -144,7 +144,7 @@ namespace nanojit
         LIns* base = ins->oprnd1();
         int d = ins->disp();
         Register rr = prepResultReg(ins, GpRegs);
-        Register ra = getBaseReg(base, d, GpRegs);
+        Register ra = getBaseReg(ins->opcode(), base, d, GpRegs);
 
         #if !PEDANTIC
         if (isS16(d)) {
@@ -165,7 +165,7 @@ namespace nanojit
 
     void Assembler::asm_store32(LIns *value, int32_t dr, LIns *base) {
         Register rs = findRegFor(value, GpRegs);
-        Register ra = value == base ? rs : getBaseReg(base, dr, GpRegs & ~rmask(rs));
+        Register ra = value == base ? rs : getBaseReg(LIR_sti, base, dr, GpRegs & ~rmask(rs));
 
     #if !PEDANTIC
         if (isS16(dr)) {
@@ -182,9 +182,8 @@ namespace nanojit
     void Assembler::asm_load64(LIns *ins) {
         LIns* base = ins->oprnd1();
     #ifdef NANOJIT_64BIT
-        Reservation *resv = getresv(ins);
-        Register rr;
-        if (resv && (rr = resv->reg) != UnknownReg && (rmask(rr) & FpRegs)) {
+        Register rr = ins->getReg();
+        if (isKnownReg(rr) && (rmask(rr) & FpRegs)) {
             // FPR already assigned, fine, use it
             freeRsrcOf(ins, false);
         } else {
@@ -197,7 +196,7 @@ namespace nanojit
     #endif
 
         int dr = ins->disp();
-        Register ra = getBaseReg(base, dr, GpRegs);
+        Register ra = getBaseReg(ins->opcode(), base, dr, GpRegs);
 
     #ifdef NANOJIT_64BIT
         if (rmask(rr) & GpRegs) {
@@ -259,7 +258,7 @@ namespace nanojit
 
     void Assembler::asm_store64(LIns *value, int32_t dr, LIns *base) {
         NanoAssert(value->isQuad());
-        Register ra = getBaseReg(base, dr, GpRegs);
+        Register ra = getBaseReg(LIR_stqi, base, dr, GpRegs);
 
     #if !PEDANTIC && !defined NANOJIT_64BIT
         if (value->isop(LIR_quad) && isS16(dr) && isS16(dr+4)) {
@@ -290,11 +289,9 @@ namespace nanojit
         Register rs = findRegFor(value, FpRegs);
     #else
         // if we have to choose a register, use a GPR
-        Reservation *resv = getresv(value);
-        Register rs;
-        if (!resv || (rs = resv->reg) == UnknownReg) {
-            rs = findRegFor(value, GpRegs & ~rmask(ra));
-        }
+        Register rs = ( value->isUnusedOrHasUnknownReg()
+                      ? findRegFor(value, GpRegs & ~rmask(ra))
+                      : value->getReg() );
 
         if (rmask(rs) & GpRegs) {
         #if !PEDANTIC
@@ -573,15 +570,15 @@ namespace nanojit
         FMR(r, s);
     }
 
-    void Assembler::asm_restore(LIns *i, Reservation *resv, Register r) {
+    void Assembler::asm_restore(LIns *i, Reservation *, Register r) {
         int d;
         if (i->isop(LIR_alloc)) {
-            d = disp(resv);
+            d = disp(i);
             ADDI(r, FP, d);
         }
         else if (i->isconst()) {
-            if (!resv->arIndex) {
-                i->resv()->clear();
+            if (!i->getArIndex()) {
+                i->markAsClear();
             }
             asm_li(r, i->imm32());
         }
@@ -717,9 +714,8 @@ namespace nanojit
             if (p->isconst()) {
                 asm_li(r, p->imm32());
             } else {
-                Reservation* rA = getresv(p);
-                if (rA) {
-                    if (rA->reg == UnknownReg) {
+                if (p->isUsed()) {
+                    if (!p->hasKnownReg()) {
                         // load it into the arg reg
                         int d = findMemFor(p);
                         if (p->isop(LIR_alloc)) {
@@ -732,7 +728,7 @@ namespace nanojit
                         }
                     } else {
                         // it must be in a saved reg
-                        MR(r, rA->reg);
+                        MR(r, p->getReg());
                     }
                 }
                 else {
@@ -743,16 +739,16 @@ namespace nanojit
             }
         }
         else if (sz == ARGSIZE_F) {
-            Reservation* rA = getresv(p);
-            if (rA) {
-                if (rA->reg == UnknownReg || !IsFpReg(rA->reg)) {
+            if (p->isUsed()) {
+                Register rp = p->getReg();
+                if (!isKnownReg(rp) || !IsFpReg(rp)) {
                     // load it into the arg reg
                     int d = findMemFor(p);
                     LFD(r, d, FP);
                 } else {
                     // it must be in a saved reg
-                    NanoAssert(IsFpReg(r) && IsFpReg(rA->reg));
-                    FMR(r, rA->reg);
+                    NanoAssert(IsFpReg(r) && IsFpReg(rp));
+                    FMR(r, rp);
                 }
             }
             else {
@@ -897,10 +893,8 @@ namespace nanojit
         LInsp rhs = ins->oprnd2();
         RegisterMask allow = FpRegs;
         Register rr = prepResultReg(ins, allow);
-        Reservation *rA, *rB;
-        findRegFor2(allow, lhs, rA, rhs, rB);
-        Register ra = rA->reg;
-        Register rb = rB->reg;
+        Register ra, rb;
+        findRegFor2b(allow, lhs, ra, rhs, rb);
         switch (op) {
             case LIR_fadd: FADD(rr, ra, rb); break;
             case LIR_fsub: FSUB(rr, ra, rb); break;
@@ -976,9 +970,8 @@ namespace nanojit
 
     void Assembler::asm_quad(LIns *ins) {
     #ifdef NANOJIT_64BIT
-        Reservation *resv = getresv(ins);
-        Register r;
-        if (resv && (r = resv->reg) != UnknownReg && (rmask(r) & FpRegs)) {
+        Register r = ins->getReg();
+        if (isKnownReg(r) && (rmask(r) & FpRegs)) {
             // FPR already assigned, fine, use it
             freeRsrcOf(ins, false);
         } else {
@@ -1304,6 +1297,29 @@ namespace nanojit
     void Assembler::nFragExit(LIns*) {
         TODO(nFragExit);
     }
+
+    void Assembler::asm_jtbl(LIns* ins, NIns** native_table)
+    {
+        // R0 = index*4, R2 = table, CTR = computed address to jump to.
+        // must ensure no page breaks in here because R2 & CTR can get clobbered.
+        Register indexreg = findRegFor(ins->oprnd1(), GpRegs);
+#ifdef NANOJIT_64BIT
+        underrunProtect(9*4);
+        BCTR(0);                                // jump to address in CTR
+        MTCTR(R2);                              // CTR = R2
+        LDX(R2, R2, R0);                        // R2 = [table + index*8]
+        SLDI(R0, indexreg, 3);                  // R0 = index*8
+        asm_li64(R2, uint64_t(native_table));   // R2 = table (5 instr)
+#else // 64bit
+        underrunProtect(6*4);
+        BCTR(0);                                // jump to address in CTR
+        MTCTR(R2);                              // CTR = R2
+        LWZX(R2, R2, R0);                       // R2 = [table + index*4]
+        SLWI(R0, indexreg, 2);                  // R0 = index*4
+        asm_li(R2, int32_t(native_table));      // R2 = table (up to 2 instructions)
+#endif // 64bit
+    }
+
 } // namespace nanojit
 
 #endif // FEATURE_NANOJIT && NANOJIT_PPC

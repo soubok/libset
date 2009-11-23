@@ -74,9 +74,8 @@
         }
 
 #ifdef JS_TRACER
-        TraceRecorder* tr = TRACE_RECORDER(cx);
-        if (tr) {
-            AbortableRecordingStatus status = TraceRecorder::monitorRecording(cx, tr, op);
+        if (TraceRecorder* tr = TRACE_RECORDER(cx)) {
+            AbortableRecordingStatus status = tr->monitorRecording(op);
             switch (status) {
               case ARECORD_CONTINUE:
                 moreInterrupts = true;
@@ -90,6 +89,7 @@
                 // The code at 'error:' aborts the recording.
                 goto error;
               case ARECORD_ABORTED:
+              case ARECORD_COMPLETED:
                 break;
               case ARECORD_STOP:
                 /* A 'stop' error should have already aborted recording. */
@@ -318,7 +318,7 @@ BEGIN_CASE(JSOP_STOP)
             if (!TRACE_RECORDER(cx) && recursive) {
                 if (*(regs.pc + JSOP_CALL_LENGTH) == JSOP_TRACE) {
                     regs.pc += JSOP_CALL_LENGTH;
-                    MONITOR_BRANCH(Monitor_LeaveFrame);
+                    MONITOR_BRANCH(Record_LeaveFrame);
                     op = (JSOp)*regs.pc;
                     DO_OP();
                 }
@@ -629,7 +629,7 @@ END_CASE(JSOP_PICK)
         TRACE_2(SetPropHit, entry, sprop);                                    \
         if (SPROP_HAS_STUB_SETTER(sprop) &&                                   \
             (sprop)->slot != SPROP_INVALID_SLOT &&                            \
-            !OBJ_SCOPE(obj)->branded()) {                                     \
+            !OBJ_SCOPE(obj)->brandedOrHasMethodBarrier()) {                   \
             /* Fast path for, e.g., plain Object instance properties. */      \
             LOCKED_OBJ_SET_SLOT(obj, (sprop)->slot, *vp);                     \
         } else {                                                              \
@@ -1095,15 +1095,15 @@ BEGIN_CASE(JSOP_DIV)
 #ifdef XP_WIN
         /* XXX MSVC miscompiles such that (NaN == 0) */
         if (JSDOUBLE_IS_NaN(d2))
-            rval = DOUBLE_TO_JSVAL(rt->jsNaN);
+            rval = rt->NaNValue;
         else
 #endif
         if (d == 0 || JSDOUBLE_IS_NaN(d))
-            rval = DOUBLE_TO_JSVAL(rt->jsNaN);
+            rval = rt->NaNValue;
         else if (JSDOUBLE_IS_NEG(d) != JSDOUBLE_IS_NEG(d2))
-            rval = DOUBLE_TO_JSVAL(rt->jsNegativeInfinity);
+            rval = rt->negativeInfinityValue;
         else
-            rval = DOUBLE_TO_JSVAL(rt->jsPositiveInfinity);
+            rval = rt->positiveInfinityValue;
         STORE_OPND(-1, rval);
     } else {
         d /= d2;
@@ -1116,7 +1116,7 @@ BEGIN_CASE(JSOP_MOD)
     FETCH_NUMBER(cx, -2, d);
     regs.sp--;
     if (d2 == 0) {
-        STORE_OPND(-1, DOUBLE_TO_JSVAL(rt->jsNaN));
+        STORE_OPND(-1, rt->NaNValue);
     } else {
         d = js_fmod(d, d2);
         STORE_NUMBER(cx, -1, d);
@@ -1756,7 +1756,7 @@ BEGIN_CASE(JSOP_SETMETHOD)
                         /* The cache entry doesn't apply. vshape mismatch. */
                         checkForAdd = false;
                     } else if (scope->owned()) {
-                        if (sprop == scope->lastProp || scope->has(sprop)) {
+                        if (sprop == scope->lastProperty() || scope->hasProperty(sprop)) {
                           fast_set_propcache_hit:
                             PCMETER(cache->pchits++);
                             PCMETER(cache->setpchits++);
@@ -1766,8 +1766,7 @@ BEGIN_CASE(JSOP_SETMETHOD)
                         }
                         checkForAdd =
                             !(sprop->attrs & JSPROP_SHARED) &&
-                            sprop->parent == scope->lastProp &&
-                            !scope->hadMiddleDelete();
+                            sprop->parent == scope->lastProperty();
                     } else {
                         scope = js_GetMutableScope(cx, obj);
                         if (!scope) {
@@ -1814,7 +1813,7 @@ BEGIN_CASE(JSOP_SETMETHOD)
                         /*
                          * If this obj's number of reserved slots differed, or
                          * if something created a hash table for scope, we must
-                         * pay the price of JSScope::add.
+                         * pay the price of JSScope::putProperty.
                          *
                          * If slot does not match the cached sprop's slot,
                          * update the cache entry in the hope that obj and
@@ -1823,10 +1822,10 @@ BEGIN_CASE(JSOP_SETMETHOD)
                          */
                         if (slot != sprop->slot || scope->table) {
                             JSScopeProperty *sprop2 =
-                                scope->add(cx, sprop->id,
-                                           sprop->getter, sprop->setter,
-                                           slot, sprop->attrs,
-                                           sprop->flags, sprop->shortid);
+                                scope->putProperty(cx, sprop->id,
+                                                   sprop->getter, sprop->setter,
+                                                   slot, sprop->attrs,
+                                                   sprop->flags, sprop->shortid);
                             if (!sprop2) {
                                 js_FreeSlot(cx, obj, slot);
                                 JS_UNLOCK_SCOPE(cx, scope);
@@ -2236,7 +2235,7 @@ BEGIN_CASE(JSOP_APPLY)
             } else if (fp->script == fp->down->script &&
                        *fp->down->regs->pc == JSOP_CALL &&
                        *fp->regs->pc == JSOP_TRACE) {
-                MONITOR_BRANCH(Monitor_EnterFrame);
+                MONITOR_BRANCH(Record_EnterFrame);
             }
 #endif
 
@@ -2858,7 +2857,7 @@ BEGIN_CASE(JSOP_CALLDSLOT)
     JS_ASSERT(fp->argv);
     obj = JSVAL_TO_OBJECT(fp->argv[-2]);
     JS_ASSERT(obj);
-    JS_ASSERT(DSLOTS_IS_NOT_NULL(obj));
+    JS_ASSERT(obj->dslots);
 
     index = GET_UINT16(regs.pc);
     JS_ASSERT(JS_INITIAL_NSLOTS + index < jsatomid(obj->dslots[-1]));
@@ -3257,18 +3256,12 @@ BEGIN_CASE(JSOP_LAMBDA)
         if (FUN_NULL_CLOSURE(fun)) {
             parent = fp->scopeChain;
 
-            if (OBJ_GET_PARENT(cx, obj) == parent) {
+            if (0 && OBJ_GET_PARENT(cx, obj) == parent) {
                 op = JSOp(regs.pc[JSOP_LAMBDA_LENGTH]);
 
                 /*
                  * Optimize ({method: function () { ... }, ...}) and
                  * this.method = function () { ... }; bytecode sequences.
-                 *
-                 * Note that we jump to the entry points for JSOP_SETPROP and
-                 * JSOP_INITPROP without calling the trace recorder, because
-                 * the record hooks for those ops are essentially no-ops (this
-                 * can't change given the predictive shape guarding the
-                 * recorder must do).
                  */
                 if (op == JSOP_SETMETHOD) {
 #ifdef DEBUG
@@ -3543,10 +3536,10 @@ BEGIN_CASE(JSOP_INITMETHOD)
 
             /*
              * Detect a repeated property name and force a miss to share the
-             * strict warning code and cope with complexity managed by
-             * JSScope::add.
+             * strict warning code and consolidate all the complexity managed
+             * by JSScope::addProperty.
              */
-            if (sprop->parent != scope->lastProp)
+            if (sprop->parent != scope->lastProperty())
                 goto do_initprop_miss;
 
             /*
@@ -3554,8 +3547,8 @@ BEGIN_CASE(JSOP_INITMETHOD)
              * proto-property, and there cannot have been any deletions of
              * prior properties.
              */
-            JS_ASSERT(!scope->hadMiddleDelete());
-            JS_ASSERT_IF(scope->table, !scope->has(sprop));
+            JS_ASSERT(!scope->inDictionaryMode());
+            JS_ASSERT_IF(scope->table, !scope->hasProperty(sprop));
 
             slot = sprop->slot;
             JS_ASSERT(slot == scope->freeslot);
@@ -3569,14 +3562,11 @@ BEGIN_CASE(JSOP_INITMETHOD)
                 JS_ASSERT(slot == sprop->slot);
             }
 
-            JS_ASSERT(!scope->lastProp ||
-                      scope->shape == scope->lastProp->shape);
+            JS_ASSERT(!scope->lastProperty() ||
+                      scope->shape == scope->lastProperty()->shape);
             if (scope->table) {
                 JSScopeProperty *sprop2 =
-                    scope->add(cx, sprop->id,
-                               sprop->getter, sprop->setter,
-                               slot, sprop->attrs,
-                               sprop->flags, sprop->shortid);
+                    scope->addDataProperty(cx, sprop->id, slot, sprop->attrs);
                 if (!sprop2) {
                     js_FreeSlot(cx, obj, slot);
                     JS_UNLOCK_SCOPE(cx, scope);
@@ -3585,19 +3575,7 @@ BEGIN_CASE(JSOP_INITMETHOD)
                 JS_ASSERT(sprop2 == sprop);
             } else {
                 JS_ASSERT(scope->owned());
-
-                /* Inline-specialized version of JSScope::extend. */
-                js_LeaveTraceIfGlobalObject(cx, obj);
-                scope->shape = sprop->shape;
-                ++scope->entryCount;
-                scope->lastProp = sprop;
-
-                jsuint index;
-                if (js_IdIsIndex(sprop->id, &index))
-                    scope->setIndexedProperties();
-
-                if (sprop->isMethod())
-                    scope->setMethodBarrier();
+                scope->extend(cx, sprop);
             }
 
             /*

@@ -95,6 +95,7 @@ namespace nanojit
 
     #define NJ_MAX_STACK_ENTRY 256
     #define NJ_MAX_PARAMETERS 1
+    #define NJ_JTBL_SUPPORTED 1
 
         // Preserve a 16-byte stack alignment, to support the use of
         // SSE instructions like MOVDQA (if not by Tamarin itself,
@@ -155,7 +156,7 @@ namespace nanojit
 
     static const RegisterMask AllowableFlagRegs = 1<<EAX |1<<ECX | 1<<EDX | 1<<EBX;
 
-    static inline bool isValidDisplacement(int32_t) {
+    static inline bool isValidDisplacement(LOpcode, int32_t) {
         return true;
     }
 
@@ -174,7 +175,7 @@ namespace nanojit
     #define DECLARE_PLATFORM_REGALLOC()
 
     #define DECLARE_PLATFORM_ASSEMBLER()    \
-        const static Register argRegs[2], retRegs[2];\
+        const static Register argRegs[2], retRegs[2]; \
         int32_t max_stk_args;\
         void nativePageReset();\
         void nativePageSetup();\
@@ -182,8 +183,10 @@ namespace nanojit
         void asm_stkarg(LInsp p, int32_t& stkd);\
         void asm_farg(LInsp, int32_t& stkd);\
         void asm_arg(ArgSize sz, LInsp p, Register r, int32_t& stkd);\
+        void asm_pusharg(LInsp);\
         void asm_fcmp(LIns *cond);\
-        void asm_cmp(LIns *cond);\
+        NIns* asm_fbranch(bool, LIns*, NIns*);\
+        void asm_cmp(LIns *cond); \
         void asm_div_mod(LIns *cond);
 
     #define swapptrs()  { NIns* _tins = _nIns; _nIns=_nExitIns; _nExitIns=_tins; }
@@ -521,6 +524,11 @@ namespace nanojit
     *(--_nIns) = (uint8_t) ( 0x50 | (r) );  \
     asm_output("push %s",gpn(r)); } while(0)
 
+#define PUSHm(d,b) do { \
+    count_pushld();\
+    ALUm(0xff, 6, d, b);        \
+    asm_output("push %d(%s)",d,gpn(b)); } while(0)
+
 #define POPr(r) do { \
     count_pop();\
     underrunProtect(1);         \
@@ -585,6 +593,15 @@ namespace nanojit
         MODRMm(4, 0, r);     \
         *(--_nIns) = 0xff;   \
         asm_output("jmp   *(%s)", gpn(r)); } while (0)
+
+#define JMP_indexed(x, ss, addr) do { \
+        underrunProtect(7);  \
+        IMM32(addr); \
+        _nIns -= 3;\
+        _nIns[0]   = (NIns) 0xff; /* jmp */ \
+        _nIns[1]   = (NIns) (0<<6 | 4<<3 | 4); /* modrm: base=sib + disp32 */ \
+        _nIns[2]   = (NIns) ((ss)<<6 | (x)<<3 | 5); /* sib: x<<ss + table */ \
+        asm_output("jmp   *(%s*%d+%p)", gpn(x), 1<<(ss), (void*)(addr)); } while (0)
 
 #define JE(t)   JCC(0x04, t, "je")
 #define JNE(t)  JCC(0x05, t, "jne")

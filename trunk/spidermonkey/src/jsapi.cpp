@@ -86,6 +86,9 @@
 #include "jsstaticcheck.h"
 #include "jsvector.h"
 
+#include "jsatominlines.h"
+#include "jsscopeinlines.h"
+
 #if JS_HAS_FILE_OBJECT
 #include "jsfile.h"
 #endif
@@ -93,8 +96,6 @@
 #if JS_HAS_XML_SUPPORT
 #include "jsxml.h"
 #endif
-
-#include "jsatominlines.h"
 
 #ifdef HAVE_VA_LIST_AS_ARRAY
 #define JS_ADDRESSOF_VA_LIST(ap) ((va_list *)(ap))
@@ -126,19 +127,19 @@ JS_Now()
 JS_PUBLIC_API(jsval)
 JS_GetNaNValue(JSContext *cx)
 {
-    return DOUBLE_TO_JSVAL(cx->runtime->jsNaN);
+    return cx->runtime->NaNValue;
 }
 
 JS_PUBLIC_API(jsval)
 JS_GetNegativeInfinityValue(JSContext *cx)
 {
-    return DOUBLE_TO_JSVAL(cx->runtime->jsNegativeInfinity);
+    return cx->runtime->negativeInfinityValue;
 }
 
 JS_PUBLIC_API(jsval)
 JS_GetPositiveInfinityValue(JSContext *cx)
 {
-    return DOUBLE_TO_JSVAL(cx->runtime->jsPositiveInfinity);
+    return cx->runtime->positiveInfinityValue;
 }
 
 JS_PUBLIC_API(jsval)
@@ -1142,6 +1143,7 @@ static struct v2smap {
     {JSVERSION_1_6,     "1.6"},
     {JSVERSION_1_7,     "1.7"},
     {JSVERSION_1_8,     "1.8"},
+    {JSVERSION_ECMA_5,  "ECMAv5"},
     {JSVERSION_DEFAULT, js_default_str},
     {JSVERSION_UNKNOWN, NULL},          /* must be last, NULL is sentinel */
 };
@@ -1177,18 +1179,24 @@ JS_GetOptions(JSContext *cx)
 JS_PUBLIC_API(uint32)
 JS_SetOptions(JSContext *cx, uint32 options)
 {
+    JS_LOCK_GC(cx->runtime);
     uint32 oldopts = cx->options;
     cx->options = options;
     js_SyncOptionsToVersion(cx);
+    cx->updateJITEnabled();
+    JS_UNLOCK_GC(cx->runtime);
     return oldopts;
 }
 
 JS_PUBLIC_API(uint32)
 JS_ToggleOptions(JSContext *cx, uint32 options)
 {
+    JS_LOCK_GC(cx->runtime);
     uint32 oldopts = cx->options;
     cx->options ^= options;
     js_SyncOptionsToVersion(cx);
+    cx->updateJITEnabled();
+    JS_UNLOCK_GC(cx->runtime);
     return oldopts;
 }
 
@@ -1610,15 +1618,11 @@ JS_ResolveStandardClass(JSContext *cx, JSObject *obj, jsval id,
 static JSBool
 AlreadyHasOwnProperty(JSContext *cx, JSObject *obj, JSAtom *atom)
 {
-    JSScopeProperty *sprop;
-    JSScope *scope;
-
-    JS_ASSERT(OBJ_IS_NATIVE(obj));
     JS_LOCK_OBJ(cx, obj);
-    scope = OBJ_SCOPE(obj);
-    sprop = scope->lookup(ATOM_TO_JSID(atom));
+    JSScope *scope = OBJ_SCOPE(obj);
+    bool found = scope->hasProperty(ATOM_TO_JSID(atom));
     JS_UNLOCK_SCOPE(cx, scope);
-    return sprop != NULL;
+    return found;
 }
 
 JS_PUBLIC_API(JSBool)
@@ -1848,6 +1852,12 @@ JS_PUBLIC_API(void)
 JS_free(JSContext *cx, void *p)
 {
     return cx->free(p);
+}
+
+JS_PUBLIC_API(void)
+JS_updateMallocCounter(JSContext *cx, size_t nbytes)
+{
+    return cx->updateMallocCounter(nbytes);
 }
 
 JS_PUBLIC_API(char *)
@@ -3388,7 +3398,7 @@ AlreadyHasOwnPropertyHelper(JSContext *cx, JSObject *obj, jsid id,
 
     JS_LOCK_OBJ(cx, obj);
     scope = OBJ_SCOPE(obj);
-    *foundp = (scope->lookup(id) != NULL);
+    *foundp = scope->hasProperty(id);
     JS_UNLOCK_SCOPE(cx, scope);
     return JS_TRUE;
 }
@@ -4072,7 +4082,7 @@ JS_NewPropertyIterator(JSContext *cx, JSObject *obj)
     if (OBJ_IS_NATIVE(obj)) {
         /* Native case: start with the last property in obj's own scope. */
         scope = OBJ_SCOPE(obj);
-        pdata = scope->lastProp;
+        pdata = scope->lastProperty();
         index = -1;
     } else {
         /*
@@ -4115,15 +4125,12 @@ JS_NextProperty(JSContext *cx, JSObject *iterobj, jsid *idp)
 
         /*
          * If the next property mapped by scope in the property tree ancestor
-         * line is not enumerable, or it's an alias, or one or more properties
-         * were deleted from the "middle" of the scope-mapped ancestor line
-         * and the next property was among those deleted, skip it and keep on
-         * trying to find an enumerable property that is still in scope.
+         * line is not enumerable, or it's an alias, skip it and keep on trying
+         * to find an enumerable property that is still in scope.
          */
         while (sprop &&
                (!(sprop->attrs & JSPROP_ENUMERATE) ||
-                (sprop->flags & SPROP_IS_ALIAS) ||
-                (scope->hadMiddleDelete() && !scope->has(sprop)))) {
+                (sprop->flags & SPROP_IS_ALIAS))) {
             sprop = sprop->parent;
         }
 
@@ -4270,7 +4277,7 @@ JS_CloneFunctionObject(JSContext *cx, JSObject *funobj, JSObject *parent)
      * but looking up the property by name instead of frame slot.
      */
     if (FUN_FLAT_CLOSURE(fun)) {
-        JS_ASSERT(DSLOTS_IS_NOT_NULL(funobj));
+        JS_ASSERT(funobj->dslots);
         if (!js_EnsureReservedSlots(cx, clone,
                                     fun->countInterpretedReservedSlots())) {
             return NULL;
@@ -4898,9 +4905,10 @@ JS_DecompileScript(JSContext *cx, JSScript *script, const char *name,
     JSString *str;
 
     CHECK_REQUEST(cx);
-    jp = JS_NEW_PRINTER(cx, name, NULL,
-                        indent & ~JS_DONT_PRETTY_PRINT,
-                        !(indent & JS_DONT_PRETTY_PRINT));
+    jp = js_NewPrinter(cx, name, NULL,
+                       indent & ~JS_DONT_PRETTY_PRINT,
+                       !(indent & JS_DONT_PRETTY_PRINT),
+                       false, false);
     if (!jp)
         return NULL;
     if (js_DecompileScript(jp, script))
@@ -4914,41 +4922,21 @@ JS_DecompileScript(JSContext *cx, JSScript *script, const char *name,
 JS_PUBLIC_API(JSString *)
 JS_DecompileFunction(JSContext *cx, JSFunction *fun, uintN indent)
 {
-    JSPrinter *jp;
-    JSString *str;
-
     CHECK_REQUEST(cx);
-    jp = JS_NEW_PRINTER(cx, "JS_DecompileFunction", fun,
-                        indent & ~JS_DONT_PRETTY_PRINT,
-                        !(indent & JS_DONT_PRETTY_PRINT));
-    if (!jp)
-        return NULL;
-    if (js_DecompileFunction(jp))
-        str = js_GetPrinterOutput(jp);
-    else
-        str = NULL;
-    js_DestroyPrinter(jp);
-    return str;
+    return js_DecompileToString(cx, "JS_DecompileFunction", fun,
+                                indent & ~JS_DONT_PRETTY_PRINT,
+                                !(indent & JS_DONT_PRETTY_PRINT),
+                                false, false, js_DecompileFunction);
 }
 
 JS_PUBLIC_API(JSString *)
 JS_DecompileFunctionBody(JSContext *cx, JSFunction *fun, uintN indent)
 {
-    JSPrinter *jp;
-    JSString *str;
-
     CHECK_REQUEST(cx);
-    jp = JS_NEW_PRINTER(cx, "JS_DecompileFunctionBody", fun,
-                        indent & ~JS_DONT_PRETTY_PRINT,
-                        !(indent & JS_DONT_PRETTY_PRINT));
-    if (!jp)
-        return NULL;
-    if (js_DecompileFunctionBody(jp))
-        str = js_GetPrinterOutput(jp);
-    else
-        str = NULL;
-    js_DestroyPrinter(jp);
-    return str;
+    return js_DecompileToString(cx, "JS_DecompileFunctionBody", fun,
+                                indent & ~JS_DONT_PRETTY_PRINT,
+                                !(indent & JS_DONT_PRETTY_PRINT),
+                                false, false, js_DecompileFunctionBody);
 }
 
 JS_PUBLIC_API(JSBool)
@@ -4967,7 +4955,6 @@ JS_ExecuteScriptPart(JSContext *cx, JSObject *obj, JSScript *script,
                      JSExecPart part, jsval *rval)
 {
     JSScript tmp;
-    JSDebugHooks *hooks;
     JSBool ok;
 
     /* Make a temporary copy of the JSScript structure and farble it a bit. */
@@ -4980,7 +4967,7 @@ JS_ExecuteScriptPart(JSContext *cx, JSObject *obj, JSScript *script,
     }
 
     /* Tell the debugger about our temporary copy of the script structure. */
-    hooks = cx->debugHooks;
+    const JSDebugHooks *hooks = cx->debugHooks;
     if (hooks->newScriptHook) {
         hooks->newScriptHook(cx, tmp.filename, tmp.lineno, &tmp, NULL,
                              hooks->newScriptHookData);
@@ -5151,10 +5138,17 @@ JS_TriggerAllOperationCallbacks(JSRuntime *rt)
 JS_PUBLIC_API(JSBool)
 JS_IsRunning(JSContext *cx)
 {
-    /* The use of cx->fp below is safe: if we're on trace, it is skipped. */
+    /*
+     * The use of cx->fp below is safe. Rationale: Here we don't care if the
+     * interpreter state is stale. We just want to know if there *is* any
+     * interpreter state.
+     */
     VOUCH_DOES_NOT_REQUIRE_STACK();
 
-    return JS_ON_TRACE(cx) || cx->fp != NULL;
+#ifdef JS_TRACER
+    JS_ASSERT_IF(JS_TRACE_MONITOR(cx).tracecx == cx, cx->fp);
+#endif
+    return cx->fp != NULL;
 }
 
 JS_PUBLIC_API(JSBool)

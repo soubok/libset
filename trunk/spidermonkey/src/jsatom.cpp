@@ -162,6 +162,7 @@ const char *const js_common_atom_names[] = {
     js_configurable_str,        /* configurableAtom             */
     js_writable_str,            /* writableAtom                 */
     js_value_str,               /* valueAtom                    */
+    "use strict",               /* useStrictAtom                */
 
 #if JS_HAS_XML_SUPPORT
     js_etago_str,               /* etagoAtom                    */
@@ -1173,6 +1174,20 @@ JSAtomList::rawRemove(JSCompiler *jsc, JSAtomListElement *ale, JSHashEntry **hep
     }
 
     --count;
+}
+
+JSAutoAtomList::~JSAutoAtomList()
+{
+    if (table) {
+        JS_HashTableDestroy(table);
+    } else {
+        JSHashEntry *hep = list; 
+        while (hep) {
+            JSHashEntry *next = hep->next;
+            js_free_temp_entry(compiler, hep, HT_FREE_ENTRY);
+            hep = next;
+        }
+    }
 }
 
 JSAtomListElement *

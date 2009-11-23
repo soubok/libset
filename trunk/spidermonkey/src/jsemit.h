@@ -226,6 +226,8 @@ struct JSTreeContext {              /* tree context for semantic checks */
     /* Test whether we're in a statement of given type. */
     bool inStatement(JSStmtType type);
 
+    inline bool needStrictChecks();
+
     /* 
      * sharpSlotBase is -1 or first slot of pair for [sharpArray, sharpDepth].
      * The parser calls ensureSharpSlots to allocate these two stack locals.
@@ -233,11 +235,6 @@ struct JSTreeContext {              /* tree context for semantic checks */
     int sharpSlotBase;
     bool ensureSharpSlots();
 };
-
-/*
- * Flags to propagate out of the blocks.
- */
-#define TCF_RETURN_FLAGS        (TCF_RETURN_EXPR | TCF_RETURN_VOID)
 
 #define TCF_COMPILING           0x01 /* JSTreeContext is JSCodeGenerator */
 #define TCF_IN_FUNCTION         0x02 /* parsing inside function body */
@@ -260,6 +257,7 @@ struct JSTreeContext {              /* tree context for semantic checks */
 #define TCF_NO_SCRIPT_RVAL    0x4000 /* API caller does not want result value
                                         from global script */
 #define TCF_HAS_SHARPS        0x8000 /* source contains sharp defs or uses */
+#define TCF_FUN_PARAM_EVAL   0x10000 /* function has parameter named 'eval' */
 
 /*
  * Set when parsing a declaration-like destructuring pattern.  This
@@ -283,6 +281,19 @@ struct JSTreeContext {              /* tree context for semantic checks */
 #define TCF_NEED_MUTABLE_SCRIPT 0x20000
 
 /*
+ * This function/global/eval code body contained a Use Strict
+ * Directive.  Treat certain strict warnings as errors, and forbid
+ * the use of 'with'.  See also TSF_STRICT_MODE_CODE,
+ * JSScript::strictModeCode, and JSREPORT_STRICT_ERROR.
+ */
+#define TCF_STRICT_MODE_CODE       0x40000
+
+/*
+ * Flags to propagate out of the blocks.
+ */
+#define TCF_RETURN_FLAGS        (TCF_RETURN_EXPR | TCF_RETURN_VOID)
+
+/*
  * Sticky deoptimization flags to propagate from FunctionBody.
  */
 #define TCF_FUN_FLAGS           (TCF_FUN_SETS_OUTER_NAME |                    \
@@ -291,7 +302,17 @@ struct JSTreeContext {              /* tree context for semantic checks */
                                  TCF_FUN_HEAVYWEIGHT     |                    \
                                  TCF_FUN_IS_GENERATOR    |                    \
                                  TCF_FUN_USES_OWN_NAME   |                    \
-                                 TCF_HAS_SHARPS)
+                                 TCF_HAS_SHARPS          |                    \
+                                 TCF_STRICT_MODE_CODE)
+
+/*
+ * Return true if we need to check for conditions that elicit
+ * JSOPTION_STRICT warnings or strict mode errors.
+ */
+inline bool JSTreeContext::needStrictChecks() {
+    return JS_HAS_STRICT_OPTION(compiler->context) ||
+           (flags & TCF_STRICT_MODE_CODE);
+}
 
 /*
  * Span-dependent instructions are jumps whose span (from the jump bytecode to
