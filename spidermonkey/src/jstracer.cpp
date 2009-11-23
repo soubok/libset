@@ -292,7 +292,7 @@ nanojit::Allocator::allocChunk(size_t nbytes)
 {
     VMAllocator *vma = (VMAllocator*)this;
     JS_ASSERT(!vma->outOfMemory());
-    void *p = calloc(1, nbytes);
+    void *p = js_calloc(nbytes);
     if (!p) {
         JS_ASSERT(nbytes < sizeof(vma->mReserve));
         vma->mOutOfMemory = true;
@@ -306,7 +306,7 @@ void
 nanojit::Allocator::freeChunk(void *p) {
     VMAllocator *vma = (VMAllocator*)this;
     if (p != &vma->mReserve[0])
-        free(p);
+        js_free(p);
 }
 
 void
@@ -791,7 +791,7 @@ TraceRecorder::tprint(const char *format, int count, nanojit::LIns *insa[])
 
     LIns* args_ins[] = { INS_CONSTPTR(args), INS_CONST(count), INS_CONSTPTR(data) };
     LIns* call_ins = lir->insCall(&PrintOnTrace_ci, args_ins);
-    guard(false, lir->ins_eq0(call_ins), MISMATCH_EXIT);    
+    guard(false, lir->ins_eq0(call_ins), MISMATCH_EXIT);
 }
 
 // Generate a 'printf'-type call from trace for debugging.
@@ -839,7 +839,7 @@ TraceRecorder::tprint(const char *format, LIns *ins1, LIns *ins2, LIns *ins3, LI
 }
 
 void
-TraceRecorder::tprint(const char *format, LIns *ins1, LIns *ins2, LIns *ins3, LIns *ins4, 
+TraceRecorder::tprint(const char *format, LIns *ins1, LIns *ins2, LIns *ins3, LIns *ins4,
                       LIns *ins5, LIns *ins6)
 {
     LIns* insa[] = { ins1, ins2, ins3, ins4, ins5, ins6 };
@@ -892,7 +892,7 @@ struct Tracker::TrackerPage*
 Tracker::addTrackerPage(const void* v)
 {
     jsuword base = getTrackerPageBase(v);
-    struct TrackerPage* p = (struct TrackerPage*) calloc(1, sizeof(*p));
+    struct TrackerPage* p = (struct TrackerPage*) js_calloc(sizeof(*p));
     p->base = base;
     p->next = pagelist;
     pagelist = p;
@@ -905,7 +905,7 @@ Tracker::clear()
     while (pagelist) {
         TrackerPage* p = pagelist;
         pagelist = pagelist->next;
-        free(p);
+        js_free(p);
     }
 }
 
@@ -3371,7 +3371,7 @@ FlushNativeStackFrame(JSContext* cx, unsigned callDepth, const JSTraceType* mp, 
         for (; n != 0; fp = fp->down) {
             --n;
             if (fp->argv) {
-                if (fp->argsobj && 
+                if (fp->argsobj &&
                     js_GetArgsPrivateNative(JSVAL_TO_OBJECT(fp->argsobj))) {
                     JSVAL_TO_OBJECT(fp->argsobj)->setPrivate(fp);
                 }
@@ -4936,7 +4936,7 @@ TraceRecorder::prepareTreeCall(TreeFragment* inner, LIns*& inner_sp_ins)
                           (long long int)sp_adj,
                           (long long int)treeInfo->nativeStackBase,
                           (long long int)ti->nativeStackBase);
-        ptrdiff_t sp_offset = 
+        ptrdiff_t sp_offset =
                 - treeInfo->nativeStackBase /* rebase sp to beginning of outer tree's stack */
                 + sp_adj /* adjust for stack in outer frame inner tree can't see */
                 + ti->maxNativeStackSlots * sizeof(double); /* plus the inner tree's stack */
@@ -9882,7 +9882,7 @@ TraceRecorder::newArguments()
     LIns* argc_ins = INS_CONST(cx->fp->argc);
     LIns* callee_ins = get(&cx->fp->argv[-2]);
     LIns* argv_ins = cx->fp->argc
-        ? lir->ins2(LIR_piadd, lirbuf->sp, 
+        ? lir->ins2(LIR_piadd, lirbuf->sp,
                     lir->insImmWord(nativespOffset(&cx->fp->argv[0])))
         : INS_CONSTPTR((void *) 2);
     js_ArgsPrivateNative *apn = js_ArgsPrivateNative::create(traceAlloc(), cx->fp->argc);
@@ -9909,7 +9909,7 @@ TraceRecorder::record_JSOP_ARGUMENTS()
         args_ins = newArguments();
     } else {
         // Generate LIR to create arguments only if it has not already been created.
-        
+
         LIns* mem_ins = lir->insAlloc(sizeof(jsval));
 
         LIns* br1 = lir->insBranch(LIR_jt, lir->ins_peq0(a_ins), NULL);
