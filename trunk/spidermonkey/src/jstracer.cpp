@@ -292,7 +292,7 @@ nanojit::Allocator::allocChunk(size_t nbytes)
 {
     VMAllocator *vma = (VMAllocator*)this;
     JS_ASSERT(!vma->outOfMemory());
-    void *p = js_calloc(nbytes);
+    void *p = calloc(1, nbytes);
     if (!p) {
         JS_ASSERT(nbytes < sizeof(vma->mReserve));
         vma->mOutOfMemory = true;
@@ -306,7 +306,7 @@ void
 nanojit::Allocator::freeChunk(void *p) {
     VMAllocator *vma = (VMAllocator*)this;
     if (p != &vma->mReserve[0])
-        js_free(p);
+        free(p);
 }
 
 void
@@ -391,13 +391,13 @@ InitJITLogController()
             "  treevis      spew that tracevis/tree.py can parse\n"
             "  ------ options for Nanojit ------\n"
             "  fragprofile  count entries and exits for each fragment\n"
-            "  activation   show activation info\n"
             "  liveness     show LIR liveness at start of rdr pipeline\n"
             "  readlir      show LIR as it enters the reader pipeline\n"
             "  aftersf      show LIR after StackFilter\n"
-            "  regalloc     show regalloc details\n"
             "  assembly     show final aggregated assembly code\n"
-            "  nocodeaddrs  don't show code addresses in assembly listings\n"
+            "  regalloc     show regalloc state in 'assembly' output\n"
+            "  activation   show activation state in 'assembly' output\n"
+            "  nocodeaddrs  omit code addresses in 'assembly' output\n"
             "\n"
         );
         exit(0);
@@ -791,7 +791,7 @@ TraceRecorder::tprint(const char *format, int count, nanojit::LIns *insa[])
 
     LIns* args_ins[] = { INS_CONSTPTR(args), INS_CONST(count), INS_CONSTPTR(data) };
     LIns* call_ins = lir->insCall(&PrintOnTrace_ci, args_ins);
-    guard(false, lir->ins_eq0(call_ins), MISMATCH_EXIT);
+    guard(false, lir->ins_eq0(call_ins), MISMATCH_EXIT);    
 }
 
 // Generate a 'printf'-type call from trace for debugging.
@@ -839,7 +839,7 @@ TraceRecorder::tprint(const char *format, LIns *ins1, LIns *ins2, LIns *ins3, LI
 }
 
 void
-TraceRecorder::tprint(const char *format, LIns *ins1, LIns *ins2, LIns *ins3, LIns *ins4,
+TraceRecorder::tprint(const char *format, LIns *ins1, LIns *ins2, LIns *ins3, LIns *ins4, 
                       LIns *ins5, LIns *ins6)
 {
     LIns* insa[] = { ins1, ins2, ins3, ins4, ins5, ins6 };
@@ -892,7 +892,7 @@ struct Tracker::TrackerPage*
 Tracker::addTrackerPage(const void* v)
 {
     jsuword base = getTrackerPageBase(v);
-    struct TrackerPage* p = (struct TrackerPage*) js_calloc(sizeof(*p));
+    struct TrackerPage* p = (struct TrackerPage*) calloc(1, sizeof(*p));
     p->base = base;
     p->next = pagelist;
     pagelist = p;
@@ -905,7 +905,7 @@ Tracker::clear()
     while (pagelist) {
         TrackerPage* p = pagelist;
         pagelist = pagelist->next;
-        js_free(p);
+        free(p);
     }
 }
 
@@ -2391,9 +2391,10 @@ TraceRecorder::TraceRecorder(JSContext* cx, VMSideExit* anchor, VMFragment* frag
                                                &js_LogController);
         }
     )
+    // CseFilter must be downstream of SoftFloatFilter (see bug 527754 for why).
+    lir = new (tempAlloc()) CseFilter(lir, tempAlloc());
     if (nanojit::AvmCore::config.soft_float)
         lir = new (tempAlloc()) SoftFloatFilter(lir);
-    lir = new (tempAlloc()) CseFilter(lir, tempAlloc());
     lir = new (tempAlloc()) ExprFilter(lir);
     lir = new (tempAlloc()) FuncFilter(lir);
 #ifdef DEBUG
@@ -3371,7 +3372,7 @@ FlushNativeStackFrame(JSContext* cx, unsigned callDepth, const JSTraceType* mp, 
         for (; n != 0; fp = fp->down) {
             --n;
             if (fp->argv) {
-                if (fp->argsobj &&
+                if (fp->argsobj && 
                     js_GetArgsPrivateNative(JSVAL_TO_OBJECT(fp->argsobj))) {
                     JSVAL_TO_OBJECT(fp->argsobj)->setPrivate(fp);
                 }
@@ -4280,6 +4281,17 @@ TraceRecorder::compile()
     if (outOfMemory())
         return ARECORD_STOP;
 
+    /* :TODO: windows support */
+#if defined DEBUG && !defined WIN32
+    /* Associate a filename and line number with the fragment. */
+    const char* filename = cx->fp->script->filename;
+    char* label = (char*)js_malloc((filename ? strlen(filename) : 7) + 16);
+    sprintf(label, "%s:%u", filename ? filename : "<stdin>",
+            js_FramePCToLineNumber(cx, cx->fp));
+    traceMonitor->labels->add(fragment, sizeof(Fragment), 0, label);
+    js_free(label);
+#endif
+
     Assembler *assm = traceMonitor->assembler;
     JS_ASSERT(assm->error() == nanojit::None);
     nanojit::compile(assm, fragment, tempAlloc() verbose_only(, traceMonitor->labels));
@@ -4308,15 +4320,6 @@ TraceRecorder::compile()
     if (fragment == fragment->root)
         fragment->root->treeInfo = treeInfo;
 
-    /* :TODO: windows support */
-#if defined DEBUG && !defined WIN32
-    const char* filename = cx->fp->script->filename;
-    char* label = (char*)js_malloc((filename ? strlen(filename) : 7) + 16);
-    sprintf(label, "%s:%u", filename ? filename : "<stdin>",
-            js_FramePCToLineNumber(cx, cx->fp));
-    traceMonitor->labels->add(fragment, sizeof(Fragment), 0, label);
-    js_free(label);
-#endif
     return ARECORD_CONTINUE;
 }
 
@@ -4936,7 +4939,7 @@ TraceRecorder::prepareTreeCall(TreeFragment* inner, LIns*& inner_sp_ins)
                           (long long int)sp_adj,
                           (long long int)treeInfo->nativeStackBase,
                           (long long int)ti->nativeStackBase);
-        ptrdiff_t sp_offset =
+        ptrdiff_t sp_offset = 
                 - treeInfo->nativeStackBase /* rebase sp to beginning of outer tree's stack */
                 + sp_adj /* adjust for stack in outer frame inner tree can't see */
                 + ti->maxNativeStackSlots * sizeof(double); /* plus the inner tree's stack */
@@ -7877,15 +7880,17 @@ JS_DEFINE_CALLINFO_4(extern, UINT32, GetClosureArg, CONTEXT, OBJECT, CVIPTR, DOU
  *     NameResult   describes how to look up name; see comment for NameResult in jstracer.h
  */
 JS_REQUIRES_STACK AbortableRecordingStatus
-TraceRecorder::scopeChainProp(JSObject* obj, jsval*& vp, LIns*& ins, NameResult& nr)
+TraceRecorder::scopeChainProp(JSObject* chainHead, jsval*& vp, LIns*& ins, NameResult& nr)
 {
-    JS_ASSERT(obj != globalObj);
+    JS_ASSERT(chainHead == cx->fp->scopeChain);
+    JS_ASSERT(chainHead != globalObj);
 
     JSTraceMonitor &localtm = *traceMonitor;
 
     JSAtom* atom = atoms[GET_INDEX(cx->fp->regs->pc)];
     JSObject* obj2;
     JSProperty* prop;
+    JSObject *obj = chainHead;
     bool ok = js_FindProperty(cx, ATOM_TO_JSID(atom), &obj, &obj2, &prop);
 
     /* js_FindProperty can reenter the interpreter and kill |this|. */
@@ -7901,13 +7906,19 @@ TraceRecorder::scopeChainProp(JSObject* obj, jsval*& vp, LIns*& ins, NameResult&
     if (obj == globalObj) {
         // Even if the property is on the global object, we must guard against
         // the creation of properties that shadow the property in the middle
-        // of the scope chain if we are in a function.
+        // of the scope chain.
+        LIns *head_ins;
         if (cx->fp->argv) {
-            LIns* obj_ins;
-            JSObject* parent = STOBJ_GET_PARENT(cx->fp->calleeObject());
-            LIns* parent_ins = stobj_get_parent(get(&cx->fp->argv[-2]));
-            CHECK_STATUS_A(traverseScopeChain(parent, parent_ins, obj, obj_ins));
+            // Skip any Call object when inside a function. Any reference to a
+            // Call name the compiler resolves statically and we do not need
+            // to match shapes of the Call objects.
+            chainHead = cx->fp->calleeObject()->getParent();
+            head_ins = stobj_get_parent(get(&cx->fp->argv[-2]));
+        } else {
+            head_ins = scopeChain();
         }
+        LIns *obj_ins;
+        CHECK_STATUS_A(traverseScopeChain(chainHead, head_ins, obj, obj_ins));
 
         JSScopeProperty* sprop = (JSScopeProperty*) prop;
 
@@ -8991,7 +9002,7 @@ DumpShape(JSObject* obj, const char* prefix)
     }
 
     fprintf(shapefp, "\n%s: shape %u flags %x\n", prefix, scope->shape, scope->flags);
-    for (JSScopeProperty* sprop = scope->lastProperty(); sprop; sprop = sprop->parent) {
+    for (JSScopeProperty* sprop = scope->lastProp; sprop; sprop = sprop->parent) {
         if (JSID_IS_ATOM(sprop->id)) {
             fprintf(shapefp, " %s", JS_GetStringBytes(JSVAL_TO_STRING(ID_TO_VALUE(sprop->id))));
         } else {
@@ -9936,7 +9947,7 @@ TraceRecorder::newArguments()
     LIns* argc_ins = INS_CONST(cx->fp->argc);
     LIns* callee_ins = get(&cx->fp->argv[-2]);
     LIns* argv_ins = cx->fp->argc
-        ? lir->ins2(LIR_piadd, lirbuf->sp,
+        ? lir->ins2(LIR_piadd, lirbuf->sp, 
                     lir->insImmWord(nativespOffset(&cx->fp->argv[0])))
         : INS_CONSTPTR((void *) 2);
     js_ArgsPrivateNative *apn = js_ArgsPrivateNative::create(traceAlloc(), cx->fp->argc);
@@ -9963,7 +9974,7 @@ TraceRecorder::record_JSOP_ARGUMENTS()
         args_ins = newArguments();
     } else {
         // Generate LIR to create arguments only if it has not already been created.
-
+        
         LIns* mem_ins = lir->insAlloc(sizeof(jsval));
 
         LIns* br1 = lir->insBranch(LIR_jt, lir->ins_peq0(a_ins), NULL);
@@ -11204,7 +11215,7 @@ TraceRecorder::setProp(jsval &l, JSPropCacheEntry* entry, JSScopeProperty* sprop
     LIns* obj_ins = get(&l);
     JSScope* scope = OBJ_SCOPE(obj);
 
-    JS_ASSERT_IF(entry->vcap == PCVCAP_MAKE(entry->kshape, 0, 0), scope->hasProperty(sprop));
+    JS_ASSERT_IF(entry->vcap == PCVCAP_MAKE(entry->kshape, 0, 0), scope->has(sprop));
 
     // Fast path for CallClass. This is about 20% faster than the general case.
     v_ins = get(&v);
@@ -11226,7 +11237,7 @@ TraceRecorder::setProp(jsval &l, JSPropCacheEntry* entry, JSScopeProperty* sprop
     jsuword pcval;
     CHECK_STATUS(guardPropertyCacheHit(obj_ins, map_ins, obj, obj2, entry, pcval));
     JS_ASSERT(scope->object == obj2);
-    JS_ASSERT(scope->hasProperty(sprop));
+    JS_ASSERT(scope->has(sprop));
     JS_ASSERT_IF(obj2 != obj, sprop->attrs & JSPROP_SHARED);
 
     /*
@@ -12532,7 +12543,7 @@ TraceRecorder::prop(JSObject* obj, LIns* obj_ins, uint32 *slotp, LIns** v_insp, 
 
     if (PCVAL_IS_SPROP(pcval)) {
         sprop = PCVAL_TO_SPROP(pcval);
-        JS_ASSERT(OBJ_SCOPE(obj2)->hasProperty(sprop));
+        JS_ASSERT(OBJ_SCOPE(obj2)->has(sprop));
 
         if (setflags && !SPROP_HAS_STUB_SETTER(sprop))
             RETURN_STOP_A("non-stub setter");
