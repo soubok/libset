@@ -48,6 +48,32 @@
 
 JS_BEGIN_EXTERN_C
 
+#define JS_HAS_JSLIBS_RegisterCustomAllocators
+
+extern JS_PUBLIC_API(void)
+JSLIBS_RegisterCustomAllocators(
+  void* (*)( size_t ),
+  void* (*)( size_t, size_t ),
+  void* (*)( size_t, size_t ),
+  void* (*)( void*, size_t ),
+  size_t (*)( void* ),
+  void (*)( void* )
+);
+
+extern void* (*custom_malloc)( size_t );
+extern void* (*custom_calloc)( size_t, size_t );
+extern void* (*custom_realloc)( void*, size_t );
+extern void (*custom_free)( void* );
+
+JS_END_EXTERN_C
+
+#define malloc custom_malloc
+#define calloc custom_calloc
+#define realloc custom_realloc
+#define free custom_free
+
+JS_BEGIN_EXTERN_C
+
 /*
  * JS_Assert is present even in release builds, for the benefit of applications
  * that build DEBUG and link against a non-DEBUG SpiderMonkey library.
@@ -300,5 +326,10 @@ public:
 #endif /* !defined(DEBUG) */
 
 #endif /* defined(__cplusplus) */
+
+#undef malloc
+#undef calloc
+#undef realloc
+#undef free
 
 #endif /* jsutil_h___ */
