@@ -107,7 +107,7 @@ nanojit::Allocator::allocChunk(size_t nbytes)
 {
     VMAllocator *vma = (VMAllocator*)this;
     JS_ASSERT(!vma->outOfMemory());
-    void *p = calloc(1, nbytes);
+    void *p = js_calloc(nbytes);
     if (!p) {
         JS_ASSERT(nbytes < sizeof(vma->mReserve));
         vma->mOutOfMemory = true;
@@ -121,7 +121,7 @@ void
 nanojit::Allocator::freeChunk(void *p) {
     VMAllocator *vma = (VMAllocator*)this;
     if (p != &vma->mReserve[0])
-        free(p);
+        js_free(p);
 }
 
 void
@@ -938,7 +938,7 @@ struct Tracker::TrackerPage*
 Tracker::addTrackerPage(const void* v)
 {
     jsuword base = getTrackerPageBase(v);
-    struct TrackerPage* p = (struct TrackerPage*) calloc(1, sizeof(*p));
+    struct TrackerPage* p = (struct TrackerPage*) js_calloc(sizeof(*p));
     p->base = base;
     p->next = pagelist;
     pagelist = p;
@@ -951,7 +951,7 @@ Tracker::clear()
     while (pagelist) {
         TrackerPage* p = pagelist;
         pagelist = pagelist->next;
-        free(p);
+        js_free(p);
     }
 }
 
