@@ -1325,6 +1325,15 @@ extern JS_PUBLIC_API(uint32)
 JS_GetGCParameterForThread(JSContext *cx, JSGCParamKey key);
 
 /*
+ * Flush the code cache for the current thread. The operation might be
+ * delayed if the cache cannot be flushed currently because native
+ * code is currently executing.
+ */
+
+extern JS_PUBLIC_API(void)
+JS_FlushCaches(JSContext *cx);
+
+/*
  * Add a finalizer for external strings created by JS_NewExternalString (see
  * below) using a type-code returned from this function, and that understands
  * how to free or release the memory pointed at by JS_GetStringChars(str).
@@ -2355,14 +2364,6 @@ JS_IsRunning(JSContext *cx);
 
 extern JS_PUBLIC_API(JSBool)
 JS_IsConstructing(JSContext *cx);
-
-/*
- * Returns true if a script is executing and its current bytecode is a set
- * (assignment) operation, even if there are native (no script) stack frames
- * between the script and the caller to JS_IsAssigning.
- */
-extern JS_FRIEND_API(JSBool)
-JS_IsAssigning(JSContext *cx);
 
 /*
  * Saving and restoring frame chains.

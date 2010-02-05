@@ -71,11 +71,34 @@
 #include "jsstr.h"
 #include "jstracer.h"
 
+using namespace js;
+
 static void
 FreeContext(JSContext *cx);
 
 static void
 MarkLocalRoots(JSTracer *trc, JSLocalRootStack *lrs);
+
+#ifdef DEBUG
+bool
+CallStack::contains(JSStackFrame *fp)
+{
+    JSStackFrame *start;
+    JSStackFrame *stop;
+    if (isSuspended()) {
+        start = suspendedFrame;
+        stop = initialFrame->down;
+    } else {
+        start = cx->fp;
+        stop = cx->activeCallStack()->initialFrame->down;
+    }
+    for (JSStackFrame *f = start; f != stop; f = f->down) {
+        if (f == fp)
+            return true;
+    }
+    return false;
+}
+#endif
 
 void
 JSThreadData::init()
@@ -86,7 +109,7 @@ JSThreadData::init()
         JS_ASSERT(reinterpret_cast<uint8*>(this)[i] == 0);
 #endif
 #ifdef JS_TRACER
-    js_InitJIT(&traceMonitor);
+    InitJIT(&traceMonitor);
 #endif
     js_InitRandom(this);
 }
@@ -107,7 +130,7 @@ JSThreadData::finish()
     js_FinishGSNCache(&gsnCache);
     js_FinishPropertyCache(&propertyCache);
 #if defined JS_TRACER
-    js_FinishJIT(&traceMonitor);
+    FinishJIT(&traceMonitor);
 #endif
 }
 
@@ -529,6 +552,9 @@ js_NewContext(JSRuntime *rt, size_t stackChunkSize)
             ok = js_InitRuntimeNumberState(cx);
         if (ok)
             ok = js_InitRuntimeStringState(cx);
+        if (ok)
+            ok = JSScope::initRuntimeState(cx);
+
 #ifdef JS_THREADSAFE
         JS_EndRequest(cx);
 #endif
@@ -731,7 +757,7 @@ js_DestroyContext(JSContext *cx, JSDestroyContextMode mode)
                 JS_BeginRequest(cx);
 #endif
 
-            /* Unlock and clear GC things held by runtime pointers. */
+            JSScope::finishRuntimeState(cx);
             js_FinishRuntimeNumberState(cx);
             js_FinishRuntimeStringState(cx);
 
@@ -906,44 +932,6 @@ js_WaitForGC(JSRuntime *rt)
             JS_AWAIT_GC_DONE(rt);
         } while (rt->gcRunning);
     }
-}
-
-uint32
-js_DiscountRequestsForGC(JSContext *cx)
-{
-    uint32 requestDebit;
-
-    JS_ASSERT(cx->thread);
-    JS_ASSERT(cx->runtime->gcThread != cx->thread);
-
-#ifdef JS_TRACER
-    if (JS_ON_TRACE(cx)) {
-        JS_UNLOCK_GC(cx->runtime);
-        js_LeaveTrace(cx);
-        JS_LOCK_GC(cx->runtime);
-    }
-#endif
-
-    requestDebit = js_CountThreadRequests(cx);
-    if (requestDebit != 0) {
-        JSRuntime *rt = cx->runtime;
-        JS_ASSERT(requestDebit <= rt->requestCount);
-        rt->requestCount -= requestDebit;
-        if (rt->requestCount == 0)
-            JS_NOTIFY_REQUEST_DONE(rt);
-    }
-    return requestDebit;
-}
-
-void
-js_RecountRequestsAfterGC(JSRuntime *rt, uint32 requestDebit)
-{
-    while (rt->gcLevel > 0) {
-        JS_ASSERT(rt->gcThread);
-        JS_AWAIT_GC_DONE(rt);
-    }
-    if (requestDebit != 0)
-        rt->requestCount += requestDebit;
 }
 
 #endif
@@ -1281,7 +1269,8 @@ MarkLocalRoots(JSTracer *trc, JSLocalRootStack *lrs)
 }
 
 static void
-ReportError(JSContext *cx, const char *message, JSErrorReport *reportp)
+ReportError(JSContext *cx, const char *message, JSErrorReport *reportp,
+            JSErrorCallback callback, void *userRef)
 {
     /*
      * Check the error report, and set a JavaScript-catchable exception
@@ -1290,7 +1279,8 @@ ReportError(JSContext *cx, const char *message, JSErrorReport *reportp)
      * on the error report, and exception-aware hosts should ignore it.
      */
     JS_ASSERT(reportp);
-    if (reportp->errorNumber == JSMSG_UNCAUGHT_EXCEPTION)
+    if ((!callback || callback == js_GetErrorMessage) &&
+        reportp->errorNumber == JSMSG_UNCAUGHT_EXCEPTION)
         reportp->flags |= JSREPORT_EXCEPTION;
 
     /*
@@ -1301,7 +1291,8 @@ ReportError(JSContext *cx, const char *message, JSErrorReport *reportp)
      * propagates out of scope.  This is needed for compatability
      * with the old scheme.
      */
-    if (!JS_IsRunning(cx) || !js_ErrorToException(cx, message, reportp)) {
+    if (!JS_IsRunning(cx) ||
+        !js_ErrorToException(cx, message, reportp, callback, userRef)) {
         js_ReportErrorAgain(cx, message, reportp);
     } else if (cx->debugHooks->debugErrorHook && cx->errorReporter) {
         JSDebugErrorHook hook = cx->debugHooks->debugErrorHook;
@@ -1457,7 +1448,7 @@ js_ReportErrorVA(JSContext *cx, uintN flags, const char *format, va_list ap)
 
     warning = JSREPORT_IS_WARNING(report.flags);
 
-    ReportError(cx, message, &report);
+    ReportError(cx, message, &report, NULL, NULL);
     js_free(message);
     cx->free(ucmessage);
     return warning;
@@ -1651,7 +1642,7 @@ js_ReportErrorNumberVA(JSContext *cx, uintN flags, JSErrorCallback callback,
         return JS_FALSE;
     }
 
-    ReportError(cx, message, &report);
+    ReportError(cx, message, &report, callback, userRef);
 
     if (message)
         cx->free(message);
@@ -1947,4 +1938,18 @@ JSContext::checkMallocGCPressure(void *p)
         js_TriggerGC(this, true);
     }
     JS_UNLOCK_GC(runtime);
+}
+
+
+bool
+JSContext::isConstructing()
+{
+#ifdef JS_TRACER
+    if (JS_ON_TRACE(this)) {
+        JS_ASSERT(bailExit);
+        return *bailExit->pc == JSOP_NEW;
+    }
+#endif
+    JSStackFrame *fp = js_GetTopStackFrame(this);
+    return fp && (fp->flags & JSFRAME_CONSTRUCTING);
 }

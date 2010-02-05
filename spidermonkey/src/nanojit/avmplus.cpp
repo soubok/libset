@@ -35,11 +35,6 @@
 #include "nanojit.h"
 
 #ifdef SOLARIS
-	#include <ucontext.h>
-	#include <dlfcn.h>
-	#include <procfs.h>
-	#include <sys/stat.h>
-    extern "C" caddr_t _getfp(void);
     typedef caddr_t maddr_ptr;
 #else
     typedef void *maddr_ptr;
@@ -94,11 +89,13 @@ void*
 nanojit::CodeAlloc::allocCodeChunk(size_t nbytes) {
     void * buffer;
     posix_memalign(&buffer, 4096, nbytes);
+    VMPI_setPageProtection(buffer, nbytes, true /* exec */, true /* write */);
     return buffer;
 }
 
 void
 nanojit::CodeAlloc::freeCodeChunk(void *p, size_t nbytes) {
+    VMPI_setPageProtection(p, nbytes, false /* exec */, true /* write */);
     ::free(p);
 }
 
@@ -160,13 +157,28 @@ nanojit::CodeAlloc::freeCodeChunk(void *p, size_t nbytes) {
 
 void*
 nanojit::CodeAlloc::allocCodeChunk(size_t nbytes) {
-    return valloc(nbytes);
+    void* mem = valloc(nbytes);
+    VMPI_setPageProtection(mem, nbytes, true /* exec */, true /* write */);
+    return mem;
 }
 
 void
 nanojit::CodeAlloc::freeCodeChunk(void *p, size_t nbytes) {
+    VMPI_setPageProtection(p, nbytes, false /* exec */, true /* write */);
     ::free(p);
 }
 
 #endif // WIN32
+
+// All of the allocCodeChunk/freeCodeChunk implementations above allocate
+// code memory as RWX and then free it, so the explicit page protection api's
+// below are no-ops.
+
+void
+nanojit::CodeAlloc::markCodeChunkWrite(void*, size_t)
+{}
+
+void
+nanojit::CodeAlloc::markCodeChunkExec(void*, size_t)
+{}
 

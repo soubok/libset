@@ -277,7 +277,7 @@ ToDisassemblySource(JSContext *cx, jsval v)
 
         if (clasp == &js_BlockClass) {
             char *source = JS_sprintf_append(NULL, "depth %d {", OBJ_BLOCK_DEPTH(cx, obj));
-            for (JSScopeProperty *sprop = OBJ_SCOPE(obj)->lastProp;
+            for (JSScopeProperty *sprop = OBJ_SCOPE(obj)->lastProperty();
                  sprop;
                  sprop = sprop->parent) {
                 const char *bytes = js_AtomToPrintableString(cx, JSID_TO_ATOM(sprop->id));
@@ -1316,7 +1316,7 @@ GetLocal(SprintStack *ss, jsint i)
     }
 
     i -= depth;
-    for (sprop = OBJ_SCOPE(obj)->lastProp; sprop; sprop = sprop->parent) {
+    for (sprop = OBJ_SCOPE(obj)->lastProperty(); sprop; sprop = sprop->parent) {
         if (sprop->shortid == i)
             break;
     }
@@ -2525,8 +2525,13 @@ Decompile(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
                     break;
 
                   case SRC_HIDDEN:
-                    /* Hide this pop, it's from a goto in a with or for/in. */
+                    /*
+                     * Hide this pop. Don't adjust our stack depth model if
+                     * it's from a goto in a with or for/in.
+                     */
                     todo = -2;
+                    if (lastop == JSOP_UNBRAND)
+                        (void) POP_STR();
                     break;
 
                   case SRC_DECL:
@@ -2634,7 +2639,7 @@ Decompile(SprintStack *ss, jsbytecode *pc, intN nb, JSOp nextop)
                 MUST_FLOW_THROUGH("enterblock_out");
 #define LOCAL_ASSERT_OUT(expr) LOCAL_ASSERT_CUSTOM(expr, ok = JS_FALSE; \
                                                    goto enterblock_out)
-                for (sprop = OBJ_SCOPE(obj)->lastProp; sprop;
+                for (sprop = OBJ_SCOPE(obj)->lastProperty(); sprop;
                      sprop = sprop->parent) {
                     if (!(sprop->flags & SPROP_HAS_SHORTID))
                         continue;
@@ -5578,8 +5583,14 @@ ReconstructPCStack(JSContext *cx, JSScript *script, jsbytecode *target,
             }
         }
 
-        if (sn && SN_TYPE(sn) == SRC_HIDDEN)
+        /*
+         * Ignore early-exit code, which is SRC_HIDDEN, but do not ignore the
+         * hidden POP that sometimes appears after an UNBRAND. See bug 543565.
+         */
+        if (sn && SN_TYPE(sn) == SRC_HIDDEN &&
+            (op != JSOP_POP || js_GetOpcode(cx, script, pc - 1) != JSOP_UNBRAND)) {
             continue;
+        }
 
         if (SimulateOp(cx, script, op, cs, pc, pcstack, pcdepth) < 0)
             return -1;

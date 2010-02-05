@@ -382,6 +382,10 @@ SetContextOptions(JSContext *cx)
     JS_SetOperationCallback(cx, ShellOperationCallback);
 }
 
+#ifdef WINCE
+int errno;
+#endif
+
 static void
 Process(JSContext *cx, JSObject *obj, char *filename, JSBool forceTTY)
 {
@@ -412,7 +416,9 @@ Process(JSContext *cx, JSObject *obj, char *filename, JSBool forceTTY)
 
 #ifndef WINCE
     /* windows mobile (and possibly other os's) does not have a TTY */
-    if (!forceTTY && !isatty(fileno(file))) {
+    if (!forceTTY && !isatty(fileno(file)))
+#endif
+    {
         /*
          * It's not interactive - just execute it.
          *
@@ -444,7 +450,6 @@ Process(JSContext *cx, JSObject *obj, char *filename, JSBool forceTTY)
             fclose(file);
         return;
     }
-#endif /* WINCE */
 
     /* It's an interactive filehandle; drop into read-eval-print loop. */
     lineno = 1;
@@ -614,6 +619,13 @@ MapContextOptionNameToFlag(JSContext* cx, const char* name)
 
 extern JSClass global_class;
 
+#if defined(JS_TRACER) && defined(DEBUG)
+namespace js {
+    extern struct JSClass jitstats_class;
+    void InitJITStatsClass(JSContext *cx, JSObject *glob);
+}
+#endif
+
 static int
 ProcessArgs(JSContext *cx, JSObject *obj, char **argv, int argc)
 {
@@ -723,11 +735,9 @@ ProcessArgs(JSContext *cx, JSObject *obj, char **argv, int argc)
             enableJit = !enableJit;
             JS_ToggleOptions(cx, JSOPTION_JIT);
 #if defined(JS_TRACER) && defined(DEBUG)
-extern struct JSClass jitstats_class;
-extern void js_InitJITStatsClass(JSContext *cx, JSObject *glob);
-            js_InitJITStatsClass(cx, JS_GetGlobalObject(cx));
+            js::InitJITStatsClass(cx, JS_GetGlobalObject(cx));
             JS_DefineObject(cx, JS_GetGlobalObject(cx), "tracemonkey",
-                            &jitstats_class, NULL, 0);
+                            &js::jitstats_class, NULL, 0);
 #endif
             break;
 
@@ -1113,28 +1123,31 @@ AssertEq(JSContext *cx, uintN argc, jsval *vp)
 static JSBool
 GC(JSContext *cx, uintN argc, jsval *vp)
 {
-    JSRuntime *rt;
-    uint32 preBytes;
-
-    rt = cx->runtime;
-    preBytes = rt->gcBytes;
+    size_t preBytes = cx->runtime->gcBytes;
     JS_GC(cx);
 
     char buf[256];
     JS_snprintf(buf, sizeof(buf), "before %lu, after %lu, break %08lx\n",
-                (unsigned long)preBytes, (unsigned long)rt->gcBytes,
+                (unsigned long)preBytes, (unsigned long)cx->runtime->gcBytes,
 #ifdef HAVE_SBRK
                 (unsigned long)sbrk(0)
 #else
                 0
 #endif
                 );
-#ifdef JS_GCMETER
-    js_DumpGCStats(rt, stdout);
-#endif
     *vp = STRING_TO_JSVAL(JS_NewStringCopyZ(cx, buf));
-    return JS_TRUE;
+    return true;
 }
+
+#ifdef JS_GCMETER
+static JSBool
+GCStats(JSContext *cx, uintN argc, jsval *vp)
+{
+    js_DumpGCStats(cx->runtime, stdout);
+    *vp = JSVAL_VOID;
+    return true;
+}
+#endif
 
 static JSBool
 GCParameter(JSContext *cx, uintN argc, jsval *vp)
@@ -1754,10 +1767,37 @@ DisassembleValue(JSContext *cx, jsval v, bool lines, bool recursive)
 
 #undef SHOW_FLAG
 
-            if (FUN_NULL_CLOSURE(fun))
-                fputs(" NULL_CLOSURE", stdout);
-            else if (FUN_FLAT_CLOSURE(fun))
-                fputs(" FLAT_CLOSURE", stdout);
+            if (FUN_INTERPRETED(fun)) {
+                if (FUN_NULL_CLOSURE(fun))
+                    fputs(" NULL_CLOSURE", stdout);
+                else if (FUN_FLAT_CLOSURE(fun))
+                    fputs(" FLAT_CLOSURE", stdout);
+
+                if (fun->u.i.nupvars) {
+                    fputs("\nupvars: {\n", stdout);
+
+                    void *mark = JS_ARENA_MARK(&cx->tempPool);
+                    jsuword *localNames = js_GetLocalNameArray(cx, fun, &cx->tempPool);
+                    if (!localNames)
+                        return false;
+
+                    JSUpvarArray *uva = fun->u.i.script->upvars();
+                    uintN upvar_base = fun->countArgsAndVars();
+
+                    for (uint32 i = 0, n = uva->length; i < n; i++) {
+                        JSAtom *atom = JS_LOCAL_NAME_TO_ATOM(localNames[upvar_base + i]);
+                        uint32 cookie = uva->vector[i];
+
+                        printf("  %s: {skip:%u, slot:%u},\n",
+                               js_AtomToPrintableString(cx, atom),
+                               UPVAR_FRAME_SKIP(cookie),
+                               UPVAR_FRAME_SLOT(cookie));
+                    }
+
+                    JS_ARENA_RELEASE(&cx->tempPool, mark);
+                    putchar('}');
+                }
+            }
             putchar('\n');
         }
     }
@@ -3254,7 +3294,9 @@ Scatter(JSContext *cx, uintN argc, jsval *vp)
         );
         if (!newcx)
             goto fail;
+        JS_BeginRequest(newcx);
         JS_SetGlobalObject(newcx, JS_GetGlobalObject(cx));
+        JS_EndRequest(newcx);
         JS_ClearContextThread(newcx);
         sd.threads[i].cx = newcx;
     }
@@ -3707,6 +3749,9 @@ static JSFunctionSpec shell_functions[] = {
     JS_FS("quit",           Quit,           0,0,0),
     JS_FN("assertEq",       AssertEq,       2,0),
     JS_FN("gc",             ::GC,           0,0),
+#ifdef JS_GCMETER
+    JS_FN("gcstats",        GCStats,        0,0),
+#endif
     JS_FN("gcparam",        GCParameter,    2,0),
     JS_FN("countHeap",      CountHeap,      0,0),
 #ifdef JS_GC_ZEAL
@@ -3792,6 +3837,9 @@ static const char *const shell_help_messages[] = {
 "  Throw if the first two arguments are not the same (both +0 or both -0,\n"
 "  both NaN, or non-zero and ===)",
 "gc()                     Run the garbage collector",
+#ifdef JS_GCMETER
+"gcstats()                Print garbage collector statistics",
+#endif
 "gcparam(name, value)\n"
 "  Wrapper for JS_SetGCParameter. The name must be either 'maxBytes' or\n"
 "  'maxMallocBytes' and the value must be convertable to a positive uint32",

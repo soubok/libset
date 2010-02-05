@@ -157,8 +157,10 @@ struct JSStmtInfo {
 
 #ifdef JS_SCOPE_DEPTH_METER
 # define JS_SCOPE_DEPTH_METERING(code) ((void) (code))
+# define JS_SCOPE_DEPTH_METERING_IF(cond, code) ((cond) ? (void) (code) : (void) 0)
 #else
 # define JS_SCOPE_DEPTH_METERING(code) ((void) 0)
+# define JS_SCOPE_DEPTH_METERING_IF(code, x) ((void) 0)
 #endif
 
 struct JSTreeContext {              /* tree context for semantic checks */
@@ -208,15 +210,15 @@ struct JSTreeContext {              /* tree context for semantic checks */
     /*
      * For functions the tree context is constructed and destructed a second
      * time during code generation. To avoid a redundant stats update in such
-     * cases, we store (uintN) -1 in maxScopeDepth.
+     * cases, we store uint16(-1) in maxScopeDepth.
      */
     ~JSTreeContext() {
-        JS_SCOPE_DEPTH_METERING(maxScopeDepth == (uintN) -1 ||
-                                JS_BASIC_STATS_ACCUM(&compiler
-                                                       ->context
-                                                       ->runtime
-                                                       ->lexicalScopeDepthStats,
-                                                     maxScopeDepth));
+        JS_SCOPE_DEPTH_METERING_IF((maxScopeDepth != uint16(-1)),
+                                   JS_BASIC_STATS_ACCUM(&compiler
+                                                          ->context
+                                                          ->runtime
+                                                          ->lexicalScopeDepthStats,
+                                                        maxScopeDepth));
     }
 
     uintN blockid() { return topStmt ? topStmt->blockid : bodyid; }
@@ -234,6 +236,11 @@ struct JSTreeContext {              /* tree context for semantic checks */
      */
     int sharpSlotBase;
     bool ensureSharpSlots();
+
+    // Return true there is a generator function within |skip| lexical scopes
+    // (going upward) from this context's lexical scope. Always return true if
+    // this context is itself a generator.
+    bool skipSpansGenerator(unsigned skip);
 };
 
 #define TCF_COMPILING           0x01 /* JSTreeContext is JSCodeGenerator */
@@ -257,7 +264,6 @@ struct JSTreeContext {              /* tree context for semantic checks */
 #define TCF_NO_SCRIPT_RVAL    0x4000 /* API caller does not want result value
                                         from global script */
 #define TCF_HAS_SHARPS        0x8000 /* source contains sharp defs or uses */
-#define TCF_FUN_PARAM_EVAL   0x10000 /* function has parameter named 'eval' */
 
 /*
  * Set when parsing a declaration-like destructuring pattern.  This
@@ -281,15 +287,26 @@ struct JSTreeContext {              /* tree context for semantic checks */
 #define TCF_NEED_MUTABLE_SCRIPT 0x20000
 
 /*
- * This function/global/eval code body contained a Use Strict
- * Directive.  Treat certain strict warnings as errors, and forbid
- * the use of 'with'.  See also TSF_STRICT_MODE_CODE,
- * JSScript::strictModeCode, and JSREPORT_STRICT_ERROR.
+ * This function/global/eval code body contained a Use Strict Directive. Treat
+ * certain strict warnings as errors, and forbid the use of 'with'. See also
+ * TSF_STRICT_MODE_CODE, JSScript::strictModeCode, and JSREPORT_STRICT_ERROR.
  */
-#define TCF_STRICT_MODE_CODE       0x40000
+#define TCF_STRICT_MODE_CODE    0x40000
+
+/* Function has parameter named 'eval'. */
+#define TCF_FUN_PARAM_EVAL      0x80000
 
 /*
- * Flags to propagate out of the blocks.
+ * Flag signifying that the current function seems to be a constructor that
+ * sets this.foo to define "methods", at least one of which can't be a null
+ * closure, so we should avoid over-specializing property cache entries and
+ * trace inlining guards to method function object identity, which will vary
+ * per instance.
+ */
+#define TCF_FUN_UNBRAND_THIS   0x100000
+
+/*
+ * Flags to check for return; vs. return expr; in a function.
  */
 #define TCF_RETURN_FLAGS        (TCF_RETURN_EXPR | TCF_RETURN_VOID)
 

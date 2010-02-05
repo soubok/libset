@@ -54,6 +54,8 @@
     #define NANOJIT_SPARC
 #elif defined AVMPLUS_AMD64
     #define NANOJIT_X64
+#elif defined AVMPLUS_MIPS
+    #define NANOJIT_MIPS
 #else
     #error "unknown nanojit architecture"
 #endif
@@ -68,21 +70,6 @@
 #else
     #define IF_64BIT(...)
     #define UNLESS_64BIT(...) __VA_ARGS__
-#endif
-
-// set ARM_VFP constant if not already set
-#if !defined(ARM_VFP)
-    #ifdef AVMPLUS_ARM
-        #if defined(NJ_ARM_VFP)
-            #define ARM_VFP      1
-        #else
-            #define ARM_VFP      0
-        #endif
-    #else
-        // some LIR features should test VFP on ARM,
-        // but can be set to "always on" on non-ARM
-        #define ARM_VFP 1
-    #endif
 #endif
 
 // Embed no-op macros that let Valgrind work with the JIT.
@@ -152,10 +139,10 @@ namespace nanojit
 
 #ifdef AVMPLUS_VERBOSE
 #ifndef NJ_VERBOSE_DISABLED
-	#define NJ_VERBOSE 1
+    #define NJ_VERBOSE 1
 #endif
 #ifndef NJ_PROFILE_DISABLED
-	#define NJ_PROFILE 1
+    #define NJ_PROFILE 1
 #endif
 #endif
 
@@ -249,14 +236,13 @@ namespace nanojit {
            and below, so that callers can use bits 16 and above for
            themselves. */
         // TODO: add entries for the writer pipeline
-        LC_FragProfile = 1<<7, // collect per-frag usage counts
-        LC_Activation  = 1<<6, // enable printActivationState
-        LC_Liveness    = 1<<5, // (show LIR liveness analysis)
-        LC_ReadLIR     = 1<<4, // As read from LirBuffer
-        LC_AfterSF     = 1<<3, // After StackFilter
-        LC_RegAlloc    = 1<<2, // stuff to do with reg alloc
-        LC_Assembly    = 1<<1, // final assembly
-        LC_NoCodeAddrs = 1<<0  // (don't show code addresses on asm output)
+        LC_FragProfile = 1<<6, // collect per-frag usage counts
+        LC_Activation  = 1<<5, // enable printActivationState
+        LC_Liveness    = 1<<4, // (show LIR liveness analysis)
+        LC_ReadLIR     = 1<<3, // As read from LirBuffer
+        LC_AfterSF     = 1<<2, // After StackFilter
+        LC_RegAlloc    = 1<<1, // stuff to do with reg alloc
+        LC_Assembly    = 1<<0  // final assembly
     };
 
     class LogControl

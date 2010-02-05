@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set ts=8 sw=4 et tw=99:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -18,11 +18,12 @@
  * March 31, 1998.
  *
  * The Initial Developer of the Original Code is
- * Netscape Communications Corporation.
- * Portions created by the Initial Developer are Copyright (C) 1998
+ * Mozilla Corporation.
+ * Portions created by the Initial Developer are Copyright (C) 2010
  * the Initial Developer. All Rights Reserved.
  *
  * Contributor(s):
+ *   Igor Bukanov <igor@mir2.org>
  *
  * Alternatively, the contents of this file may be used under the terms of
  * either of the GNU General Public License Version 2 or later (the "GPL"),
@@ -38,49 +39,18 @@
  *
  * ***** END LICENSE BLOCK ***** */
 
-#ifndef jsobjinlines_h___
-#define jsobjinlines_h___
+#ifndef jsinterpinlines_h___
+#define jsinterpinlines_h___
 
-#include "jsobj.h"
+#include "jsinterp.h"
+#include "jslock.h"
 #include "jsscope.h"
 
-inline void
-JSObject::initSharingEmptyScope(JSClass *clasp, JSObject *proto, JSObject *parent,
-                                jsval privateSlotValue)
-{
-    init(clasp, proto, parent, privateSlotValue);
-
-    JSEmptyScope *emptyScope = OBJ_SCOPE(proto)->emptyScope;
-    JS_ASSERT(emptyScope->clasp == clasp);
-    emptyScope->hold();
-    map = emptyScope;
-}
-
-inline void
-JSObject::freeSlotsArray(JSContext *cx)
-{
-    JS_ASSERT(hasSlotsArray());
-    JS_ASSERT(size_t(dslots[-1]) > JS_INITIAL_NSLOTS);
-    cx->free(dslots - 1);
-}
-
 inline bool
-JSObject::unbrand(JSContext *cx)
+js_MatchPropertyCacheShape(JSContext *cx, JSObject *obj, uint32 shape)
 {
-    if (OBJ_IS_NATIVE(this)) {
-        JS_LOCK_OBJ(cx, this);
-        JSScope *scope = OBJ_SCOPE(this);
-        if (scope->isSharedEmpty()) {
-            scope = js_GetMutableScope(cx, this);
-            if (!scope) {
-                JS_UNLOCK_OBJ(cx, this);
-                return false;
-            }
-        }
-        scope->setGeneric();
-        JS_UNLOCK_SCOPE(cx, scope);
-    }
-    return true;
+    return CX_OWNS_OBJECT_TITLE(cx, obj) && OBJ_SHAPE(obj) == shape;
 }
 
-#endif /* jsobjinlines_h___ */
+
+#endif /* jsinterpinlines_h___ */
