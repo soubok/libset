@@ -65,9 +65,14 @@ JS_PUBLIC_API(void) JS_Assert(const char *s, const char *file, JSIntn ln)
 #if defined(WIN32)
     DebugBreak();
     exit(3);
+#elif defined(__APPLE__)
+    /*
+     * On Mac OS X, Breakpad ignores signals. Only real Mach exceptions are
+     * trapped.
+     */
+    *((int *) NULL) = 0;  /* To continue from here in GDB: "return" then "continue". */
 #else
-    /* In GDB, you can continue from here with the command "signal 0". */
-    raise(SIGABRT);
+    raise(SIGABRT);  /* To continue from here in GDB: "signal 0". */
 #endif
 }
 
@@ -361,24 +366,3 @@ JS_DumpBacktrace(JSCallsite *trace)
 }
 
 #endif /* defined(DEBUG_notme) && defined(XP_UNIX) */
-
-void* (*custom_malloc)( size_t ) = malloc;
-void* (*custom_calloc)( size_t, size_t ) = calloc;
-void* (*custom_realloc)( void*, size_t ) = realloc;
-void (*custom_free)( void* ) = free;
-
-void JSLIBS_RegisterCustomAllocators(
-	void* (*malloc_)( size_t ),
-	void* (*calloc_)( size_t, size_t ),
-	void* (*memalign_)( size_t, size_t ),
-	void* (*realloc_)( void*, size_t ),
-	size_t (*msize_)( void* ),
-	void (*free_)( void* )
-) {
-
-	custom_malloc = malloc_;
-	custom_calloc = calloc_;
-	custom_realloc = realloc_;
-	custom_free = free_;
-}
-

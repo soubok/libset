@@ -85,6 +85,7 @@
 #include "prmjtime.h"
 #include "jsstaticcheck.h"
 #include "jsvector.h"
+#include "jstypedarray.h"
 
 #include "jsatominlines.h"
 #include "jsscopeinlines.h"
@@ -96,6 +97,8 @@
 #if JS_HAS_XML_SUPPORT
 #include "jsxml.h"
 #endif
+
+using namespace js;
 
 #ifdef HAVE_VA_LIST_AS_ARRAY
 #define JS_ADDRESSOF_VA_LIST(ap) ((va_list *)(ap))
@@ -333,7 +336,7 @@ JS_PushArgumentsVA(JSContext *cx, void **markp, const char *format, va_list ap)
             continue;
         argc++;
     }
-    js_LeaveTrace(cx);
+    LeaveTrace(cx);
     sp = js_AllocStack(cx, argc, markp);
     if (!sp)
         return NULL;
@@ -968,7 +971,7 @@ JS_EndRequest(JSContext *cx)
     JS_ASSERT(cx->requestDepth > 0);
     JS_ASSERT(cx->outstandingRequests > 0);
     if (cx->requestDepth == 1) {
-        js_LeaveTrace(cx);  /* for GC safety */
+        LeaveTrace(cx);  /* for GC safety */
 
         /* Lock before clearing to interlock with ClaimScope, in jslock.c. */
         rt = cx->runtime;
@@ -1216,6 +1219,7 @@ JS_GetGlobalObject(JSContext *cx)
 JS_PUBLIC_API(void)
 JS_SetGlobalObject(JSContext *cx, JSObject *obj)
 {
+    CHECK_REQUEST(cx);
     cx->globalObject = obj;
 
 #if JS_HAS_XML_SUPPORT
@@ -1342,7 +1346,8 @@ JS_InitStandardClasses(JSContext *cx, JSObject *obj)
     /* Define a top-level property 'undefined' with the undefined value. */
     atom = cx->runtime->atomState.typeAtoms[JSTYPE_VOID];
     if (!obj->defineProperty(cx, ATOM_TO_JSID(atom), JSVAL_VOID,
-                             JS_PropertyStub, JS_PropertyStub, JSPROP_PERMANENT)) {
+                             JS_PropertyStub, JS_PropertyStub,
+                             JSPROP_PERMANENT | JSPROP_READONLY)) {
         return JS_FALSE;
     }
 
@@ -1360,6 +1365,7 @@ JS_InitStandardClasses(JSContext *cx, JSObject *obj)
            js_InitRegExpClass(cx, obj) &&
            js_InitStringClass(cx, obj) &&
            js_InitEval(cx, obj) &&
+           js_InitTypedArrayClasses(cx, obj) &&
 #if JS_HAS_SCRIPT_OBJECT
            js_InitScriptClass(cx, obj) &&
 #endif
@@ -1439,6 +1445,7 @@ static JSStdName standard_class_atoms[] = {
     {js_InitIteratorClasses,            EAGER_ATOM_AND_CLASP(StopIteration)},
 #endif
     {js_InitJSONClass,                  EAGER_ATOM_AND_CLASP(JSON)},
+    {js_InitTypedArrayClasses,          EAGER_CLASS_ATOM(ArrayBuffer), &js::ArrayBuffer::jsclass},
     {NULL,                              0, NULL, NULL}
 };
 
@@ -1491,6 +1498,18 @@ static JSStdName standard_class_names[] = {
     {js_InitIteratorClasses,    EAGER_ATOM_AND_CLASP(Iterator)},
     {js_InitIteratorClasses,    EAGER_ATOM_AND_CLASP(Generator)},
 #endif
+
+    /* Typed Arrays */
+    {js_InitTypedArrayClasses,  EAGER_CLASS_ATOM(ArrayBuffer), NULL},
+    {js_InitTypedArrayClasses,  EAGER_CLASS_ATOM(Int8Array), NULL},
+    {js_InitTypedArrayClasses,  EAGER_CLASS_ATOM(Uint8Array), NULL},
+    {js_InitTypedArrayClasses,  EAGER_CLASS_ATOM(Int16Array), NULL},
+    {js_InitTypedArrayClasses,  EAGER_CLASS_ATOM(Uint16Array), NULL},
+    {js_InitTypedArrayClasses,  EAGER_CLASS_ATOM(Int32Array), NULL},
+    {js_InitTypedArrayClasses,  EAGER_CLASS_ATOM(Uint32Array), NULL},
+    {js_InitTypedArrayClasses,  EAGER_CLASS_ATOM(Float32Array), NULL},
+    {js_InitTypedArrayClasses,  EAGER_CLASS_ATOM(Float64Array), NULL},
+    {js_InitTypedArrayClasses,  EAGER_CLASS_ATOM(Uint8ClampedArray), NULL},
 
     {NULL,                      0, NULL, NULL}
 };
@@ -1549,7 +1568,7 @@ JS_ResolveStandardClass(JSContext *cx, JSObject *obj, jsval id,
         *resolved = JS_TRUE;
         return obj->defineProperty(cx, ATOM_TO_JSID(atom), JSVAL_VOID,
                                    JS_PropertyStub, JS_PropertyStub,
-                                   JSPROP_PERMANENT);
+                                   JSPROP_PERMANENT | JSPROP_READONLY);
     }
 
     /* Try for class constructors/prototypes named by well-known atoms. */
@@ -1618,15 +1637,11 @@ JS_ResolveStandardClass(JSContext *cx, JSObject *obj, jsval id,
 static JSBool
 AlreadyHasOwnProperty(JSContext *cx, JSObject *obj, JSAtom *atom)
 {
-    JSScopeProperty *sprop;
-    JSScope *scope;
-
-    JS_ASSERT(OBJ_IS_NATIVE(obj));
     JS_LOCK_OBJ(cx, obj);
-    scope = OBJ_SCOPE(obj);
-    sprop = scope->lookup(ATOM_TO_JSID(atom));
+    JSScope *scope = OBJ_SCOPE(obj);
+    bool found = scope->hasProperty(ATOM_TO_JSID(atom));
     JS_UNLOCK_SCOPE(cx, scope);
-    return sprop != NULL;
+    return found;
 }
 
 JS_PUBLIC_API(JSBool)
@@ -2011,19 +2026,16 @@ JS_LockGCThingRT(JSRuntime *rt, void *thing)
 JS_PUBLIC_API(JSBool)
 JS_UnlockGCThing(JSContext *cx, void *thing)
 {
-    JSBool ok;
-
     CHECK_REQUEST(cx);
-    ok = js_UnlockGCThingRT(cx->runtime, thing);
-    if (!ok)
-        JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_CANT_UNLOCK);
-    return ok;
+    js_UnlockGCThingRT(cx->runtime, thing);
+    return true;
 }
 
 JS_PUBLIC_API(JSBool)
 JS_UnlockGCThingRT(JSRuntime *rt, void *thing)
 {
-    return js_UnlockGCThingRT(rt, thing);
+    js_UnlockGCThingRT(rt, thing);
+    return true;
 }
 
 JS_PUBLIC_API(void)
@@ -2038,7 +2050,7 @@ JS_TraceRuntime(JSTracer *trc)
 {
     JSBool allAtoms = trc->context->runtime->gcKeepAtoms != 0;
 
-    js_LeaveTrace(trc->context);
+    LeaveTrace(trc->context);
     js_TraceRuntime(trc, allAtoms);
 }
 
@@ -2444,7 +2456,7 @@ JS_IsGCMarkingTracer(JSTracer *trc)
 JS_PUBLIC_API(void)
 JS_GC(JSContext *cx)
 {
-    js_LeaveTrace(cx);
+    LeaveTrace(cx);
 
     /* Don't nuke active arenas if executing or compiling. */
     if (cx->stackPool.current == &cx->stackPool.first)
@@ -2546,7 +2558,7 @@ JS_PUBLIC_API(JSBool)
 JS_IsAboutToBeFinalized(JSContext *cx, void *thing)
 {
     JS_ASSERT(thing);
-    return js_IsAboutToBeFinalized(cx, thing);
+    return js_IsAboutToBeFinalized(thing);
 }
 
 JS_PUBLIC_API(void)
@@ -2595,7 +2607,7 @@ JS_SetGCParameterForThread(JSContext *cx, JSGCParamKey key, uint32 value)
 {
     JS_ASSERT(key == JSGC_MAX_CODE_CACHE_BYTES);
 #ifdef JS_TRACER
-    js_SetMaxCodeCacheBytes(cx, value);
+    SetMaxCodeCacheBytes(cx, value);
 #endif
 }
 
@@ -2607,6 +2619,14 @@ JS_GetGCParameterForThread(JSContext *cx, JSGCParamKey key)
     return JS_THREAD_DATA(cx)->traceMonitor.maxCodeCacheBytes;
 #else
     return 0;
+#endif
+}
+
+JS_PUBLIC_API(void)
+JS_FlushCaches(JSContext *cx)
+{
+#ifdef JS_TRACER
+    FlushJITCache(cx);
 #endif
 }
 
@@ -2953,6 +2973,8 @@ JS_SealObject(JSContext *cx, JSObject *obj, JSBool deep)
     nslots = scope->freeslot;
     for (i = 0; i != nslots; ++i) {
         v = STOBJ_GET_SLOT(obj, i);
+        if (i == JSSLOT_PRIVATE && (obj->getClass()->flags & JSCLASS_HAS_PRIVATE))
+            continue;
         if (JSVAL_IS_PRIMITIVE(v))
             continue;
         if (!JS_SealObject(cx, JSVAL_TO_OBJECT(v), deep))
@@ -3402,7 +3424,7 @@ AlreadyHasOwnPropertyHelper(JSContext *cx, JSObject *obj, jsid id,
 
     JS_LOCK_OBJ(cx, obj);
     scope = OBJ_SCOPE(obj);
-    *foundp = (scope->lookup(id) != NULL);
+    *foundp = scope->hasProperty(id);
     JS_UNLOCK_SCOPE(cx, scope);
     return JS_TRUE;
 }
@@ -4086,7 +4108,7 @@ JS_NewPropertyIterator(JSContext *cx, JSObject *obj)
     if (OBJ_IS_NATIVE(obj)) {
         /* Native case: start with the last property in obj's own scope. */
         scope = OBJ_SCOPE(obj);
-        pdata = scope->lastProp;
+        pdata = scope->lastProperty();
         index = -1;
     } else {
         /*
@@ -4129,15 +4151,12 @@ JS_NextProperty(JSContext *cx, JSObject *iterobj, jsid *idp)
 
         /*
          * If the next property mapped by scope in the property tree ancestor
-         * line is not enumerable, or it's an alias, or one or more properties
-         * were deleted from the "middle" of the scope-mapped ancestor line
-         * and the next property was among those deleted, skip it and keep on
-         * trying to find an enumerable property that is still in scope.
+         * line is not enumerable, or it's an alias, skip it and keep on trying
+         * to find an enumerable property that is still in scope.
          */
         while (sprop &&
                (!(sprop->attrs & JSPROP_ENUMERATE) ||
-                (sprop->flags & SPROP_IS_ALIAS) ||
-                (scope->hadMiddleDelete() && !scope->has(sprop)))) {
+                (sprop->flags & SPROP_IS_ALIAS))) {
             sprop = sprop->parent;
         }
 
@@ -5158,44 +5177,21 @@ JS_IsRunning(JSContext *cx)
     return cx->fp != NULL;
 }
 
+
+
 JS_PUBLIC_API(JSBool)
 JS_IsConstructing(JSContext *cx)
 {
-#ifdef JS_TRACER
-    if (JS_ON_TRACE(cx)) {
-        JS_ASSERT(cx->bailExit);
-        return *cx->bailExit->pc == JSOP_NEW;
-    }
-#endif
-
-    JSStackFrame *fp = js_GetTopStackFrame(cx);
-    return fp && (fp->flags & JSFRAME_CONSTRUCTING);
-}
-
-JS_FRIEND_API(JSBool)
-JS_IsAssigning(JSContext *cx)
-{
-    JSStackFrame *fp;
-
-    fp = js_GetScriptedCaller(cx, NULL);
-    if (!fp || !fp->regs)
-        return JS_FALSE;
-    return (js_CodeSpec[*fp->regs->pc].format & JOF_ASSIGNING) != 0;
+    return cx->isConstructing();
 }
 
 JS_PUBLIC_API(JSStackFrame *)
 JS_SaveFrameChain(JSContext *cx)
 {
-    JSStackFrame *fp;
-
-    fp = js_GetTopStackFrame(cx);
+    JSStackFrame *fp = js_GetTopStackFrame(cx);
     if (!fp)
-        return fp;
-
-    JS_ASSERT(!fp->dormantNext);
-    fp->dormantNext = cx->dormantFrameChain;
-    cx->dormantFrameChain = fp;
-    cx->fp = NULL;
+        return NULL;
+    cx->saveActiveCallStack();
     return fp;
 }
 
@@ -5206,11 +5202,7 @@ JS_RestoreFrameChain(JSContext *cx, JSStackFrame *fp)
     JS_ASSERT(!cx->fp);
     if (!fp)
         return;
-
-    JS_ASSERT(fp == cx->dormantFrameChain);
-    cx->fp = fp;
-    cx->dormantFrameChain = fp->dormantNext;
-    fp->dormantNext = NULL;
+    cx->restoreCallStack();
 }
 
 /************************************************************************/
@@ -5833,7 +5825,8 @@ JS_PUBLIC_API(JSBool)
 JS_ThrowReportedError(JSContext *cx, const char *message,
                       JSErrorReport *reportp)
 {
-    return JS_IsRunning(cx) && js_ErrorToException(cx, message, reportp);
+    return JS_IsRunning(cx) &&
+           js_ErrorToException(cx, message, reportp, NULL, NULL);
 }
 
 JS_PUBLIC_API(JSBool)

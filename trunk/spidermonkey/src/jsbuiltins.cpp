@@ -66,11 +66,12 @@
 
 using namespace avmplus;
 using namespace nanojit;
+using namespace js;
 
 JS_FRIEND_API(void)
 js_SetTraceableNativeFailed(JSContext *cx)
 {
-    js_SetBuiltinError(cx);
+    SetBuiltinError(cx);
 }
 
 /*
@@ -209,7 +210,7 @@ js_StringToInt32(JSContext* cx, JSString* str)
     const jschar* end;
     const jschar* ep;
     jsdouble d;
-    
+
     if (str->length() == 1) {
         jschar c = str->chars()[0];
         if ('0' <= c && c <= '9')
@@ -231,21 +232,23 @@ JS_DEFINE_CALLINFO_2(extern, INT32, js_StringToInt32, CONTEXT, STRING, 1, 1)
 JSBool FASTCALL
 js_AddProperty(JSContext* cx, JSObject* obj, JSScopeProperty* sprop)
 {
-    JS_ASSERT(OBJ_IS_NATIVE(obj));
     JS_LOCK_OBJ(cx, obj);
 
+    uint32 slot = sprop->slot;
     JSScope* scope = OBJ_SCOPE(obj);
-    uint32 slot;
-    if (scope->owned()) {
-        JS_ASSERT(!scope->has(sprop));
-    } else {
+    if (slot != scope->freeslot)
+        goto exit_trace;
+    JS_ASSERT(sprop->parent == scope->lastProperty());
+
+    if (scope->isSharedEmpty()) {
         scope = js_GetMutableScope(cx, obj);
         if (!scope)
             goto exit_trace;
+    } else {
+        JS_ASSERT(!scope->hasProperty(sprop));
     }
 
-    slot = sprop->slot;
-    if (!scope->table && sprop->parent == scope->lastProp && slot == scope->freeslot) {
+    if (!scope->table) {
         if (slot < STOBJ_NSLOTS(obj) && !OBJ_GET_CLASS(cx, obj)->reserveSlots) {
             JS_ASSERT(JSVAL_IS_VOID(STOBJ_GET_SLOT(obj, scope->freeslot)));
             ++scope->freeslot;
@@ -261,10 +264,9 @@ js_AddProperty(JSContext* cx, JSObject* obj, JSScopeProperty* sprop)
 
         scope->extend(cx, sprop);
     } else {
-        JSScopeProperty *sprop2 = scope->add(cx, sprop->id,
-                                             sprop->getter, sprop->setter,
-                                             SPROP_INVALID_SLOT, sprop->attrs,
-                                             sprop->flags, sprop->shortid);
+        JSScopeProperty *sprop2 =
+            scope->addProperty(cx, sprop->id, sprop->getter, sprop->setter, SPROP_INVALID_SLOT,
+                               sprop->attrs, sprop->flags, sprop->shortid);
         if (sprop2 != sprop)
             goto exit_trace;
     }
@@ -406,7 +408,7 @@ js_PopInterpFrame(JSContext* cx, InterpState* state)
     /* Update display table. */
     if (cx->fp->script->staticLevel < JS_DISPLAY_SIZE)
         cx->display[cx->fp->script->staticLevel] = cx->fp->displaySave;
-    
+
     /* Pop the frame and its memory. */
     cx->fp = cx->fp->down;
     JS_ASSERT(cx->fp->regs == &ifp->callerRegs);

@@ -71,16 +71,19 @@
 
 CLASS(  LFENCE,         0,  1)  //  1%  LIR_regfence, LIR_xbarrier
 
-CLASS(  LIMM_I,         0,  4)  //  5%  LIR_imm
-CLASS(  LIMM_Q,         1,  3)  //  8%  LIR_quad
-CLASS(  LIMM_F,         0,  4)  // 12%  LIR_float
+CLASS(  LALLOC,         0,  1)  //  2%  LIR_alloc
+
+CLASS(  LIMM_I,         0,  4)  //  6%  LIR_imm
+CLASS(  LIMM_Q,         1,  3)  //  9%  LIR_quad
+CLASS(  LIMM_F,         0,  3)  // 12%  LIR_float
 
 CLASS(  LOP_I_I,        0,  2)  // 14%  LIR_neg, LIR_not
 CLASS(  LOP_Q_Q,        1,  0)  // 14%  (none)
 CLASS(  LOP_F_F,        0,  2)  // 16%  LIR_fneg
 
 CLASS(  LOP_I_II,       0, 16)  // 32%  LIR_add, LIR_and, LIR_eq, etc.
-CLASS(  LOP_Q_QQ,       1,  9)  // 41%  LIR_qiadd, LIR_qiand, LIR_qeq, etc.
+CLASS(  LOP_Q_QQ,       1,  7)  // 39%  LIR_qiadd, LIR_qiand, LIR_qeq, etc.
+CLASS(  LOP_Q_QI,       1,  2)  // 41%  LIR_qilsh, LIR_qirsh, LIR_qursh
 CLASS(  LOP_F_FF,       0, 10)  // 51%  LIR_fadd, etc.
 
 // cmov has a low weight because is also used with LIR_div/LIR_mod.
@@ -93,18 +96,17 @@ CLASS(  LOP_B_FF,       0,  3)  // 63%  LIR_feq, LIR_flt, etc
 
 CLASS(  LOP_Q_I,        1,  2)  // 65%  LIR_i2q, LIR_u2q
 CLASS(  LOP_F_I,        0,  2)  // 67%  LIR_i2f, LIR_u2f
-
-CLASS(  LOP_I_F,        0,  2)  // 69%  LIR_qlo, LIR_qhi
+CLASS(  LOP_I_Q,        1,  1)  // 68%  LIR_q2i
+CLASS(  LOP_I_F,        0,  1)  // 69%  LIR_qlo, LIR_qhi, LIR_f2i
 CLASS(  LOP_F_II,       0,  1)  // 70%  LIR_qjoin
 
-    // XXX: "QorF" because the same opcode is used for both 64-bit int and
-    // 64-bit float loads.  Ditto for stores.  That should be fixed, see
-    // bug 520714. 
-CLASS(  LLD_I,          0,  4)  // 74%  LIR_ld
-CLASS(  LLD_QorF,       0,  4)  // 78%  LIR_ldq
+CLASS(  LLD_I,          0,  3)  // 73%  LIR_ld, LIR_ldc, LIR_ld*b, LIR_ld*s
+CLASS(  LLD_Q,          1,  2)  // 75%  LIR_ldq, LIR_ldqc
+CLASS(  LLD_F,          0,  3)  // 78%  LIR_ldf, LIR_ldfc
 
-CLASS(  LST_I,          0,  7)  // 85%  LIR_sti
-CLASS(  LST_QorF,       0,  7)  // 92%  LIR_stqi
+CLASS(  LST_I,          0,  5)  // 83%  LIR_sti
+CLASS(  LST_Q,          1,  4)  // 87%  LIR_stqi
+CLASS(  LST_F,          0,  5)  // 92%  LIR_stfi
 
 CLASS(  LCALL_I_I1,     0,  1)  // 93%  LIR_icall
 CLASS(  LCALL_I_I6,     0,  1)  // 94%  LIR_icall

@@ -145,15 +145,6 @@ js_CheckKeyword(const jschar *str, size_t length)
     return kw ? kw->tokentype : TOK_EOF;
 }
 
-JS_FRIEND_API(void)
-js_MapKeywords(void (*mapfun)(const char *))
-{
-    size_t i;
-
-    for (i = 0; i != KEYWORD_COUNT; ++i)
-        mapfun(keyword_defs[i].chars);
-}
-
 JSBool
 js_IsIdentifier(JSString *str)
 {
@@ -607,7 +598,7 @@ ReportCompileErrorNumberVA(JSContext *cx, JSTokenStream *ts, JSParseNode *pn,
      * which is likely spurious.
      */
     if (!(ts->flags & TSF_ERROR)) {
-        if (js_ErrorToException(cx, message, &report))
+        if (js_ErrorToException(cx, message, &report, NULL, NULL))
             onError = NULL;
     }
 

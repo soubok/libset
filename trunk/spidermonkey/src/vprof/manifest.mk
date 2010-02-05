@@ -1,4 +1,3 @@
-
 # ***** BEGIN LICENSE BLOCK *****
 # Version: MPL 1.1/GPL 2.0/LGPL 2.1
 #
@@ -15,8 +14,8 @@
 # The Original Code is [Open Source Virtual Machine].
 #
 # The Initial Developer of the Original Code is
-# Adobe System Incorporated.
-# Portions created by the Initial Developer are Copyright (C) 2005-2006
+# Intel Corporation.
+# Portions created by the Initial Developer are Copyright (C) 2008
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -35,49 +34,6 @@
 #
 # ***** END LICENSE BLOCK *****
 
-nanojit_cpu_cxxsrc = $(error Unrecognized target CPU.)
-
-ifeq (i686,$(TARGET_CPU))
-nanojit_cpu_cxxsrc := Nativei386.cpp
-endif
-
-ifeq (x86_64,$(TARGET_CPU))
-nanojit_cpu_cxxsrc := NativeX64.cpp
-endif
-
-ifeq (powerpc,$(TARGET_CPU))
-nanojit_cpu_cxxsrc := NativePPC.cpp
-endif
-
-ifeq (ppc64,$(TARGET_CPU))
-nanojit_cpu_cxxsrc := NativePPC.cpp
-endif
-
-ifeq (arm,$(TARGET_CPU))
-nanojit_cpu_cxxsrc := NativeARM.cpp
-endif
-
-ifeq (sparc,$(TARGET_CPU))
-nanojit_cpu_cxxsrc := NativeSparc.cpp
-endif
-
-ifeq (mips,$(TARGET_CPU))
-nanojit_cpu_cxxsrc := NativeMIPS.cpp
-endif
-
 avmplus_CXXSRCS := $(avmplus_CXXSRCS) \
-  $(curdir)/Allocator.cpp \
-  $(curdir)/Assembler.cpp \
-  $(curdir)/CodeAlloc.cpp \
-  $(curdir)/Containers.cpp \
-  $(curdir)/Fragmento.cpp \
-  $(curdir)/LIR.cpp \
-  $(curdir)/RegAlloc.cpp \
-  $(curdir)/$(nanojit_cpu_cxxsrc) \
+  $(curdir)/vprof.cpp \
   $(NULL)
-
-ifeq ($(COMPILER),VS)
-# Disable the 'cast truncates constant value' warning, incurred by
-# macros encoding instruction operands in machine code fields.
-$(curdir)/Assembler.obj $(curdir)/Nativei386.obj: avmplus_CXXFLAGS += -wd4310
-endif

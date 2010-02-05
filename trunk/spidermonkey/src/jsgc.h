@@ -148,11 +148,11 @@ js_ReserveObjects(JSContext *cx, size_t nobjects);
 extern JSBool
 js_LockGCThingRT(JSRuntime *rt, void *thing);
 
-extern JSBool
+extern void
 js_UnlockGCThingRT(JSRuntime *rt, void *thing);
 
-extern JSBool
-js_IsAboutToBeFinalized(JSContext *cx, void *thing);
+extern bool
+js_IsAboutToBeFinalized(void *thing);
 
 /*
  * Macro to test if a traversal is the marking phase of GC to avoid exposing
@@ -303,20 +303,20 @@ js_NewGCXML(JSContext *cx)
 }
 #endif
 
-struct JSGCArenaInfo;
+struct JSGCArena;
 struct JSGCChunkInfo;
 
 struct JSGCArenaList {
-    JSGCArenaInfo   *head;          /* list start */
-    JSGCArenaInfo   *cursor;        /* arena with free things */
+    JSGCArena       *head;          /* list start */
+    JSGCArena       *cursor;        /* arena with free things */
     uint32          thingKind;      /* one of JSFinalizeGCThingKind */
     uint32          thingSize;      /* size of things to allocate on this list
                                      */
 };
 
 struct JSGCDoubleArenaList {
-    JSGCArenaInfo   *head;          /* list start */
-    JSGCArenaInfo   *cursor;        /* next arena with free cells */
+    JSGCArena       *head;          /* list start */
+    JSGCArena       *cursor;        /* next arena with free cells */
 };
 
 struct JSGCFreeLists {
@@ -383,13 +383,16 @@ class JSFreePointerListTask : public JSBackgroundTask {
 extern void
 js_FinalizeStringRT(JSRuntime *rt, JSString *str);
 
-#ifdef DEBUG_notme
-#define JS_GCMETER 1
+#if defined JS_GCMETER
+const bool JS_WANT_GC_METER_PRINT = true;
+#elif defined DEBUG
+# define JS_GCMETER 1
+const bool JS_WANT_GC_METER_PRINT = false;
 #endif
 
 #ifdef JS_GCMETER
 
-typedef struct JSGCArenaStats {
+struct JSGCArenaStats {
     uint32  alloc;          /* allocation attempts */
     uint32  localalloc;     /* allocations from local lists */
     uint32  retry;          /* allocation retries after running the GC */
@@ -403,9 +406,9 @@ typedef struct JSGCArenaStats {
     uint32  maxarenas;      /* maximum of allocated arenas */
     uint32  totalarenas;    /* total number of arenas with live things that
                                GC scanned so far */
-} JSGCArenaStats;
+};
 
-typedef struct JSGCStats {
+struct JSGCStats {
     uint32  finalfail;  /* finalizer calls allocator failures */
     uint32  lockborn;   /* things born locked */
     uint32  lock;       /* valid lock calls */
@@ -414,10 +417,10 @@ typedef struct JSGCStats {
     uint32  maxdepth;   /* maximum mark tail recursion depth */
     uint32  cdepth;     /* mark recursion depth of C functions */
     uint32  maxcdepth;  /* maximum mark recursion depth of C functions */
-    uint32  untraced;   /* number of times tracing of GC thing's children were
+    uint32  unmarked;   /* number of times marking of GC thing's children were
                            delayed due to a low C stack */
 #ifdef DEBUG
-    uint32  maxuntraced;/* maximum number of things with children to trace
+    uint32  maxunmarked;/* maximum number of things with children to mark
                            later */
 #endif
     uint32  maxlevel;   /* maximum GC nesting (indirect recursion) level */
@@ -430,9 +433,9 @@ typedef struct JSGCStats {
     uint32  closelater; /* number of close hooks scheduled to run */
     uint32  maxcloselater; /* max number of close hooks scheduled to run */
 
-    JSGCArenaStats  arenaStats[FINALIZE_LIST_LIMIT];
+    JSGCArenaStats  arenaStats[FINALIZE_LIMIT];
     JSGCArenaStats  doubleArenaStats;
-} JSGCStats;
+};
 
 extern JS_FRIEND_API(void)
 js_DumpGCStats(JSRuntime *rt, FILE *fp);

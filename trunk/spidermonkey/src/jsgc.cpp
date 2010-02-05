@@ -87,6 +87,8 @@
 #include "jsdtracef.h"
 #endif
 
+#include "jsobjinlines.h"
+
 /*
  * Include the headers for mmap.
  */
@@ -104,6 +106,8 @@
 #if !defined(MAP_ANONYMOUS)
 # define MAP_ANONYMOUS 0
 #endif
+
+using namespace js;
 
 /*
  * Check JSTempValueUnion has the size of jsval and void * so we can
@@ -139,274 +143,46 @@ JS_STATIC_ASSERT(JSVAL_NULL == 0);
 JS_STATIC_ASSERT(FINALIZE_EXTERNAL_STRING_LAST - FINALIZE_EXTERNAL_STRING0 ==
                  JS_EXTERNAL_STRING_LIMIT - 1);
 
-/*
- * A GC arena contains a fixed number of flag bits for each thing in its heap,
- * and supports O(1) lookup of a flag given its thing's address.
- *
- * To implement this, we allocate things of the same size from a GC arena
- * containing GC_ARENA_SIZE bytes aligned on GC_ARENA_SIZE boundary. The
- * following picture shows arena's layout:
- *
- *  +------------------------------+--------------------+---------------+
- *  | allocation area for GC thing | flags of GC things | JSGCArenaInfo |
- *  +------------------------------+--------------------+---------------+
- *
- * To find the flag bits for the thing we calculate the thing index counting
- * from arena's start using:
- *
- *   thingIndex = (thingAddress & GC_ARENA_MASK) / thingSize
- *
- * The details of flag's lookup depend on thing's kind. For all GC things
- * except doubles we use one byte of flags where the 4 bits determine thing's
- * type and the rest is used to implement GC marking, finalization and
- * locking. We calculate the address of flag's byte using:
- *
- *   flagByteAddress =
- *       (thingAddress | GC_ARENA_MASK) - sizeof(JSGCArenaInfo) - thingIndex
- *
- * where
- *
- *   (thingAddress | GC_ARENA_MASK) - sizeof(JSGCArenaInfo)
- *
- * is the last byte of flags' area.
- *
- * This implies that the things are allocated from the start of their area and
- * flags are allocated from the end. This arrangement avoids a relatively
- * expensive calculation of the location of the boundary separating things and
- * flags. The boundary's offset from the start of the arena is given by:
- *
- *   thingsPerArena * thingSize
- *
- * where thingsPerArena is the number of things that the arena can hold:
- *
- *   (GC_ARENA_SIZE - sizeof(JSGCArenaInfo)) / (thingSize + 1).
- *
- * To allocate doubles we use a specialized arena. It can contain only numbers
- * so we do not need the type bits. Moreover, since the doubles do not require
- * a finalizer and very few of them are locked via js_LockGCThing API, we use
- * just one bit of flags per double to denote if it was marked during the
- * marking phase of the GC. The locking is implemented via a hash table. Thus
- * for doubles the flag area becomes a bitmap.
- */
-
-static const jsuword GC_ARENAS_PER_CHUNK = 16;
-static const jsuword GC_ARENA_SHIFT = 12;
-static const jsuword GC_ARENA_MASK = JS_BITMASK(GC_ARENA_SHIFT);
-static const jsuword GC_ARENA_SIZE = JS_BIT(GC_ARENA_SHIFT);
-
-struct JSGCArenaInfo {
-    /*
-     * Allocation list for the arena or NULL if the arena holds double values.
-     */
-    JSGCArenaList   *list;
-
-    /*
-     * Pointer to the previous arena in a linked list. The arena can either
-     * belong to one of JSContext.gcArenaList lists or, when it does not have
-     * any allocated GC things, to the list of free arenas in the chunk with
-     * head stored in JSGCChunkInfo.lastFreeArena.
-     */
-    JSGCArenaInfo   *prev;
-
-    /*
-     * A link field for the list of arenas with marked but not yet traced
-     * things. The field is encoded as arena's page to share the space with
-     * firstArena and arenaIndex fields.
-     */
-    jsuword         prevUntracedPage :  JS_BITS_PER_WORD - GC_ARENA_SHIFT;
-
-    /*
-     * When firstArena is false, the index of arena in the chunk. When
-     * firstArena is true, the index of a free arena holding JSGCChunkInfo or
-     * NO_FREE_ARENAS if there are no free arenas in the chunk.
-     *
-     * GET_ARENA_INDEX and GET_CHUNK_INFO_INDEX are convenience macros to
-     * access either of indexes.
-     */
-    jsuword         arenaIndex :        GC_ARENA_SHIFT - 1;
-
-    /* Flag indicating if the arena is the first in the chunk. */
-    jsuword         firstArena :        1;
-
-    union {
-        struct {
-            JSGCThing   *freeList;
-            jsuword     untracedThings;     /* bitset for fast search of marked
-                                               but not yet traced things */
-        } finalizable;
-
-        bool            hasMarkedDoubles;   /* the arena has marked doubles */
-    };
-};
-
-/* GC flag definitions, must fit in 8 bits. */
-const uint8 GCF_MARK        = JS_BIT(0);
-const uint8 GCF_LOCK        = JS_BIT(1); /* lock request bit in API */
-const uint8 GCF_CHILDREN    = JS_BIT(2); /* GC things with children to be
-                                            marked later. */
+JS_STATIC_ASSERT(sizeof(JSStackHeader) >= 2 * sizeof(jsval));
 
 /*
- * The private JSGCThing struct, which describes a JSRuntime.gcFreeList element.
- */
-struct JSGCThing {
-    JSGCThing   *link;
-};
-
-/*
- * Macros to convert between JSGCArenaInfo, the start address of the arena and
- * arena's page defined as (start address) >> GC_ARENA_SHIFT.
- */
-#define ARENA_INFO_OFFSET (GC_ARENA_SIZE - (uint32) sizeof(JSGCArenaInfo))
-
-#define IS_ARENA_INFO_ADDRESS(arena)                                          \
-    (((jsuword) (arena) & GC_ARENA_MASK) == ARENA_INFO_OFFSET)
-
-#define ARENA_START_TO_INFO(arenaStart)                                       \
-    (JS_ASSERT(((arenaStart) & (jsuword) GC_ARENA_MASK) == 0),                \
-     (JSGCArenaInfo *) ((arenaStart) + (jsuword) ARENA_INFO_OFFSET))
-
-#define ARENA_INFO_TO_START(arena)                                            \
-    (JS_ASSERT(IS_ARENA_INFO_ADDRESS(arena)),                                 \
-     (jsuword) (arena) & ~(jsuword) GC_ARENA_MASK)
-
-#define ARENA_PAGE_TO_INFO(arenaPage)                                         \
-    (JS_ASSERT(arenaPage != 0),                                               \
-     JS_ASSERT(!((jsuword)(arenaPage) >> (JS_BITS_PER_WORD-GC_ARENA_SHIFT))), \
-     ARENA_START_TO_INFO((arenaPage) << GC_ARENA_SHIFT))
-
-#define ARENA_INFO_TO_PAGE(arena)                                             \
-    (JS_ASSERT(IS_ARENA_INFO_ADDRESS(arena)),                                 \
-     ((jsuword) (arena) >> GC_ARENA_SHIFT))
-
-#define GET_ARENA_INFO(chunk, index)                                          \
-    (JS_ASSERT((index) < GC_ARENAS_PER_CHUNK),                                \
-     ARENA_START_TO_INFO(chunk + ((index) << GC_ARENA_SHIFT)))
-
-/*
- * Definitions for allocating arenas in chunks.
+ * A GC arena contains GC_ARENA_SIZE bytes aligned on GC_ARENA_SIZE boundary.
+ * The arena holds thing of the same size, a JSGCArenaInfo descriptor and a
+ * mark bitmap.
  *
- * All chunks that have at least one free arena are put on the doubly-linked
- * list with the head stored in JSRuntime.gcChunkList. JSGCChunkInfo contains
- * the head of the chunk's free arena list together with the link fields for
- * gcChunkList.
+ * The size of each thing must be divisible by GC_CELL_SIZE, the minimal
+ * allocation unit, and the size of the mark bitmap is fixed and is
+ * independent of the thing's size with one bit per each GC_CELL_SIZE bytes.
+ * For thing sizes that exceed GC_CELL_SIZE this implies that we waste space
+ * in the mark bitmap. The advantage is that we can find the mark bit for the
+ * thing using just integer shifts avoiding an expensive integer division. We
+ * trade some space for speed here.
  *
- * Structure stored in one of chunk's free arenas. GET_CHUNK_INFO_INDEX gives
- * the index of this arena. When all arenas in the chunk are used, it is
- * removed from the list and the index is set to NO_FREE_ARENAS indicating
- * that the chunk is not on gcChunkList and has no JSGCChunkInfo available.
- */
-
-struct JSGCChunkInfo {
-    JSGCChunkInfo   **prevp;
-    JSGCChunkInfo   *next;
-    JSGCArenaInfo   *lastFreeArena;
-    uint32          numFreeArenas;
-};
-
-#define NO_FREE_ARENAS              JS_BITMASK(GC_ARENA_SHIFT - 1)
-
-JS_STATIC_ASSERT(1 <= GC_ARENAS_PER_CHUNK &&
-                 GC_ARENAS_PER_CHUNK <= NO_FREE_ARENAS);
-
-#define GET_ARENA_CHUNK(arena, index)                                         \
-    (JS_ASSERT(GET_ARENA_INDEX(arena) == index),                              \
-     ARENA_INFO_TO_START(arena) - ((index) << GC_ARENA_SHIFT))
-
-#define GET_ARENA_INDEX(arena)                                                \
-    ((arena)->firstArena ? 0 : (uint32) (arena)->arenaIndex)
-
-#define GET_CHUNK_INFO_INDEX(chunk)                                           \
-    ((uint32) ARENA_START_TO_INFO(chunk)->arenaIndex)
-
-#define SET_CHUNK_INFO_INDEX(chunk, index)                                    \
-    (JS_ASSERT((index) < GC_ARENAS_PER_CHUNK || (index) == NO_FREE_ARENAS),   \
-     (void) (ARENA_START_TO_INFO(chunk)->arenaIndex = (jsuword) (index)))
-
-#define GET_CHUNK_INFO(chunk, infoIndex)                                      \
-    (JS_ASSERT(GET_CHUNK_INFO_INDEX(chunk) == (infoIndex)),                   \
-     JS_ASSERT((uint32) (infoIndex) < GC_ARENAS_PER_CHUNK),                   \
-     (JSGCChunkInfo *) ((chunk) + ((infoIndex) << GC_ARENA_SHIFT)))
-
-#define CHUNK_INFO_TO_INDEX(ci)                                               \
-    GET_ARENA_INDEX(ARENA_START_TO_INFO((jsuword)ci))
-
-/*
- * Macros for GC-thing operations.
- */
-#define THINGS_PER_ARENA(thingSize)                                           \
-    ((GC_ARENA_SIZE - (uint32) sizeof(JSGCArenaInfo)) / ((thingSize) + 1U))
-
-#define THING_TO_ARENA(thing)                                                 \
-    (JS_ASSERT(!JSString::isStatic(thing)),                                   \
-     (JSGCArenaInfo *)(((jsuword) (thing) | GC_ARENA_MASK)                    \
-                       + 1 - sizeof(JSGCArenaInfo)))
-
-#define THING_TO_INDEX(thing, thingSize)                                      \
-    ((uint32) ((jsuword) (thing) & GC_ARENA_MASK) / (uint32) (thingSize))
-
-#define THING_FLAGP(arena, thingIndex)                                        \
-    (JS_ASSERT((jsuword) (thingIndex)                                         \
-               < (jsuword) THINGS_PER_ARENA((arena)->list->thingSize)),       \
-     (uint8 *)(arena) - 1 - (thingIndex))
-
-#define THING_TO_FLAGP(thing, thingSize)                                      \
-    THING_FLAGP(THING_TO_ARENA(thing), THING_TO_INDEX(thing, thingSize))
-
-#define FLAGP_TO_ARENA(flagp) THING_TO_ARENA(flagp)
-
-#define FLAGP_TO_INDEX(flagp)                                                 \
-    (JS_ASSERT(((jsuword) (flagp) & GC_ARENA_MASK) < ARENA_INFO_OFFSET),      \
-     (ARENA_INFO_OFFSET - 1 - (uint32) ((jsuword) (flagp) & GC_ARENA_MASK)))
-
-#define FLAGP_TO_THING(flagp, thingSize)                                      \
-    (JS_ASSERT(((jsuword) (flagp) & GC_ARENA_MASK) >=                         \
-               (ARENA_INFO_OFFSET - THINGS_PER_ARENA(thingSize))),            \
-     (JSGCThing *)(((jsuword) (flagp) & ~GC_ARENA_MASK) +                     \
-                   (thingSize) * FLAGP_TO_INDEX(flagp)))
-
-static inline JSGCThing *
-NextThing(JSGCThing *thing, size_t thingSize)
-{
-    return reinterpret_cast<JSGCThing *>(reinterpret_cast<jsuword>(thing) +
-                                         thingSize);
-}
-
-static inline JSGCThing *
-MakeNewArenaFreeList(JSGCArenaInfo *a, unsigned thingSize, size_t nthings)
-{
-    JS_ASSERT(nthings * thingSize < GC_ARENA_SIZE - sizeof(JSGCArenaInfo));
-
-    jsuword thingsStart = ARENA_INFO_TO_START(a);
-    JSGCThing *first = reinterpret_cast<JSGCThing *>(thingsStart);
-    JSGCThing *last = reinterpret_cast<JSGCThing *>(thingsStart +
-                                                    (nthings - 1) * thingSize);
-    for (JSGCThing *thing = first; thing != last;) {
-        JSGCThing *next = NextThing(thing, thingSize);
-        thing->link = next;
-        thing = next;
-    }
-    last->link = NULL;
-    return first;
-}
-
-/*
- * Macros for the specialized arena for doubles.
+ * Another advantage of the fixed size of the bitmap is that it allows us to
+ * put it at the end of the arena where it ends on a CPU cache line boundary.
+ * This minimizes the number of cache lines that are necessary to access
+ * during the marking phase of the GC.
  *
- * DOUBLES_PER_ARENA defines the maximum number of doubles that the arena can
- * hold. We find it as the following. Let n be the number of doubles in the
- * arena. Together with the bitmap of flags and JSGCArenaInfo they should fit
- * the arena. Hence DOUBLES_PER_ARENA or n_max is the maximum value of n for
- * which the following holds:
+ * The following picture demonstrates arena's layout:
  *
+ *  +------------------------------+---------------+-------------+
+ *  | allocation area for GC thing | JSGCArenaInfo | mark bitmap |
+ *  +------------------------------+---------------+-------------+
+ *
+ * The allocation area contains GC_CELLS_PER_ARENA. We find that number as the
+ * following. Let n be the number of cells in the arena. Together with the
+ * word-aligned mark bitmap and JSGCArenaInfo they should fit the arena. Hence
+ * GC_CELLS_PER_ARENA or n_max is the maximum value of n for which the
+ * following holds:
+  *
  *   n*s + ceil(n/B) <= M                                               (1)
  *
  * where "/" denotes normal real division,
  *       ceil(r) gives the least integer not smaller than the number r,
- *       s is the number of words in jsdouble,
+ *       s is the number of words in the GC cell,
  *       B is number of bits per word or B == JS_BITS_PER_WORD
- *       M is the number of words in the arena before JSGCArenaInfo or
+ *       M is the number of words in the arena without JSGCArenaInfo or
  *       M == (GC_ARENA_SIZE - sizeof(JSGCArenaInfo)) / sizeof(jsuword).
- *       M == ARENA_INFO_OFFSET / sizeof(jsuword)
  *
  * We rewrite the inequality as
  *
@@ -456,105 +232,336 @@ MakeNewArenaFreeList(JSGCArenaInfo *a, unsigned thingSize, size_t nthings)
  *
  *  and
  *
- *    B*s == JS_BITS_PER_WORD * sizeof(jsdouble) / sizeof(jsuword)
- *        == JS_BITS_PER_DOUBLE.
+ *    B*s == JS_BITS_PER_WORD * GC_CELL_SIZE / sizeof(jsuword)
+ *        == BITS_PER_GC_CELL.
  */
-const size_t DOUBLES_PER_ARENA =
-    (ARENA_INFO_OFFSET * JS_BITS_PER_BYTE) / (JS_BITS_PER_DOUBLE + 1);
 
-/*
- * Check that  ARENA_INFO_OFFSET and sizeof(jsdouble) divides sizeof(jsuword).
- */
-JS_STATIC_ASSERT(ARENA_INFO_OFFSET % sizeof(jsuword) == 0);
-JS_STATIC_ASSERT(sizeof(jsdouble) % sizeof(jsuword) == 0);
+static const jsuword GC_ARENAS_PER_CHUNK = 16;
+static const jsuword GC_ARENA_SHIFT = 12;
+static const jsuword GC_ARENA_MASK = JS_BITMASK(GC_ARENA_SHIFT);
+static const jsuword GC_ARENA_SIZE = JS_BIT(GC_ARENA_SHIFT);
+static const jsuword GC_CHUNK_SIZE = GC_ARENAS_PER_CHUNK << GC_ARENA_SHIFT;
+
+const size_t GC_CELL_SHIFT = 3;
+const size_t GC_CELL_SIZE = size_t(1) << GC_CELL_SHIFT;
+const size_t GC_CELL_MASK = GC_CELL_SIZE - 1;
+
+const size_t BITS_PER_GC_CELL = GC_CELL_SIZE * JS_BITS_PER_BYTE;
+
+struct JSGCArenaInfo {
+    /*
+     * Allocation list for the arena or NULL if the arena holds double values.
+     */
+    JSGCArenaList   *list;
+
+    /*
+     * Pointer to the previous arena in a linked list. The arena can either
+     * belong to one of JSContext.gcArenaList lists or, when it does not have
+     * any allocated GC things, to the list of free arenas in the chunk with
+     * head stored in JSGCChunkInfo.lastFreeArena.
+     */
+    JSGCArena       *prev;
+
+    /*
+     * A link field for the list of arenas with marked things that haven't yet
+     * been scanned for live children. The field is encoded as arena's page to
+     * to hold only the high-order arena-counting bits to share the space with
+     * firstArena and arenaIndex fields. For details see comments before
+     * DelayMarkingChildren.
+     */
+    jsuword         prevUnmarkedPage :  JS_BITS_PER_WORD - GC_ARENA_SHIFT;
+
+    /*
+     * When firstArena is false, the index of arena in the chunk. When
+     * firstArena is true, the index of a free arena holding JSGCChunkInfo or
+     * NO_FREE_ARENAS if there are no free arenas in the chunk.
+     *
+     * GetArenaIndex() and GetChunkInfoIndex() below are convenience functions
+     * to access either of indexes.
+     */
+    jsuword         arenaIndex :        GC_ARENA_SHIFT - 1;
+
+    /* Flag indicating if the arena is the first in the chunk. */
+    jsuword         firstArena :        1;
+
+    JSGCThing       *freeList;
+
+    union {
+        /* See comments before DelayMarkingChildren. */
+        jsuword     unmarkedChildren;
+
+        /* The arena has marked doubles. */
+        bool        hasMarkedDoubles;
+    };
+};
+
+const size_t GC_CELLS_PER_ARENA = (GC_ARENA_SIZE - sizeof(JSGCArenaInfo)) *
+                                   JS_BITS_PER_BYTE / (BITS_PER_GC_CELL + 1);
+
+const size_t GC_ARENA_MARK_BITMAP_WORDS =
+    JS_HOWMANY(GC_CELLS_PER_ARENA, JS_BITS_PER_WORD);
+
+/* Check that GC_CELLS_PER_ARENA indeed maximises (1). */
+JS_STATIC_ASSERT(GC_CELLS_PER_ARENA * GC_CELL_SIZE +
+                 GC_ARENA_MARK_BITMAP_WORDS * sizeof(jsuword) <=
+                 GC_ARENA_SIZE - sizeof(JSGCArenaInfo));
+
+JS_STATIC_ASSERT((GC_CELLS_PER_ARENA + 1) * GC_CELL_SIZE +
+                 sizeof(jsuword) *
+                 JS_HOWMANY((GC_CELLS_PER_ARENA + 1), JS_BITS_PER_WORD) >
+                 GC_ARENA_SIZE - sizeof(JSGCArenaInfo));
+
+const size_t GC_ARENA_MARK_BITMAP_SIZE = GC_ARENA_MARK_BITMAP_WORDS *
+                                         sizeof(jsuword);
+
+const size_t GC_ARENA_CELLS_SIZE = GC_CELLS_PER_ARENA * GC_CELL_SIZE;
+
 JS_STATIC_ASSERT(sizeof(jsbitmap) == sizeof(jsuword));
 
-const size_t DOUBLES_ARENA_BITMAP_WORDS =
-    JS_HOWMANY(DOUBLES_PER_ARENA, JS_BITS_PER_WORD);
-
-/* Check that DOUBLES_PER_ARENA indeed maximises (1). */
-JS_STATIC_ASSERT(DOUBLES_PER_ARENA * sizeof(jsdouble) +
-                 DOUBLES_ARENA_BITMAP_WORDS * sizeof(jsuword) <=
-                 ARENA_INFO_OFFSET);
-
-JS_STATIC_ASSERT((DOUBLES_PER_ARENA + 1) * sizeof(jsdouble) +
-                 sizeof(jsuword) *
-                 JS_HOWMANY((DOUBLES_PER_ARENA + 1), JS_BITS_PER_WORD) >
-                 ARENA_INFO_OFFSET);
-
-/*
- * When DOUBLES_PER_ARENA % BITS_PER_DOUBLE_FLAG_UNIT != 0, some bits in the
- * last byte of the occupation bitmap are unused.
- */
-const size_t UNUSED_DOUBLE_BITMAP_BITS =
-    DOUBLES_ARENA_BITMAP_WORDS * JS_BITS_PER_WORD - DOUBLES_PER_ARENA;
-
-JS_STATIC_ASSERT(UNUSED_DOUBLE_BITMAP_BITS < JS_BITS_PER_WORD);
-
-const size_t DOUBLES_ARENA_BITMAP_OFFSET =
-    ARENA_INFO_OFFSET - DOUBLES_ARENA_BITMAP_WORDS * sizeof(jsuword);
-
-#define CHECK_DOUBLE_ARENA_INFO(arenaInfo)                                    \
-    (JS_ASSERT(IS_ARENA_INFO_ADDRESS(arenaInfo)),                             \
-     JS_ASSERT(!(arenaInfo)->list))                                           \
-
-/*
- * Get the start of the bitmap area containing double mark flags in the arena.
- * To access the flag the code uses
- *
- *   JS_TEST_BIT(bitmapStart, index)
- *
- * That is, compared with the case of arenas with non-double things, we count
- * flags from the start of the bitmap area, not from the end.
- */
-#define DOUBLE_ARENA_BITMAP(arenaInfo)                                        \
-    (CHECK_DOUBLE_ARENA_INFO(arenaInfo),                                      \
-     (jsbitmap *) arenaInfo - DOUBLES_ARENA_BITMAP_WORDS)
-
-#define DOUBLE_ARENA_BITMAP_END(arenaInfo)                                    \
-    (CHECK_DOUBLE_ARENA_INFO(arenaInfo), (jsbitmap *) (arenaInfo))
-
-#define DOUBLE_THING_TO_INDEX(thing)                                          \
-    (CHECK_DOUBLE_ARENA_INFO(THING_TO_ARENA(thing)),                          \
-     JS_ASSERT(((jsuword) (thing) & GC_ARENA_MASK) <                          \
-               DOUBLES_ARENA_BITMAP_OFFSET),                                  \
-     ((uint32) (((jsuword) (thing) & GC_ARENA_MASK) / sizeof(jsdouble))))
-
-static void
-ClearDoubleArenaFlags(JSGCArenaInfo *a)
-{
+struct JSGCArena {
     /*
-     * When some high bits in the last byte of the double occupation bitmap
-     * are unused, we must set them. Otherwise TurnUsedArenaIntoDoubleList
-     * will assume that they corresponds to some free cells and tries to
-     * allocate them.
+     * The size of the data may exceed GC_ARENA_CELLS_SIZE as, whenever the
+     * size of the system word is less than GC_CELL_SIZE, the sum
      *
-     * Note that the code works correctly with UNUSED_DOUBLE_BITMAP_BITS == 0.
+     *   GC_ARENA_CELLS_SIZE + sizeof(JSGCArenaInfo) + GC_ARENA_MARK_BITMAP_SIZE
+     *
+     * could be less then the arena size. We add the extra space to data.
      */
-    jsbitmap *bitmap = DOUBLE_ARENA_BITMAP(a);
-    memset(bitmap, 0, (DOUBLES_ARENA_BITMAP_WORDS - 1) * sizeof *bitmap);
-    jsbitmap mask = ((jsbitmap) 1 << UNUSED_DOUBLE_BITMAP_BITS) - 1;
-    size_t nused = JS_BITS_PER_WORD - UNUSED_DOUBLE_BITMAP_BITS;
-    bitmap[DOUBLES_ARENA_BITMAP_WORDS - 1] = mask << nused;
-}
+    uint8           data[GC_ARENA_SIZE - sizeof(JSGCArenaInfo) -
+                         GC_ARENA_MARK_BITMAP_SIZE];
+    JSGCArenaInfo   info;
+    jsbitmap        markBitmap[GC_ARENA_MARK_BITMAP_WORDS];
 
-static JS_ALWAYS_INLINE JSBool
-IsMarkedDouble(JSGCArenaInfo *a, uint32 index)
+    void checkAddress() const {
+        JS_ASSERT(!(reinterpret_cast<jsuword>(this) & GC_ARENA_MASK));
+    }
+
+    jsuword toPageStart() const {
+        checkAddress();
+        return reinterpret_cast<jsuword>(this);
+    }
+
+    static JSGCArena *fromPageStart(jsuword pageStart) {
+        JS_ASSERT(!(pageStart & GC_ARENA_MASK));
+        return reinterpret_cast<JSGCArena *>(pageStart);
+    }
+
+    bool hasPrevUnmarked() const { return info.prevUnmarkedPage; }
+
+    JSGCArena *getPrevUnmarked() const {
+        JS_ASSERT(hasPrevUnmarked());
+        return fromPageStart(info.prevUnmarkedPage << GC_ARENA_SHIFT);
+    }
+
+    void clearPrevUnmarked() { info.prevUnmarkedPage = 0; }
+
+    void setPrevUnmarked(JSGCArena *a) {
+        JS_ASSERT(a);
+        info.prevUnmarkedPage = a->toPageStart() >> GC_ARENA_SHIFT;
+    }
+
+    static JSGCArena *fromGCThing(void *thing) {
+        JS_ASSERT(!JSString::isStatic(thing));
+        return fromPageStart(reinterpret_cast<jsuword>(thing) & ~GC_ARENA_MASK);
+    }
+
+    void clearMarkBitmap() {
+        memset(markBitmap, 0, sizeof(markBitmap));
+    }
+
+    jsbitmap *getMarkBitmapEnd() {
+        return markBitmap + GC_ARENA_MARK_BITMAP_WORDS;
+    }
+};
+
+JS_STATIC_ASSERT(sizeof(JSGCArena) == GC_ARENA_SIZE);
+JS_STATIC_ASSERT(GC_ARENA_SIZE - GC_ARENA_CELLS_SIZE - sizeof(JSGCArenaInfo) -
+                 GC_ARENA_MARK_BITMAP_SIZE < GC_CELL_SIZE);
+JS_STATIC_ASSERT((GC_ARENA_SIZE - GC_ARENA_CELLS_SIZE - sizeof(JSGCArenaInfo) -
+                  GC_ARENA_MARK_BITMAP_SIZE) % sizeof(jsuword) == 0);
+
+JS_STATIC_ASSERT(sizeof(JSString) % GC_CELL_SIZE == 0);
+JS_STATIC_ASSERT(sizeof(JSObject) % GC_CELL_SIZE == 0);
+JS_STATIC_ASSERT(sizeof(JSFunction) % GC_CELL_SIZE == 0);
+#ifdef JSXML
+JS_STATIC_ASSERT(sizeof(JSXML) % GC_CELL_SIZE == 0);
+#endif
+
+JS_STATIC_ASSERT(GC_CELL_SIZE == sizeof(jsdouble));
+const size_t DOUBLES_PER_ARENA = GC_CELLS_PER_ARENA;
+
+/*
+ * The private JSGCThing struct, which describes a JSRuntime.gcFreeList element.
+ */
+struct JSGCThing {
+    JSGCThing   *link;
+};
+
+/*
+ * Definitions for allocating arenas in chunks.
+ *
+ * All chunks that have at least one free arena are put on the doubly-linked
+ * list with the head stored in JSRuntime.gcChunkList. JSGCChunkInfo contains
+ * the head of the chunk's free arena list together with the link fields for
+ * gcChunkList.
+ *
+ * Structure stored in one of chunk's free arenas. GetChunkInfoIndex gives the
+ * index of this arena. When all arenas in the chunk are used, it is removed
+ * from the list and the index is set to NO_FREE_ARENAS indicating that the
+ * chunk is not on gcChunkList and has no JSGCChunkInfo available.
+ */
+
+struct JSGCChunkInfo {
+    JSGCChunkInfo   **prevp;
+    JSGCChunkInfo   *next;
+    JSGCArena       *lastFreeArena;
+    uint32          numFreeArenas;
+};
+
+#define NO_FREE_ARENAS              JS_BITMASK(GC_ARENA_SHIFT - 1)
+
+JS_STATIC_ASSERT(1 <= GC_ARENAS_PER_CHUNK &&
+                 GC_ARENAS_PER_CHUNK <= NO_FREE_ARENAS);
+
+inline unsigned
+GetArenaIndex(JSGCArena *a)
 {
-    jsbitmap *bitmap;
-
-    JS_ASSERT(a->hasMarkedDoubles);
-    bitmap = DOUBLE_ARENA_BITMAP(a);
-    return JS_TEST_BIT(bitmap, index);
+    return a->info.firstArena ? 0 : unsigned(a->info.arenaIndex);
 }
 
-JS_STATIC_ASSERT(sizeof(JSStackHeader) >= 2 * sizeof(jsval));
+inline jsuword
+GetArenaChunk(JSGCArena *a, unsigned index)
+{
+    JS_ASSERT(index == GetArenaIndex(a));
+    return a->toPageStart() - (index << GC_ARENA_SHIFT);
+}
 
-JS_STATIC_ASSERT(sizeof(JSGCThing) <= sizeof(JSString));
-JS_STATIC_ASSERT(sizeof(JSGCThing) <= sizeof(jsdouble));
+inline unsigned
+GetChunkInfoIndex(jsuword chunk)
+{
+    JSGCArena *a = JSGCArena::fromPageStart(chunk);
+    JS_ASSERT(a->info.firstArena);
+    return a->info.arenaIndex;
+}
 
-/* We want to use all the available GC thing space for object's slots. */
-JS_STATIC_ASSERT(sizeof(JSObject) % sizeof(JSGCThing) == 0);
+inline void
+SetChunkInfoIndex(jsuword chunk, unsigned index)
+{
+    JS_ASSERT(index < GC_ARENAS_PER_CHUNK || index == NO_FREE_ARENAS);
+    JSGCArena *a = JSGCArena::fromPageStart(chunk);
+    JS_ASSERT(a->info.firstArena);
+    a->info.arenaIndex = jsuword(index);
+}
+
+inline JSGCChunkInfo *
+GetChunkInfo(jsuword chunk, unsigned infoIndex)
+{
+    JS_ASSERT(GetChunkInfoIndex(chunk) == infoIndex);
+    JS_ASSERT(infoIndex < GC_ARENAS_PER_CHUNK);
+    return reinterpret_cast<JSGCChunkInfo *>(chunk +
+                                             (infoIndex << GC_ARENA_SHIFT));
+}
+
+inline JSGCArena *
+InitChunkArena(jsuword chunk, unsigned index)
+{
+    JS_ASSERT(index < GC_ARENAS_PER_CHUNK);
+    JSGCArena *a = JSGCArena::fromPageStart(chunk + (index << GC_ARENA_SHIFT));
+    a->info.firstArena = (index == 0);
+    a->info.arenaIndex = index;
+    return a;
+}
+
+/*
+ * Helpers for GC-thing operations.
+ */
+inline JSGCThing *
+NextThing(JSGCThing *thing, size_t thingSize)
+{
+    return reinterpret_cast<JSGCThing *>(reinterpret_cast<jsuword>(thing) +
+                                         thingSize);
+}
+
+inline size_t
+ThingsPerArena(size_t thingSize)
+{
+    JS_ASSERT(!(thingSize & GC_CELL_MASK));
+    JS_ASSERT(thingSize <= GC_ARENA_CELLS_SIZE);
+    return GC_ARENA_CELLS_SIZE / thingSize;
+}
+
+inline jsuword
+ThingToOffset(void *thing)
+{
+    JS_ASSERT(!JSString::isStatic(thing));
+    jsuword offset = reinterpret_cast<jsuword>(thing) & GC_ARENA_MASK;
+    JS_ASSERT(offset < GC_ARENA_CELLS_SIZE);
+    JS_ASSERT(!(offset & GC_CELL_MASK));
+    return offset;
+}
+
+inline JSGCThing *
+OffsetToThing(JSGCArena *a, jsuword offset)
+{
+    JS_ASSERT(offset < GC_ARENA_CELLS_SIZE);
+    JS_ASSERT(!(offset & GC_CELL_MASK));
+    return reinterpret_cast<JSGCThing *>(a->toPageStart() | offset);
+}
+
+inline jsuword
+ThingToGCCellIndex(void *thing)
+{
+    jsuword offset = ThingToOffset(thing);
+    return offset >> GC_CELL_SHIFT;
+}
+
+inline bool
+IsMarkedGCThing(JSGCArena *a, void *thing)
+{
+    JS_ASSERT(a == JSGCArena::fromGCThing(thing));
+    jsuword index = ThingToGCCellIndex(thing);
+    return JS_TEST_BIT(a->markBitmap, index);
+}
+
+inline bool
+IsMarkedGCThing(JSGCArena *a, jsuword thingOffset)
+{
+    JS_ASSERT(thingOffset < GC_ARENA_CELLS_SIZE);
+    JS_ASSERT(!(thingOffset & GC_CELL_MASK));
+    jsuword index = thingOffset >> GC_CELL_SHIFT;
+    return JS_TEST_BIT(a->markBitmap, index);
+}
+
+inline bool
+MarkIfUnmarkedGCThing(JSGCArena *a, void *thing)
+{
+    JS_ASSERT(a == JSGCArena::fromGCThing(thing));
+    jsuword index = ThingToGCCellIndex(thing);
+    if (JS_TEST_BIT(a->markBitmap, index))
+        return false;
+    JS_SET_BIT(a->markBitmap, index);
+    return true;
+}
+
+static inline JSGCThing *
+MakeNewArenaFreeList(JSGCArena *a, size_t thingSize)
+{
+    jsuword thingsStart = a->toPageStart();
+    jsuword lastThingMinAddr = thingsStart + GC_ARENA_CELLS_SIZE -
+                               thingSize * 2 + 1;
+    jsuword thingPtr = thingsStart;
+    do {
+        jsuword nextPtr = thingPtr + thingSize;
+        JS_ASSERT((nextPtr & GC_ARENA_MASK) + thingSize <= GC_ARENA_CELLS_SIZE);
+        JSGCThing *thing = reinterpret_cast<JSGCThing *>(thingPtr);
+        thing->link = reinterpret_cast<JSGCThing *>(nextPtr);
+        thingPtr = nextPtr;
+    } while (thingPtr < lastThingMinAddr);
+
+    JSGCThing *lastThing = reinterpret_cast<JSGCThing *>(thingPtr);
+    lastThing->link = NULL;
+    return reinterpret_cast<JSGCThing *>(thingsStart);
+}
 
 #ifdef JS_GCMETER
 # define METER(x)               ((void) (x))
@@ -573,20 +580,18 @@ NewGCChunk(void)
     void *p;
 
 #if defined(XP_WIN)
-    p = VirtualAlloc(NULL, GC_ARENAS_PER_CHUNK << GC_ARENA_SHIFT,
+    p = VirtualAlloc(NULL, GC_CHUNK_SIZE,
                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     return (jsuword) p;
 #elif defined(XP_OS2)
-    if (DosAllocMem(&p, GC_ARENAS_PER_CHUNK << GC_ARENA_SHIFT,
+    if (DosAllocMem(&p, GC_CHUNK_SIZE,
                     OBJ_ANY | PAG_COMMIT | PAG_READ | PAG_WRITE)) {
-        if (DosAllocMem(&p, GC_ARENAS_PER_CHUNK << GC_ARENA_SHIFT,
-                        PAG_COMMIT | PAG_READ | PAG_WRITE)) {
+        if (DosAllocMem(&p, GC_CHUNK_SIZE, PAG_COMMIT | PAG_READ | PAG_WRITE))
             return 0;
-        }
     }
     return (jsuword) p;
 #else
-    p = mmap(NULL, GC_ARENAS_PER_CHUNK << GC_ARENA_SHIFT,
+    p = mmap(NULL, GC_CHUNK_SIZE,
              PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return (p == MAP_FAILED) ? 0 : (jsuword) p;
 #endif
@@ -601,9 +606,9 @@ DestroyGCChunk(jsuword chunk)
 #elif defined(XP_OS2)
     DosFreeMem((void *) chunk);
 #elif defined(SOLARIS)
-    munmap((char *) chunk, GC_ARENAS_PER_CHUNK << GC_ARENA_SHIFT);
+    munmap((char *) chunk, GC_CHUNK_SIZE);
 #else
-    munmap((void *) chunk, GC_ARENAS_PER_CHUNK << GC_ARENA_SHIFT);
+    munmap((void *) chunk, GC_CHUNK_SIZE);
 #endif
 }
 
@@ -629,11 +634,11 @@ RemoveChunkFromList(JSRuntime *rt, JSGCChunkInfo *ci)
     }
 }
 
-static JSGCArenaInfo *
+static JSGCArena *
 NewGCArena(JSContext *cx)
 {
     jsuword chunk;
-    JSGCArenaInfo *a;
+    JSGCArena *a;
 
     JSRuntime *rt = cx->runtime;
     if (!JS_THREAD_DATA(cx)->waiveGCQuota && rt->gcBytes >= rt->gcMaxBytes) {
@@ -648,8 +653,8 @@ NewGCArena(JSContext *cx)
     }
 
     JSGCChunkInfo *ci;
-    uint32 i;
-    JSGCArenaInfo *aprev;
+    unsigned i;
+    JSGCArena *aprev;
 
     ci = rt->gcChunkList;
     if (!ci) {
@@ -657,55 +662,50 @@ NewGCArena(JSContext *cx)
         if (chunk == 0)
             return NULL;
         JS_ASSERT((chunk & GC_ARENA_MASK) == 0);
-        a = GET_ARENA_INFO(chunk, 0);
-        a->firstArena = JS_TRUE;
-        a->arenaIndex = 0;
+        a = InitChunkArena(chunk, 0);
         aprev = NULL;
         i = 0;
         do {
-            a->prev = aprev;
+            a->info.prev = aprev;
             aprev = a;
             ++i;
-            a = GET_ARENA_INFO(chunk, i);
-            a->firstArena = JS_FALSE;
-            a->arenaIndex = i;
+            a = InitChunkArena(chunk, i);
         } while (i != GC_ARENAS_PER_CHUNK - 1);
-        ci = GET_CHUNK_INFO(chunk, 0);
+        ci = GetChunkInfo(chunk, 0);
         ci->lastFreeArena = aprev;
         ci->numFreeArenas = GC_ARENAS_PER_CHUNK - 1;
         AddChunkToList(rt, ci);
     } else {
         JS_ASSERT(ci->prevp == &rt->gcChunkList);
         a = ci->lastFreeArena;
-        aprev = a->prev;
+        aprev = a->info.prev;
         if (!aprev) {
             JS_ASSERT(ci->numFreeArenas == 1);
-            JS_ASSERT(ARENA_INFO_TO_START(a) == (jsuword) ci);
+            JS_ASSERT(a->toPageStart() == (jsuword) ci);
             RemoveChunkFromList(rt, ci);
-            chunk = GET_ARENA_CHUNK(a, GET_ARENA_INDEX(a));
-            SET_CHUNK_INFO_INDEX(chunk, NO_FREE_ARENAS);
+            chunk = GetArenaChunk(a, GetArenaIndex(a));
+            SetChunkInfoIndex(chunk, NO_FREE_ARENAS);
         } else {
             JS_ASSERT(ci->numFreeArenas >= 2);
-            JS_ASSERT(ARENA_INFO_TO_START(a) != (jsuword) ci);
+            JS_ASSERT(a->toPageStart() != (jsuword) ci);
             ci->lastFreeArena = aprev;
             ci->numFreeArenas--;
         }
     }
 
     rt->gcBytes += GC_ARENA_SIZE;
-    a->prevUntracedPage = 0;
 
     return a;
 }
 
 static void
-DestroyGCArenas(JSRuntime *rt, JSGCArenaInfo *last)
+DestroyGCArenas(JSRuntime *rt, JSGCArena *last)
 {
-    JSGCArenaInfo *a;
+    JSGCArena *a;
 
     while (last) {
         a = last;
-        last = last->prev;
+        last = last->info.prev;
 
         METER(rt->gcStats.afree++);
         JS_ASSERT(rt->gcBytes >= GC_ARENA_SIZE);
@@ -718,26 +718,26 @@ DestroyGCArenas(JSRuntime *rt, JSGCArenaInfo *last)
 #ifdef DEBUG
         jsuword firstArena;
 
-        firstArena = a->firstArena;
-        arenaIndex = a->arenaIndex;
-        memset((void *) ARENA_INFO_TO_START(a), JS_FREE_PATTERN, GC_ARENA_SIZE);
-        a->firstArena = firstArena;
-        a->arenaIndex = arenaIndex;
+        firstArena = a->info.firstArena;
+        arenaIndex = a->info.arenaIndex;
+        memset(a, JS_FREE_PATTERN, GC_ARENA_SIZE);
+        a->info.firstArena = firstArena;
+        a->info.arenaIndex = arenaIndex;
 #endif
-        arenaIndex = GET_ARENA_INDEX(a);
-        chunk = GET_ARENA_CHUNK(a, arenaIndex);
-        chunkInfoIndex = GET_CHUNK_INFO_INDEX(chunk);
+        arenaIndex = GetArenaIndex(a);
+        chunk = GetArenaChunk(a, arenaIndex);
+        chunkInfoIndex = GetChunkInfoIndex(chunk);
         if (chunkInfoIndex == NO_FREE_ARENAS) {
             chunkInfoIndex = arenaIndex;
-            SET_CHUNK_INFO_INDEX(chunk, arenaIndex);
-            ci = GET_CHUNK_INFO(chunk, chunkInfoIndex);
-            a->prev = NULL;
+            SetChunkInfoIndex(chunk, arenaIndex);
+            ci = GetChunkInfo(chunk, chunkInfoIndex);
+            a->info.prev = NULL;
             ci->lastFreeArena = a;
             ci->numFreeArenas = 1;
             AddChunkToList(rt, ci);
         } else {
             JS_ASSERT(chunkInfoIndex != arenaIndex);
-            ci = GET_CHUNK_INFO(chunk, chunkInfoIndex);
+            ci = GetChunkInfo(chunk, chunkInfoIndex);
             JS_ASSERT(ci->numFreeArenas != 0);
             JS_ASSERT(ci->lastFreeArena);
             JS_ASSERT(a != ci->lastFreeArena);
@@ -746,7 +746,7 @@ DestroyGCArenas(JSRuntime *rt, JSGCArenaInfo *last)
                 DestroyGCChunk(chunk);
             } else {
                 ++ci->numFreeArenas;
-                a->prev = ci->lastFreeArena;
+                a->info.prev = ci->lastFreeArena;
                 ci->lastFreeArena = a;
             }
         }
@@ -806,10 +806,10 @@ GetFinalizableTraceKind(size_t thingKind)
 }
 
 static inline size_t
-GetFinalizableArenaTraceKind(JSGCArenaInfo *a)
+GetFinalizableArenaTraceKind(JSGCArena *a)
 {
-    JS_ASSERT(a->list);
-    return GetFinalizableTraceKind(a->list->thingKind);
+    JS_ASSERT(a->info.list);
+    return GetFinalizableTraceKind(a->info.list->thingKind);
 }
 
 static void
@@ -843,27 +843,13 @@ FinishGCArenaLists(JSRuntime *rt)
     JS_ASSERT(rt->gcChunkList == 0);
 }
 
-/*
- * This function must not be called when thing is jsdouble.
- */
-static uint8 *
-GetGCThingFlags(void *thing)
-{
-    JSGCArenaInfo *a;
-    uint32 index;
-
-    a = THING_TO_ARENA(thing);
-    index = THING_TO_INDEX(thing, a->list->thingSize);
-    return THING_FLAGP(a, index);
-}
-
 intN
 js_GetExternalStringGCType(JSString *str)
 {
     JS_STATIC_ASSERT(FINALIZE_STRING + 1 == FINALIZE_EXTERNAL_STRING0);
     JS_ASSERT(!JSString::isStatic(str));
 
-    unsigned thingKind = THING_TO_ARENA(str)->list->thingKind;
+    unsigned thingKind = JSGCArena::fromGCThing(str)->info.list->thingKind;
     JS_ASSERT(IsFinalizableStringKind(thingKind));
     return intN(thingKind) - intN(FINALIZE_EXTERNAL_STRING0);
 }
@@ -874,8 +860,8 @@ js_GetGCThingTraceKind(void *thing)
     if (JSString::isStatic(thing))
         return JSTRACE_STRING;
 
-    JSGCArenaInfo *a = THING_TO_ARENA(thing);
-    if (!a->list)
+    JSGCArena *a = JSGCArena::fromGCThing(thing);
+    if (!a->info.list)
         return JSTRACE_DOUBLE;
     return GetFinalizableArenaTraceKind(a);
 }
@@ -883,7 +869,7 @@ js_GetGCThingTraceKind(void *thing)
 JSRuntime*
 js_GetGCStringRuntime(JSString *str)
 {
-    JSGCArenaList *list = THING_TO_ARENA(str)->list;
+    JSGCArenaList *list = JSGCArena::fromGCThing(str)->info.list;
     JS_ASSERT(list->thingSize == sizeof(JSString));
 
     unsigned i = list->thingKind;
@@ -894,27 +880,23 @@ js_GetGCStringRuntime(JSString *str)
                          offsetof(JSRuntime, gcArenaList));
 }
 
-JSBool
-js_IsAboutToBeFinalized(JSContext *cx, void *thing)
+bool
+js_IsAboutToBeFinalized(void *thing)
 {
-    JSGCArenaInfo *a;
-    uint32 index, flags;
+    if (JSString::isStatic(thing))
+        return false;
 
-    a = THING_TO_ARENA(thing);
-    if (!a->list) {
+    JSGCArena *a = JSGCArena::fromGCThing(thing);
+    if (!a->info.list) {
         /*
          * Check if arena has no marked doubles. In that case the bitmap with
          * the mark flags contains all garbage as it is initialized only when
          * marking the first double in the arena.
          */
-        if (!a->hasMarkedDoubles)
-            return JS_TRUE;
-        index = DOUBLE_THING_TO_INDEX(thing);
-        return !IsMarkedDouble(a, index);
+        if (!a->info.hasMarkedDoubles)
+            return true;
     }
-    index = THING_TO_INDEX(thing, a->list->thingSize);
-    flags = *THING_FLAGP(a, index);
-    return !(flags & (GCF_MARK | GCF_LOCK));
+    return !IsMarkedGCThing(a, thing);
 }
 
 /* This is compatible with JSDHashEntryStub. */
@@ -924,16 +906,17 @@ typedef struct JSGCRootHashEntry {
     const char      *name;
 } JSGCRootHashEntry;
 
-/* Initial size of the gcRootsHash table (SWAG, small enough to amortize). */
-#define GC_ROOTS_SIZE   256
-
 /*
- * For a CPU with extremely large pages using them for GC things wastes
- * too much memory.
+ * Initial size of the gcRootsHash and gcLocksHash tables (SWAG, small enough
+ * to amortize).
  */
-#define GC_ARENAS_PER_CPU_PAGE_LIMIT JS_BIT(18 - GC_ARENA_SHIFT)
+const uint32 GC_ROOTS_SIZE = 256;
 
-JS_STATIC_ASSERT(GC_ARENAS_PER_CPU_PAGE_LIMIT <= NO_FREE_ARENAS);
+struct JSGCLockHashEntry : public JSDHashEntryHdr
+{
+    const void      *thing;
+    uint32          count;
+};
 
 JSBool
 js_InitGC(JSRuntime *rt, uint32 maxbytes)
@@ -942,9 +925,13 @@ js_InitGC(JSRuntime *rt, uint32 maxbytes)
     if (!JS_DHashTableInit(&rt->gcRootsHash, JS_DHashGetStubOps(), NULL,
                            sizeof(JSGCRootHashEntry), GC_ROOTS_SIZE)) {
         rt->gcRootsHash.ops = NULL;
-        return JS_FALSE;
+        return false;
     }
-    rt->gcLocksHash = NULL;     /* create lazily */
+    if (!JS_DHashTableInit(&rt->gcLocksHash, JS_DHashGetStubOps(), NULL,
+                           sizeof(JSGCLockHashEntry), GC_ROOTS_SIZE)) {
+        rt->gcLocksHash.ops = NULL;
+        return false;
+    }
 
     /*
      * Separate gcMaxMallocBytes from gcMaxBytes but initialize to maxbytes
@@ -968,7 +955,7 @@ js_InitGC(JSRuntime *rt, uint32 maxbytes)
     rt->setGCLastBytes(8192);
 
     METER(memset(&rt->gcStats, 0, sizeof rt->gcStats));
-    return JS_TRUE;
+    return true;
 }
 
 #ifdef JS_GCMETER
@@ -998,53 +985,60 @@ UpdateArenaStats(JSGCArenaStats *st, uint32 nlivearenas, uint32 nkilledArenas,
 JS_FRIEND_API(void)
 js_DumpGCStats(JSRuntime *rt, FILE *fp)
 {
-    int i;
-    size_t sumArenas, sumTotalArenas;
-    size_t sumThings, sumMaxThings;
-    size_t sumThingSize, sumTotalThingSize;
-    size_t sumArenaCapacity, sumTotalArenaCapacity;
-    JSGCArenaStats *st;
-    size_t thingSize, thingsPerArena;
-    size_t sumAlloc, sumLocalAlloc, sumFail, sumRetry;
+    static const char *const GC_ARENA_NAMES[] = {
+        "double",
+        "object",
+        "function",
+#if JS_HAS_XML_SUPPORT
+        "xml",
+#endif
+        "string",
+        "external_string_0",
+        "external_string_1",
+        "external_string_2",
+        "external_string_3",
+        "external_string_4",
+        "external_string_5",
+        "external_string_6",
+        "external_string_7",
+    };
+    JS_STATIC_ASSERT(JS_ARRAY_LENGTH(GC_ARENA_NAMES) == FINALIZE_LIMIT + 1);
 
-    fprintf(fp, "\nGC allocation statistics:\n");
+    fprintf(fp, "\nGC allocation statistics:\n\n");
 
 #define UL(x)       ((unsigned long)(x))
 #define ULSTAT(x)   UL(rt->gcStats.x)
 #define PERCENT(x,y)  (100.0 * (double) (x) / (double) (y))
 
-    sumArenas = 0;
-    sumTotalArenas = 0;
-    sumThings = 0;
-    sumMaxThings = 0;
-    sumThingSize = 0;
-    sumTotalThingSize = 0;
-    sumArenaCapacity = 0;
-    sumTotalArenaCapacity = 0;
-    sumAlloc = 0;
-    sumLocalAlloc = 0;
-    sumFail = 0;
-    sumRetry = 0;
-    for (i = -1; i < (int) GC_NUM_FREELISTS; i++) {
+    size_t sumArenas = 0;
+    size_t sumTotalArenas = 0;
+    size_t sumThings = 0;
+    size_t sumMaxThings = 0;
+    size_t sumThingSize = 0;
+    size_t sumTotalThingSize = 0;
+    size_t sumArenaCapacity = 0;
+    size_t sumTotalArenaCapacity = 0;
+    size_t sumAlloc = 0;
+    size_t sumLocalAlloc = 0;
+    size_t sumFail = 0;
+    size_t sumRetry = 0;
+    for (int i = -1; i < (int) FINALIZE_LIMIT; i++) {
+        size_t thingSize, thingsPerArena;
+        JSGCArenaStats *st;
         if (i == -1) {
             thingSize = sizeof(jsdouble);
             thingsPerArena = DOUBLES_PER_ARENA;
             st = &rt->gcStats.doubleArenaStats;
-            fprintf(fp,
-                    "Arena list for double values (%lu doubles per arena):",
-                    UL(thingsPerArena));
         } else {
             thingSize = rt->gcArenaList[i].thingSize;
-            thingsPerArena = THINGS_PER_ARENA(thingSize);
+            thingsPerArena = ThingsPerArena(thingSize);
             st = &rt->gcStats.arenaStats[i];
-            fprintf(fp,
-                    "Arena list %d (thing size %lu, %lu things per arena):",
-                    i, UL(GC_FREELIST_NBYTES(i)), UL(thingsPerArena));
         }
-        if (st->maxarenas == 0) {
-            fputs(" NEVER USED\n", fp);
+        if (st->maxarenas == 0)
             continue;
-        }
+        fprintf(fp,
+                "%s arenas (thing size %lu, %lu things per arena):",
+                GC_ARENA_NAMES[i + 1], UL(thingSize), UL(thingsPerArena));
         putc('\n', fp);
         fprintf(fp, "           arenas before GC: %lu\n", UL(st->narenas));
         fprintf(fp, "       new arenas before GC: %lu (%.1f%%)\n",
@@ -1059,7 +1053,7 @@ js_DumpGCStats(JSRuntime *rt, FILE *fp)
                 PERCENT(st->totalthings, thingsPerArena * st->totalarenas));
         fprintf(fp, "                 max things: %lu\n", UL(st->maxthings));
         fprintf(fp, "             alloc attempts: %lu\n", UL(st->alloc));
-        fprintf(fp, "        alloc without locks: %1u  (%.1f%%)\n",
+        fprintf(fp, "        alloc without locks: %lu  (%.1f%%)\n",
                 UL(st->localalloc), PERCENT(st->localalloc, st->alloc));
         sumArenas += st->narenas;
         sumTotalArenas += st->totalarenas;
@@ -1073,8 +1067,29 @@ js_DumpGCStats(JSRuntime *rt, FILE *fp)
         sumLocalAlloc += st->localalloc;
         sumFail += st->fail;
         sumRetry += st->retry;
+        putc('\n', fp);
     }
-    fprintf(fp, "TOTAL STATS:\n");
+
+    fputs("Never used arenas:\n", fp);
+    for (int i = -1; i < (int) FINALIZE_LIMIT; i++) {
+        size_t thingSize, thingsPerArena;
+        JSGCArenaStats *st;
+        if (i == -1) {
+            thingSize = sizeof(jsdouble);
+            thingsPerArena = DOUBLES_PER_ARENA;
+            st = &rt->gcStats.doubleArenaStats;
+        } else {
+            thingSize = rt->gcArenaList[i].thingSize;
+            thingsPerArena = ThingsPerArena(thingSize);
+            st = &rt->gcStats.arenaStats[i];
+        }
+        if (st->maxarenas != 0)
+            continue;
+        fprintf(fp,
+                "%s (thing size %lu, %lu things per arena)\n",
+                GC_ARENA_NAMES[i + 1], UL(thingSize), UL(thingsPerArena));
+    }
+    fprintf(fp, "\nTOTAL STATS:\n");
     fprintf(fp, "            bytes allocated: %lu\n", UL(rt->gcBytes));
     fprintf(fp, "            total GC arenas: %lu\n", UL(sumArenas));
     fprintf(fp, "            total GC things: %lu\n", UL(sumThings));
@@ -1085,7 +1100,7 @@ js_DumpGCStats(JSRuntime *rt, FILE *fp)
             PERCENT(sumTotalThingSize, sumTotalArenaCapacity));
     fprintf(fp, "allocation retries after GC: %lu\n", UL(sumRetry));
     fprintf(fp, "             alloc attempts: %lu\n", UL(sumAlloc));
-    fprintf(fp, "        alloc without locks: %1u  (%.1f%%)\n",
+    fprintf(fp, "        alloc without locks: %lu  (%.1f%%)\n",
             UL(sumLocalAlloc), PERCENT(sumLocalAlloc, sumAlloc));
     fprintf(fp, "        allocation failures: %lu\n", UL(sumFail));
     fprintf(fp, "         things born locked: %lu\n", ULSTAT(lockborn));
@@ -1095,9 +1110,9 @@ js_DumpGCStats(JSRuntime *rt, FILE *fp)
     fprintf(fp, "     maximum mark recursion: %lu\n", ULSTAT(maxdepth));
     fprintf(fp, "     mark C recursion depth: %lu\n", ULSTAT(cdepth));
     fprintf(fp, "   maximum mark C recursion: %lu\n", ULSTAT(maxcdepth));
-    fprintf(fp, "      delayed tracing calls: %lu\n", ULSTAT(untraced));
+    fprintf(fp, "      delayed tracing calls: %lu\n", ULSTAT(unmarked));
 #ifdef DEBUG
-    fprintf(fp, "      max trace later count: %lu\n", ULSTAT(maxuntraced));
+    fprintf(fp, "      max trace later count: %lu\n", ULSTAT(maxunmarked));
 #endif
     fprintf(fp, "   maximum GC nesting level: %lu\n", ULSTAT(maxlevel));
     fprintf(fp, "potentially useful GC calls: %lu\n", ULSTAT(poke));
@@ -1112,10 +1127,6 @@ js_DumpGCStats(JSRuntime *rt, FILE *fp)
 #undef UL
 #undef ULSTAT
 #undef PERCENT
-
-#ifdef JS_ARENAMETER
-    JS_DumpArenaStats(fp);
-#endif
 }
 #endif
 
@@ -1131,7 +1142,8 @@ js_FinishGC(JSRuntime *rt)
     JS_DumpArenaStats(stdout);
 #endif
 #ifdef JS_GCMETER
-    js_DumpGCStats(rt, stdout);
+    if (JS_WANT_GC_METER_PRINT)
+        js_DumpGCStats(rt, stdout);
 #endif
 
     rt->gcIteratorTable.clear();
@@ -1144,9 +1156,9 @@ js_FinishGC(JSRuntime *rt)
         JS_DHashTableFinish(&rt->gcRootsHash);
         rt->gcRootsHash.ops = NULL;
     }
-    if (rt->gcLocksHash) {
-        JS_DHashTableDestroy(rt->gcLocksHash);
-        rt->gcLocksHash = NULL;
+    if (rt->gcLocksHash.ops) {
+        JS_DHashTableFinish(&rt->gcLocksHash);
+        rt->gcLocksHash.ops = NULL;
     }
 }
 
@@ -1346,7 +1358,7 @@ CloseNativeIterators(JSContext *cx)
     size_t newLength = 0;
     for (size_t i = 0; i < length; ++i) {
         JSObject *obj = array[i];
-        if (js_IsAboutToBeFinalized(cx, obj))
+        if (js_IsAboutToBeFinalized(obj))
             js_CloseNativeIterator(cx, obj);
         else
             array[newLength++] = obj;
@@ -1383,9 +1395,9 @@ JSGCFreeLists::purge()
     for (JSGCThing **p = finalizables; p != JS_ARRAY_END(finalizables); ++p) {
         JSGCThing *freeListHead = *p;
         if (freeListHead) {
-            JSGCArenaInfo *a = THING_TO_ARENA(freeListHead);
-            JS_ASSERT(!a->finalizable.freeList);
-            a->finalizable.freeList = freeListHead;
+            JSGCArena *a = JSGCArena::fromGCThing(freeListHead);
+            JS_ASSERT(!a->info.freeList);
+            a->info.freeList = freeListHead;
             *p = NULL;
         }
     }
@@ -1440,11 +1452,10 @@ RefillFinalizableFreeList(JSContext *cx, unsigned thingKind)
         return NULL;
     }
 
-    METER(JSGCArenaStats *astats = &cx->runtime->gcStats.arenaStats[thingKind]);
     bool canGC = !JS_ON_TRACE(cx) && !JS_THREAD_DATA(cx)->waiveGCQuota;
     bool doGC = canGC && IsGCThresholdReached(rt);
     JSGCArenaList *arenaList = &rt->gcArenaList[thingKind];
-    JSGCArenaInfo *a;
+    JSGCArena *a;
     for (;;) {
         if (doGC) {
             /*
@@ -1456,7 +1467,7 @@ RefillFinalizableFreeList(JSContext *cx, unsigned thingKind)
              * see bug 162779 at https://bugzilla.mozilla.org/.
              */
             js_GC(cx, GC_LAST_DITCH);
-            METER(astats->retry++);
+            METER(cx->runtime->gcStats.arenaStats[thingKind].retry++);
             canGC = false;
 
             /*
@@ -1472,10 +1483,10 @@ RefillFinalizableFreeList(JSContext *cx, unsigned thingKind)
         }
 
         while ((a = arenaList->cursor) != NULL) {
-            arenaList->cursor = a->prev;
-            JSGCThing *freeList = a->finalizable.freeList;
+            arenaList->cursor = a->info.prev;
+            JSGCThing *freeList = a->info.freeList;
             if (freeList) {
-                a->finalizable.freeList = NULL;
+                a->info.freeList = NULL;
                 JS_UNLOCK_GC(rt);
                 return freeList;
             }
@@ -1485,7 +1496,7 @@ RefillFinalizableFreeList(JSContext *cx, unsigned thingKind)
         if (a)
             break;
         if (!canGC) {
-            METER(astats->fail++);
+            METER(cx->runtime->gcStats.arenaStats[thingKind].fail++);
             JS_UNLOCK_GC(rt);
             return NULL;
         }
@@ -1497,20 +1508,16 @@ RefillFinalizableFreeList(JSContext *cx, unsigned thingKind)
      * can do the rest outside the lock because no other threads will see
      * the arena until the GC is run.
      */
-    a->list = arenaList;
-    a->prev = arenaList->head;
-    a->prevUntracedPage = 0;
-    a->finalizable.untracedThings = 0;
-    a->finalizable.freeList = NULL;
+    a->info.list = arenaList;
+    a->info.prev = arenaList->head;
+    a->clearPrevUnmarked();
+    a->info.freeList = NULL;
+    a->info.unmarkedChildren = 0;
     arenaList->head = a;
     JS_UNLOCK_GC(rt);
 
-    unsigned nthings = THINGS_PER_ARENA(arenaList->thingSize);
-    uint8 *flagsStart = THING_FLAGP(a, nthings - 1);
-    memset(flagsStart, 0, nthings);
-
-    /* Turn all things in the arena into a free list. */
-    return MakeNewArenaFreeList(a, arenaList->thingSize, nthings);
+    a->clearMarkBitmap();
+    return MakeNewArenaFreeList(a, arenaList->thingSize);
 }
 
 static inline void
@@ -1521,7 +1528,8 @@ CheckGCFreeListLink(JSGCThing *thing)
      * the free list are linked in ascending address order.
      */
     JS_ASSERT_IF(thing->link,
-                 THING_TO_ARENA(thing) == THING_TO_ARENA(thing->link));
+                 JSGCArena::fromGCThing(thing) ==
+                 JSGCArena::fromGCThing(thing->link));
     JS_ASSERT_IF(thing->link, thing < thing->link);
 }
 
@@ -1544,7 +1552,7 @@ js_NewFinalizableGCThing(JSContext *cx, unsigned thingKind)
         *freeListp = thing->link;
         cx->weakRoots.finalizableNewborns[thingKind] = thing;
         CheckGCFreeListLink(thing);
-        METER(astats->localalloc++);
+        METER(cx->runtime->gcStats.arenaStats[thingKind].localalloc++);
         return thing;
     }
 
@@ -1561,7 +1569,7 @@ js_NewFinalizableGCThing(JSContext *cx, unsigned thingKind)
             thing = *freeListp;
             if (thing) {
                 *freeListp = thing->link;
-                METER(astats->localalloc++);
+                METER(cx->runtime->gcStats.arenaStats[thingKind].localalloc++);
                 break;
             }
         }
@@ -1607,24 +1615,16 @@ js_NewFinalizableGCThing(JSContext *cx, unsigned thingKind)
 }
 
 static JSGCThing *
-TurnUsedArenaIntoDoubleList(JSGCArenaInfo *a)
+TurnUsedArenaIntoDoubleList(JSGCArena *a)
 {
     JSGCThing *head;
     JSGCThing **tailp = &head;
-    jsuword thing = ARENA_INFO_TO_START(a);
+    jsuword thing = a->toPageStart();
+    jsbitmap *lastMarkWord = a->getMarkBitmapEnd() - 1;
 
-    /*
-     * When m below points the last bitmap's word in the arena, its high bits
-     * corresponds to non-existing cells and thingptr is outside the space
-     * allocated for doubles. ClearDoubleArenaFlags sets such bits to 1. Thus
-     * even for this last word its bit is unset iff the corresponding cell
-     * exists and free.
-     */
-    for (jsbitmap *m = DOUBLE_ARENA_BITMAP(a);
-         m != DOUBLE_ARENA_BITMAP_END(a);
-         ++m) {
-        JS_ASSERT(thing < reinterpret_cast<jsuword>(DOUBLE_ARENA_BITMAP(a)));
-        JS_ASSERT((thing - ARENA_INFO_TO_START(a)) %
+    for (jsbitmap *m = a->markBitmap; m <= lastMarkWord; ++m) {
+        JS_ASSERT(thing < a->toPageStart() + GC_ARENA_CELLS_SIZE);
+        JS_ASSERT((thing - a->toPageStart()) %
                   (JS_BITS_PER_WORD * sizeof(jsdouble)) == 0);
 
         jsbitmap bits = *m;
@@ -1634,7 +1634,23 @@ TurnUsedArenaIntoDoubleList(JSGCArenaInfo *a)
             /*
              * We have some zero bits. Turn corresponding cells into a list
              * unrolling the loop for better performance.
+             *
+             * When m points the last bitmap's word in the arena, its high
+             * bits corresponds to non-existing cells and thingptr is outside
+             * the space allocated for doubles. For code simplicity we set
+             * such bits to 1 here. Thus code below can assume a bit is unset
+             * iff the corresponding cell exists and free.
              */
+            if (m == lastMarkWord) {
+                const size_t unusedBits =
+                    GC_ARENA_MARK_BITMAP_WORDS * JS_BITS_PER_WORD -
+                    DOUBLES_PER_ARENA;
+                JS_STATIC_ASSERT(unusedBits < JS_BITS_PER_WORD);
+
+                const jsbitmap mask = (jsbitmap(1) << unusedBits) - 1;
+                const size_t nused = JS_BITS_PER_WORD - unusedBits;
+                bits |= mask << nused;
+            }
             const unsigned unroll = 4;
             const jsbitmap unrollMask = (jsbitmap(1) << unroll) - 1;
             JS_STATIC_ASSERT((JS_BITS_PER_WORD & unrollMask) == 0);
@@ -1647,7 +1663,7 @@ TurnUsedArenaIntoDoubleList(JSGCArenaInfo *a)
                 } else {
 #define DO_BIT(bit)                                                           \
                     if (!(bitsChunk & (jsbitmap(1) << (bit)))) {              \
-                        JS_ASSERT(thing - ARENA_INFO_TO_START(a) <=           \
+                        JS_ASSERT(thing - a->toPageStart() <=                 \
                                   (DOUBLES_PER_ARENA - 1) * sizeof(jsdouble));\
                         JSGCThing *t = reinterpret_cast<JSGCThing *>(thing);  \
                         *tailp = t;                                           \
@@ -1677,7 +1693,7 @@ RefillDoubleFreeList(JSContext *cx)
 
     JS_LOCK_GC(rt);
 
-    JSGCArenaInfo *a;
+    JSGCArena *a;
     bool canGC = !JS_ON_TRACE(cx) && !JS_THREAD_DATA(cx)->waiveGCQuota;
     bool doGC = canGC && IsGCThresholdReached(rt);
     for (;;) {
@@ -1700,8 +1716,7 @@ RefillDoubleFreeList(JSContext *cx)
          * threads.
          */
         while (!!(a = rt->gcDoubleArenaList.cursor)) {
-            JS_ASSERT(!a->hasMarkedDoubles);
-            rt->gcDoubleArenaList.cursor = a->prev;
+            rt->gcDoubleArenaList.cursor = a->info.prev;
             JS_UNLOCK_GC(rt);
             JSGCThing *list = TurnUsedArenaIntoDoubleList(a);
             if (list)
@@ -1719,25 +1734,26 @@ RefillDoubleFreeList(JSContext *cx)
         doGC = true;
     }
 
-    a->list = NULL;
-    a->hasMarkedDoubles = false;
-    a->prev = rt->gcDoubleArenaList.head;
+    a->info.list = NULL;
+    a->info.freeList = NULL;
+    a->info.prev = rt->gcDoubleArenaList.head;
     rt->gcDoubleArenaList.head = a;
     JS_UNLOCK_GC(rt);
-    return MakeNewArenaFreeList(a, sizeof(jsdouble), DOUBLES_PER_ARENA);
+
+    a->info.hasMarkedDoubles = false;
+    return MakeNewArenaFreeList(a, sizeof(jsdouble));
 }
 
 JSBool
 js_NewDoubleInRootedValue(JSContext *cx, jsdouble d, jsval *vp)
 {
     /* Updates of metering counters here are not thread-safe. */
-    METER(JSGCArenaStats *astats = &cx->runtime->gcStats.doubleArenaStats);
-    METER(astats->alloc++);
+    METER(cx->runtime->gcStats.doubleArenaStats.alloc++);
 
     JSGCThing **freeListp = &JS_THREAD_DATA(cx)->gcFreeLists.doubles;
     JSGCThing *thing = *freeListp;
     if (thing) {
-        METER(astats->localalloc++);
+        METER(cx->runtime->gcStats.doubleArenaStats.localalloc++);
         JS_ASSERT(!JS_THREAD_DATA(cx)->localRootStack);
         CheckGCFreeListLink(thing);
         *freeListp = thing->link;
@@ -1754,7 +1770,7 @@ js_NewDoubleInRootedValue(JSContext *cx, jsdouble d, jsval *vp)
             freeListp = &lrs->gcFreeLists.doubles;
             thing = *freeListp;
             if (thing) {
-                METER(astats->localalloc++);
+                METER(cx->runtime->gcStats.doubleArenaStats.localalloc++);
                 break;
             }
         }
@@ -1767,7 +1783,7 @@ js_NewDoubleInRootedValue(JSContext *cx, jsdouble d, jsval *vp)
         if (!JS_ON_TRACE(cx)) {
             /* Trace code handle this on its own. */
             js_ReportOutOfMemory(cx);
-            METER(astats->fail++);
+            METER(cx->runtime->gcStats.doubleArenaStats.fail++);
         }
         return false;
     }
@@ -1793,122 +1809,48 @@ js_NewWeaklyRootedDouble(JSContext *cx, jsdouble d)
     return dp;
 }
 
-/*
- * Shallow GC-things can be locked just by setting the GCF_LOCK bit, because
- * they have no descendants to mark during the GC. Currently the optimization
- * is only used for non-dependant strings.
- */
-static uint8 *
-GetShallowGCThingFlag(void *thing)
-{
-    if (JSString::isStatic(thing))
-        return NULL;
-    JSGCArenaInfo *a = THING_TO_ARENA(thing);
-    if (!a->list || !IsFinalizableStringKind(a->list->thingKind))
-        return NULL;
-
-    JS_ASSERT(sizeof(JSString) == a->list->thingSize);
-    JSString *str = (JSString *) thing;
-    if (str->isDependent())
-        return NULL;
-
-    uint32 index = THING_TO_INDEX(thing, sizeof(JSString));
-    return THING_FLAGP(a, index);
-}
-
-/* This is compatible with JSDHashEntryStub. */
-typedef struct JSGCLockHashEntry {
-    JSDHashEntryHdr hdr;
-    const void      *thing;
-    uint32          count;
-} JSGCLockHashEntry;
-
 JSBool
 js_LockGCThingRT(JSRuntime *rt, void *thing)
 {
     if (!thing)
-        return JS_TRUE;
+        return true;
 
     JS_LOCK_GC(rt);
-
-    /*
-     * Avoid adding a rt->gcLocksHash entry for shallow things until someone
-     * nests a lock.
-     */
-    uint8 *flagp = GetShallowGCThingFlag(thing);
-    JSBool ok;
-    JSGCLockHashEntry *lhe;
-    if (flagp && !(*flagp & GCF_LOCK)) {
-        *flagp |= GCF_LOCK;
-        METER(rt->gcStats.lock++);
-        ok = JS_TRUE;
-        goto out;
-    }
-
-    if (!rt->gcLocksHash) {
-        rt->gcLocksHash = JS_NewDHashTable(JS_DHashGetStubOps(), NULL,
-                                           sizeof(JSGCLockHashEntry),
-                                           GC_ROOTS_SIZE);
-        if (!rt->gcLocksHash) {
-            ok = JS_FALSE;
-            goto out;
+    JSGCLockHashEntry *lhe = (JSGCLockHashEntry *)
+                             JS_DHashTableOperate(&rt->gcLocksHash, thing,
+                                                  JS_DHASH_ADD);
+    bool ok = !!lhe;
+    if (ok) {
+        if (!lhe->thing) {
+            lhe->thing = thing;
+            lhe->count = 1;
+        } else {
+            JS_ASSERT(lhe->count >= 1);
+            lhe->count++;
         }
+        METER(rt->gcStats.lock++);
     }
-
-    lhe = (JSGCLockHashEntry *)
-          JS_DHashTableOperate(rt->gcLocksHash, thing, JS_DHASH_ADD);
-    if (!lhe) {
-        ok = JS_FALSE;
-        goto out;
-    }
-    if (!lhe->thing) {
-        lhe->thing = thing;
-        lhe->count = 1;
-    } else {
-        JS_ASSERT(lhe->count >= 1);
-        lhe->count++;
-    }
-
-    METER(rt->gcStats.lock++);
-    ok = JS_TRUE;
-  out:
     JS_UNLOCK_GC(rt);
     return ok;
 }
 
-JSBool
+void
 js_UnlockGCThingRT(JSRuntime *rt, void *thing)
 {
     if (!thing)
-        return JS_TRUE;
+        return;
 
     JS_LOCK_GC(rt);
-
-    uint8 *flagp = GetShallowGCThingFlag(thing);
-    JSGCLockHashEntry *lhe;
-    if (flagp && !(*flagp & GCF_LOCK))
-        goto out;
-    if (!rt->gcLocksHash ||
-        (lhe = (JSGCLockHashEntry *)
-         JS_DHashTableOperate(rt->gcLocksHash, thing,
-                              JS_DHASH_LOOKUP),
-             JS_DHASH_ENTRY_IS_FREE(&lhe->hdr))) {
-        /* Shallow entry is not in the hash -> clear its lock bit. */
-        if (flagp)
-            *flagp &= ~GCF_LOCK;
-        else
-            goto out;
-    } else {
-        if (--lhe->count != 0)
-            goto out;
-        JS_DHashTableOperate(rt->gcLocksHash, thing, JS_DHASH_REMOVE);
+    JSGCLockHashEntry *lhe = (JSGCLockHashEntry *)
+                             JS_DHashTableOperate(&rt->gcLocksHash, thing,
+                                                  JS_DHASH_LOOKUP);
+    if (JS_DHASH_ENTRY_IS_BUSY(lhe)) {
+        rt->gcPoke = true;
+        if (--lhe->count == 0)
+            JS_DHashTableOperate(&rt->gcLocksHash, thing, JS_DHASH_REMOVE);
+        METER(rt->gcStats.unlock++);
     }
-
-    rt->gcPoke = JS_TRUE;
-    METER(rt->gcStats.unlock++);
-  out:
     JS_UNLOCK_GC(rt);
-    return JS_TRUE;
 }
 
 JS_PUBLIC_API(void)
@@ -1940,110 +1882,142 @@ JS_TraceChildren(JSTracer *trc, void *thing, uint32 kind)
 }
 
 /*
- * Number of things covered by a single bit of JSGCArenaInfo.untracedThings.
+ * When the native stack is low, the GC does not call JS_TraceChildren to mark
+ * the reachable "children" of the thing. Rather the thing is put aside and
+ * JS_TraceChildren is called later with more space on the C stack.
+ *
+ * To implement such delayed marking of the children with minimal overhead for
+ * the normal case of sufficient native stack, the code adds two fields to
+ * JSGCArenaInfo. The first field, JSGCArenaInfo::prevUnmarkedPage, links all
+ * arenas with delayed things into a stack list with the pointer to stack top
+ * in JSRuntime::gcUnmarkedArenaStackTop. DelayMarkingChildren adds arenas to
+ * the stack as necessary while MarkDelayedChildren pops the arenas from the
+ * stack until it empties.
+ *
+ * The second field, JSGCArenaInfo::unmarkedChildren, is a bitmap that tells
+ * for which things the GC should call JS_TraceChildren later. The bitmap is
+ * a single word. As such it does not pinpoint the delayed things in the arena
+ * but rather tells the intervals containing ThingsPerUnmarkedBit(thingSize)
+ * things. Later the code in MarkDelayedChildren discovers such intervals
+ * and calls JS_TraceChildren on any marked thing in the interval. This
+ * implies that JS_TraceChildren can be called many times for a single thing
+ * if the thing shares the same interval with some delayed things. This should
+ * be fine as any GC graph marking/traversing hooks must allow repeated calls
+ * during the same GC cycle. In particular, xpcom cycle collector relies on
+ * this.
+ *
+ * Note that such repeated scanning may slow down the GC. In particular, it is
+ * possible to construct an object graph where the GC calls JS_TraceChildren
+ * ThingsPerUnmarkedBit(thingSize) for almost all things in the graph. We
+ * tolerate this as the max value for ThingsPerUnmarkedBit(thingSize) is 4.
+ * This is archived for JSObject on 32 bit system as it is exactly JSObject
+ * that has the smallest size among the GC things that can be delayed. On 32
+ * bit CPU we have less than 128 objects per 4K GC arena so each bit in
+ * unmarkedChildren covers 4 objects.
  */
-#define THINGS_PER_UNTRACED_BIT(thingSize)                                    \
-    JS_HOWMANY(THINGS_PER_ARENA(thingSize), JS_BITS_PER_WORD)
-
-static void
-DelayTracingChildren(JSRuntime *rt, uint8 *flagp)
+inline unsigned
+ThingsPerUnmarkedBit(unsigned thingSize)
 {
-    JSGCArenaInfo *a;
-    uint32 untracedBitIndex;
-    jsuword bit;
-
-    JS_ASSERT(!(*flagp & GCF_CHILDREN));
-    *flagp |= GCF_CHILDREN;
-
-    METER(rt->gcStats.untraced++);
-#ifdef DEBUG
-    ++rt->gcTraceLaterCount;
-    METER_UPDATE_MAX(rt->gcStats.maxuntraced, rt->gcTraceLaterCount);
-#endif
-
-    a = FLAGP_TO_ARENA(flagp);
-    untracedBitIndex = FLAGP_TO_INDEX(flagp) /
-                       THINGS_PER_UNTRACED_BIT(a->list->thingSize);
-    JS_ASSERT(untracedBitIndex < JS_BITS_PER_WORD);
-    bit = (jsuword)1 << untracedBitIndex;
-    if (a->finalizable.untracedThings != 0) {
-        JS_ASSERT(rt->gcUntracedArenaStackTop);
-        if (a->finalizable.untracedThings & bit) {
-            /* bit already covers things with children to trace later. */
-            return;
-        }
-        a->finalizable.untracedThings |= bit;
-    } else {
-        /*
-         * The thing is the first thing with not yet traced children in the
-         * whole arena, so push the arena on the stack of arenas with things
-         * to be traced later unless the arena has already been pushed. We
-         * detect that through checking prevUntracedPage as the field is 0
-         * only for not yet pushed arenas. To ensure that
-         *   prevUntracedPage != 0
-         * even when the stack contains one element, we make prevUntracedPage
-         * for the arena at the bottom to point to itself.
-         *
-         * See comments in TraceDelayedChildren.
-         */
-        a->finalizable.untracedThings = bit;
-        if (a->prevUntracedPage == 0) {
-            if (!rt->gcUntracedArenaStackTop) {
-                /* Stack was empty, mark the arena as the bottom element. */
-                a->prevUntracedPage = ARENA_INFO_TO_PAGE(a);
-            } else {
-                JS_ASSERT(rt->gcUntracedArenaStackTop->prevUntracedPage != 0);
-                a->prevUntracedPage =
-                    ARENA_INFO_TO_PAGE(rt->gcUntracedArenaStackTop);
-            }
-            rt->gcUntracedArenaStackTop = a;
-        }
-    }
-    JS_ASSERT(rt->gcUntracedArenaStackTop);
+    return JS_HOWMANY(ThingsPerArena(thingSize), JS_BITS_PER_WORD);
 }
 
 static void
-TraceDelayedChildren(JSTracer *trc)
+DelayMarkingChildren(JSRuntime *rt, void *thing)
+{
+    METER(rt->gcStats.unmarked++);
+    JSGCArena *a = JSGCArena::fromGCThing(thing);
+    JS_ASSERT(IsMarkedGCThing(a, thing));
+
+    size_t thingIndex = ThingToOffset(thing) / a->info.list->thingSize;
+    size_t unmarkedBitIndex = thingIndex /
+                              ThingsPerUnmarkedBit(a->info.list->thingSize);
+    JS_ASSERT(unmarkedBitIndex < JS_BITS_PER_WORD);
+
+    jsuword bit = jsuword(1) << unmarkedBitIndex;
+    if (a->info.unmarkedChildren != 0) {
+        JS_ASSERT(rt->gcUnmarkedArenaStackTop);
+        if (a->info.unmarkedChildren & bit) {
+            /* bit already covers things with children to mark later. */
+            return;
+        }
+        a->info.unmarkedChildren |= bit;
+    } else {
+        /*
+         * The thing is the first thing with not yet marked children in the
+         * whole arena, so push the arena on the stack of arenas with things
+         * to be marked later unless the arena has already been pushed. We
+         * detect that through checking prevUnmarkedPage as the field is 0
+         * only for not yet pushed arenas. To ensure that
+         *   prevUnmarkedPage != 0
+         * even when the stack contains one element, we make prevUnmarkedPage
+         * for the arena at the bottom to point to itself.
+         *
+         * See comments in MarkDelayedChildren.
+         */
+        a->info.unmarkedChildren = bit;
+        if (!a->hasPrevUnmarked()) {
+            if (!rt->gcUnmarkedArenaStackTop) {
+                /* Stack was empty, mark the arena as the bottom element. */
+                a->setPrevUnmarked(a);
+            } else {
+                JS_ASSERT(rt->gcUnmarkedArenaStackTop->hasPrevUnmarked());
+                a->setPrevUnmarked(rt->gcUnmarkedArenaStackTop);
+            }
+            rt->gcUnmarkedArenaStackTop = a;
+        }
+        JS_ASSERT(rt->gcUnmarkedArenaStackTop);
+    }
+#ifdef DEBUG
+    rt->gcMarkLaterCount += ThingsPerUnmarkedBit(a->info.list->thingSize);
+    METER_UPDATE_MAX(rt->gcStats.maxunmarked, rt->gcMarkLaterCount);
+#endif
+}
+
+static void
+MarkDelayedChildren(JSTracer *trc)
 {
     JSRuntime *rt;
-    JSGCArenaInfo *a, *aprev;
-    uint32 thingSize, traceKind;
-    uint32 thingsPerUntracedBit;
-    uint32 untracedBitIndex, thingIndex, indexLimit, endIndex;
+    JSGCArena *a, *aprev;
+    unsigned thingSize, traceKind;
+    unsigned thingsPerUnmarkedBit;
+    unsigned unmarkedBitIndex, thingIndex, indexLimit, endIndex;
     JSGCThing *thing;
-    uint8 *flagp;
 
     rt = trc->context->runtime;
-    a = rt->gcUntracedArenaStackTop;
+    a = rt->gcUnmarkedArenaStackTop;
     if (!a) {
-        JS_ASSERT(rt->gcTraceLaterCount == 0);
+        JS_ASSERT(rt->gcMarkLaterCount == 0);
         return;
     }
 
     for (;;) {
         /*
          * The following assert verifies that the current arena belongs to the
-         * untraced stack, since DelayTracingChildren ensures that even for
-         * stack's bottom prevUntracedPage != 0 but rather points to itself.
+         * unmarked stack, since DelayMarkingChildren ensures that even for
+         * the stack's bottom, prevUnmarkedPage != 0 but rather points to
+         * itself.
          */
-        JS_ASSERT(a->prevUntracedPage != 0);
-        JS_ASSERT(rt->gcUntracedArenaStackTop->prevUntracedPage != 0);
-        thingSize = a->list->thingSize;
+        JS_ASSERT(a->hasPrevUnmarked());
+        JS_ASSERT(rt->gcUnmarkedArenaStackTop->hasPrevUnmarked());
+        thingSize = a->info.list->thingSize;
         traceKind = GetFinalizableArenaTraceKind(a);
-        indexLimit = THINGS_PER_ARENA(thingSize);
-        thingsPerUntracedBit = THINGS_PER_UNTRACED_BIT(thingSize);
+        indexLimit = ThingsPerArena(thingSize);
+        thingsPerUnmarkedBit = ThingsPerUnmarkedBit(thingSize);
 
         /*
-         * We cannot use do-while loop here as a->untracedThings can be zero
+         * We cannot use do-while loop here as a->unmarkedChildren can be zero
          * before the loop as a leftover from the previous iterations. See
          * comments after the loop.
          */
-        while (a->finalizable.untracedThings != 0) {
-            untracedBitIndex = JS_FLOOR_LOG2W(a->finalizable.untracedThings);
-            a->finalizable.untracedThings &=
-                ~((jsuword)1 << untracedBitIndex);
-            thingIndex = untracedBitIndex * thingsPerUntracedBit;
-            endIndex = thingIndex + thingsPerUntracedBit;
+        while (a->info.unmarkedChildren != 0) {
+            unmarkedBitIndex = JS_FLOOR_LOG2W(a->info.unmarkedChildren);
+            a->info.unmarkedChildren &= ~((jsuword)1 << unmarkedBitIndex);
+#ifdef DEBUG
+            JS_ASSERT(rt->gcMarkLaterCount >= thingsPerUnmarkedBit);
+            rt->gcMarkLaterCount -= thingsPerUnmarkedBit;
+#endif
+            thingIndex = unmarkedBitIndex * thingsPerUnmarkedBit;
+            endIndex = thingIndex + thingsPerUnmarkedBit;
 
             /*
              * endIndex can go beyond the last allocated thing as the real
@@ -2052,23 +2026,15 @@ TraceDelayedChildren(JSTracer *trc)
             if (endIndex > indexLimit)
                 endIndex = indexLimit;
             JS_ASSERT(thingIndex < indexLimit);
-
+            unsigned thingOffset = thingIndex * thingSize;
+            unsigned endOffset = endIndex * thingSize;
             do {
-                /*
-                 * Skip free or already traced things that share the bit
-                 * with untraced ones.
-                 */
-                flagp = THING_FLAGP(a, thingIndex);
-                if (!(*flagp & GCF_CHILDREN))
-                    continue;
-                *flagp &= ~GCF_CHILDREN;
-#ifdef DEBUG
-                JS_ASSERT(rt->gcTraceLaterCount != 0);
-                --rt->gcTraceLaterCount;
-#endif
-                thing = FLAGP_TO_THING(flagp, thingSize);
-                JS_TraceChildren(trc, thing, traceKind);
-            } while (++thingIndex != endIndex);
+                if (IsMarkedGCThing(a, thingOffset)) {
+                    thing = OffsetToThing(a, thingOffset);
+                    JS_TraceChildren(trc, thing, traceKind);
+                }
+                thingOffset += thingSize;
+            } while (thingOffset != endOffset);
         }
 
         /*
@@ -2076,29 +2042,29 @@ TraceDelayedChildren(JSTracer *trc)
          * pop it from the stack if the arena is the stack's top.
          *
          * When JS_TraceChildren from the above calls JS_CallTracer that in
-         * turn on low C stack calls DelayTracingChildren and the latter
-         * pushes new arenas to the untraced stack, we have to skip popping
+         * turn on low C stack calls DelayMarkingChildren and the latter
+         * pushes new arenas to the unmarked stack, we have to skip popping
          * of this arena until it becomes the top of the stack again.
          */
-        if (a == rt->gcUntracedArenaStackTop) {
-            aprev = ARENA_PAGE_TO_INFO(a->prevUntracedPage);
-            a->prevUntracedPage = 0;
+        if (a == rt->gcUnmarkedArenaStackTop) {
+            aprev = a->getPrevUnmarked();
+            a->clearPrevUnmarked();
             if (a == aprev) {
                 /*
-                 * prevUntracedPage points to itself and we reached the
+                 * prevUnmarkedPage points to itself and we reached the
                  * bottom of the stack.
                  */
                 break;
             }
-            rt->gcUntracedArenaStackTop = a = aprev;
+            rt->gcUnmarkedArenaStackTop = a = aprev;
         } else {
-            a = rt->gcUntracedArenaStackTop;
+            a = rt->gcUnmarkedArenaStackTop;
         }
     }
-    JS_ASSERT(rt->gcUntracedArenaStackTop);
-    JS_ASSERT(rt->gcUntracedArenaStackTop->prevUntracedPage == 0);
-    rt->gcUntracedArenaStackTop = NULL;
-    JS_ASSERT(rt->gcTraceLaterCount == 0);
+    JS_ASSERT(rt->gcUnmarkedArenaStackTop);
+    JS_ASSERT(!rt->gcUnmarkedArenaStackTop->hasPrevUnmarked());
+    rt->gcUnmarkedArenaStackTop = NULL;
+    JS_ASSERT(rt->gcMarkLaterCount == 0);
 }
 
 JS_PUBLIC_API(void)
@@ -2106,9 +2072,7 @@ JS_CallTracer(JSTracer *trc, void *thing, uint32 kind)
 {
     JSContext *cx;
     JSRuntime *rt;
-    JSGCArenaInfo *a;
-    uintN index;
-    uint8 *flagp;
+    JSGCArena *a;
 
     JS_ASSERT(thing);
     JS_ASSERT(JS_IS_VALID_TRACE_KIND(kind));
@@ -2130,41 +2094,35 @@ JS_CallTracer(JSTracer *trc, void *thing, uint32 kind)
      */
     switch (kind) {
       case JSTRACE_DOUBLE:
-        a = THING_TO_ARENA(thing);
-        JS_ASSERT(!a->list);
-        if (!a->hasMarkedDoubles) {
-            ClearDoubleArenaFlags(a);
-            a->hasMarkedDoubles = true;
+        a = JSGCArena::fromGCThing(thing);
+        JS_ASSERT(!a->info.list);
+        if (!a->info.hasMarkedDoubles) {
+            a->info.hasMarkedDoubles = true;
+            a->clearMarkBitmap();
         }
-        index = DOUBLE_THING_TO_INDEX(thing);
-        JS_SET_BIT(DOUBLE_ARENA_BITMAP(a), index);
+        MarkIfUnmarkedGCThing(a, thing);
         goto out;
 
       case JSTRACE_STRING:
         for (;;) {
             if (JSString::isStatic(thing))
                 goto out;
-            a = THING_TO_ARENA(thing);
-            flagp = THING_FLAGP(a, THING_TO_INDEX(thing, sizeof(JSString)));
+            a = JSGCArena::fromGCThing(thing);
             JS_ASSERT(kind == GetFinalizableArenaTraceKind(a));
-            if (!((JSString *) thing)->isDependent()) {
-                *flagp |= GCF_MARK;
+            if (!MarkIfUnmarkedGCThing(a, thing))
                 goto out;
-            }
-            if (*flagp & GCF_MARK)
+            if (!((JSString *) thing)->isDependent())
                 goto out;
-            *flagp |= GCF_MARK;
             thing = ((JSString *) thing)->dependentBase();
         }
         /* NOTREACHED */
     }
 
-    JS_ASSERT(kind == GetFinalizableArenaTraceKind(THING_TO_ARENA(thing)));
-    flagp = GetGCThingFlags(thing);
-    if (*flagp & GCF_MARK)
+    a = JSGCArena::fromGCThing(thing);
+    JS_ASSERT(kind == GetFinalizableArenaTraceKind(a));
+    if (!MarkIfUnmarkedGCThing(a, thing))
         goto out;
 
-    *flagp |= GCF_MARK;
     if (!cx->insideGCMarkCallback) {
         /*
          * With JS_GC_ASSUME_LOW_C_STACK defined the mark phase of GC always
@@ -2178,7 +2136,7 @@ JS_CallTracer(JSTracer *trc, void *thing, uint32 kind)
 # define RECURSION_TOO_DEEP() (!JS_CHECK_STACK_SIZE(cx, stackDummy))
 #endif
         if (RECURSION_TOO_DEEP())
-            DelayTracingChildren(rt, flagp);
+            DelayMarkingChildren(rt, thing);
         else
             JS_TraceChildren(trc, thing, kind);
     } else {
@@ -2190,17 +2148,17 @@ JS_CallTracer(JSTracer *trc, void *thing, uint32 kind)
          *
          * Since we do not know which call from inside the callback is the
          * last, we ensure that children of all marked things are traced and
-         * call TraceDelayedChildren(trc) after tracing the thing.
+         * call MarkDelayedChildren(trc) after tracing the thing.
          *
-         * As TraceDelayedChildren unconditionally invokes JS_TraceChildren
-         * for the things with untraced children, calling DelayTracingChildren
+         * As MarkDelayedChildren unconditionally invokes JS_TraceChildren
+         * for the things with unmarked children, calling DelayMarkingChildren
          * is useless here. Hence we always trace thing's children even with a
          * low native stack.
          */
-        cx->insideGCMarkCallback = JS_FALSE;
+        cx->insideGCMarkCallback = false;
         JS_TraceChildren(trc, thing, kind);
-        TraceDelayedChildren(trc);
-        cx->insideGCMarkCallback = JS_TRUE;
+        MarkDelayedChildren(trc);
+        cx->insideGCMarkCallback = true;
     }
 
   out:
@@ -2220,7 +2178,7 @@ js_CallValueTracerIfGCThing(JSTracer *trc, jsval v)
     if (JSVAL_IS_DOUBLE(v) || JSVAL_IS_STRING(v)) {
         thing = JSVAL_TO_TRACEABLE(v);
         kind = JSVAL_TRACE_KIND(v);
-        JS_ASSERT(kind == js_GetGCThingTraceKind(JSVAL_TO_GCTHING(v)));
+        JS_ASSERT(kind == js_GetGCThingTraceKind(thing));
     } else if (JSVAL_IS_OBJECT(v) && v != JSVAL_NULL) {
         /* v can be an arbitrary GC thing reinterpreted as an object. */
         thing = JSVAL_TO_OBJECT(v);
@@ -2241,41 +2199,43 @@ gc_root_traversal(JSDHashTable *table, JSDHashEntryHdr *hdr, uint32 num,
     jsval v = *rp;
 
     /* Ignore null reference, scalar values, and static strings. */
-    if (!JSVAL_IS_NULL(v) &&
-        JSVAL_IS_GCTHING(v) &&
-        !JSString::isStatic(JSVAL_TO_GCTHING(v))) {
+    if (JSVAL_IS_TRACEABLE(v)) {
 #ifdef DEBUG
-        bool root_points_to_gcArenaList = false;
-        jsuword thing = (jsuword) JSVAL_TO_GCTHING(v);
-        JSRuntime *rt = trc->context->runtime;
-        for (unsigned i = 0; i != FINALIZE_LIMIT; i++) {
-            JSGCArenaList *arenaList = &rt->gcArenaList[i];
-            size_t thingSize = arenaList->thingSize;
-            size_t limit = THINGS_PER_ARENA(thingSize) * thingSize;
-            for (JSGCArenaInfo *a = arenaList->head; a; a = a->prev) {
-                if (thing - ARENA_INFO_TO_START(a) < limit) {
-                    root_points_to_gcArenaList = true;
-                    break;
+        if (!JSString::isStatic(JSVAL_TO_GCTHING(v))) {
+            bool root_points_to_gcArenaList = false;
+            jsuword thing = (jsuword) JSVAL_TO_GCTHING(v);
+            JSRuntime *rt = trc->context->runtime;
+            for (unsigned i = 0; i != FINALIZE_LIMIT; i++) {
+                JSGCArenaList *arenaList = &rt->gcArenaList[i];
+                size_t thingSize = arenaList->thingSize;
+                size_t limit = ThingsPerArena(thingSize) * thingSize;
+                for (JSGCArena *a = arenaList->head; a; a = a->info.prev) {
+                    if (thing - a->toPageStart() < limit) {
+                        root_points_to_gcArenaList = true;
+                        break;
+                    }
                 }
             }
-        }
-        if (!root_points_to_gcArenaList) {
-            for (JSGCArenaInfo *a = rt->gcDoubleArenaList.head; a; a = a->prev) {
-                if (thing - ARENA_INFO_TO_START(a) <
-                    DOUBLES_PER_ARENA * sizeof(jsdouble)) {
-                    root_points_to_gcArenaList = true;
-                    break;
+            if (!root_points_to_gcArenaList) {
+                for (JSGCArena *a = rt->gcDoubleArenaList.head;
+                     a;
+                     a = a->info.prev) {
+                    if (thing - a->toPageStart() <
+                        DOUBLES_PER_ARENA * sizeof(jsdouble)) {
+                        root_points_to_gcArenaList = true;
+                        break;
+                    }
                 }
             }
-        }
-        if (!root_points_to_gcArenaList && rhe->name) {
-            fprintf(stderr,
+            if (!root_points_to_gcArenaList && rhe->name) {
+                fprintf(stderr,
 "JS API usage error: the address passed to JS_AddNamedRoot currently holds an\n"
 "invalid jsval.  This is usually caused by a missing call to JS_RemoveRoot.\n"
 "The root's name is \"%s\".\n",
-                    rhe->name);
+                        rhe->name);
+            }
+            JS_ASSERT(root_points_to_gcArenaList);
         }
-        JS_ASSERT(root_points_to_gcArenaList);
 #endif
         JS_SET_TRACING_NAME(trc, rhe->name ? rhe->name : "root");
         js_CallValueTracerIfGCThing(trc, v);
@@ -2322,8 +2282,6 @@ js_TraceStackFrame(JSTracer *trc, JSStackFrame *fp)
         JS_CALL_OBJECT_TRACER(trc, fp->callobj, "call");
     if (fp->argsobj)
         JS_CALL_OBJECT_TRACER(trc, JSVAL_TO_OBJECT(fp->argsobj), "arguments");
-    if (fp->varobj)
-        JS_CALL_OBJECT_TRACER(trc, fp->varobj, "variables");
     if (fp->script) {
         js_TraceScript(trc, fp->script);
 
@@ -2407,10 +2365,17 @@ JSWeakRoots::mark(JSTracer *trc)
     js_CallValueTracerIfGCThing(trc, lastInternalResult);
 }
 
+static void inline
+TraceFrameChain(JSTracer *trc, JSStackFrame *fp)
+{
+    do {
+        js_TraceStackFrame(trc, fp);
+    } while ((fp = fp->down) != NULL);
+}
+
 JS_REQUIRES_STACK JS_FRIEND_API(void)
 js_TraceContext(JSTracer *trc, JSContext *acx)
 {
-    JSStackFrame *fp, *nextChain;
     JSStackHeader *sh;
     JSTempValueRooter *tvr;
 
@@ -2443,9 +2408,7 @@ js_TraceContext(JSTracer *trc, JSContext *acx)
     }
 
     /*
-     * Iterate frame chain and dormant chains.
-     *
-     * (NB: see comment on this whole "dormant" thing in js_Execute.)
+     * Trace active and suspended callstacks.
      *
      * Since js_GetTopStackFrame needs to dereference cx->thread to check for
      * JIT frames, we check for non-null thread here and avoid null checks
@@ -2455,25 +2418,28 @@ js_TraceContext(JSTracer *trc, JSContext *acx)
     if (acx->thread)
 #endif
     {
-        fp = js_GetTopStackFrame(acx);
-        nextChain = acx->dormantFrameChain;
-        if (!fp)
-            goto next_chain;
+        /* If |cx->fp|, the active callstack has newest (top) frame |cx->fp|. */
+        JSStackFrame *fp = js_GetTopStackFrame(acx);
+        if (fp) {
+            JS_ASSERT(!acx->activeCallStack()->isSuspended());
+            TraceFrameChain(trc, fp);
+            if (JSObject *o = acx->activeCallStack()->getInitialVarObj())
+                JS_CALL_OBJECT_TRACER(trc, o, "variables");
+        }
 
-        /* The top frame must not be dormant. */
-        JS_ASSERT(!fp->dormantNext);
-        for (;;) {
-            do {
-                js_TraceStackFrame(trc, fp);
-            } while ((fp = fp->down) != NULL);
-
-          next_chain:
-            if (!nextChain)
-                break;
-            fp = nextChain;
-            nextChain = nextChain->dormantNext;
+        /* Trace suspended frames. */
+        CallStack *cur = acx->currentCallStack;
+        CallStack *cs = fp ? cur->getPrevious() : cur;
+        for (; cs; cs = cs->getPrevious()) {
+            TraceFrameChain(trc, cs->getSuspendedFrame());
+            if (cs->getInitialVarObj())
+                JS_CALL_OBJECT_TRACER(trc, cs->getInitialVarObj(), "var env");
         }
     }
+
+    /* Trace frames that have been temporarily removed but need to be marked. */
+    for (JSGCReachableFrame *rf = acx->reachableFrames; rf; rf = rf->next)
+        TraceFrameChain(trc, rf->frame);
 
     /* Mark other roots-by-definition in acx. */
     if (acx->globalObject && !JS_HAS_OPTION(acx, JSOPTION_UNROOTED_GLOBAL))
@@ -2544,8 +2510,7 @@ js_TraceRuntime(JSTracer *trc, JSBool allAtoms)
     JSContext *iter, *acx;
 
     JS_DHashTableEnumerate(&rt->gcRootsHash, gc_root_traversal, trc);
-    if (rt->gcLocksHash)
-        JS_DHashTableEnumerate(rt->gcLocksHash, gc_lock_traversal, trc);
+    JS_DHashTableEnumerate(&rt->gcLocksHash, gc_lock_traversal, trc);
     js_TraceAtomState(trc, allAtoms);
     js_TraceRuntimeNumberState(trc);
     js_MarkTraps(trc);
@@ -2622,8 +2587,8 @@ js_DestroyScriptsToGC(JSContext *cx, JSThreadData *data)
     }
 }
 
-static inline void
-FinalizeGCThing(JSContext *cx, JSObject *obj, unsigned thingKind)
+inline void
+FinalizeObject(JSContext *cx, JSObject *obj, unsigned thingKind)
 {
     JS_ASSERT(thingKind == FINALIZE_FUNCTION || thingKind == FINALIZE_OBJECT);
 
@@ -2631,13 +2596,8 @@ FinalizeGCThing(JSContext *cx, JSObject *obj, unsigned thingKind)
     if (!obj->map)
         return;
 
-    if (JS_UNLIKELY(cx->debugHooks->objectHook != NULL)) {
-        cx->debugHooks->objectHook(cx, obj, JS_FALSE,
-                                   cx->debugHooks->objectHookData);
-    }
-
     /* Finalize obj first, in case it needs map and slots. */
-    JSClass *clasp = STOBJ_GET_CLASS(obj);
+    JSClass *clasp = obj->getClass();
     if (clasp->finalize)
         clasp->finalize(cx, obj);
 
@@ -2646,21 +2606,45 @@ FinalizeGCThing(JSContext *cx, JSObject *obj, unsigned thingKind)
         jsdtrace_object_finalize(obj);
 #endif
 
-    if (JS_LIKELY(OBJ_IS_NATIVE(obj)))
-        OBJ_SCOPE(obj)->drop(cx, obj);
-    js_FreeSlots(cx, obj);
+    if (JS_LIKELY(OBJ_IS_NATIVE(obj))) {
+        JSScope *scope = OBJ_SCOPE(obj);
+        if (scope->isSharedEmpty())
+            static_cast<JSEmptyScope *>(scope)->dropFromGC(cx);
+        else
+            scope->destroy(cx);
+    }
+    if (obj->hasSlotsArray())
+        obj->freeSlotsArray(cx);
 }
 
-static inline void
-FinalizeGCThing(JSContext *cx, JSFunction *fun, unsigned thingKind)
+inline void
+FinalizeFunction(JSContext *cx, JSFunction *fun, unsigned thingKind)
 {
-    JS_ASSERT(thingKind == FINALIZE_FUNCTION);
-    ::FinalizeGCThing(cx, FUN_OBJECT(fun), thingKind);
+    FinalizeObject(cx, FUN_OBJECT(fun), thingKind);
+}
+
+inline void
+FinalizeHookedObject(JSContext *cx, JSObject *obj, unsigned thingKind)
+{
+    if (!obj->map)
+        return;
+
+    if (cx->debugHooks->objectHook) {
+        cx->debugHooks->objectHook(cx, obj, JS_FALSE,
+                                   cx->debugHooks->objectHookData);
+    }
+    FinalizeObject(cx, obj, thingKind);
+}
+
+inline void
+FinalizeHookedFunction(JSContext *cx, JSFunction *fun, unsigned thingKind)
+{
+    FinalizeHookedObject(cx, FUN_OBJECT(fun), thingKind);
 }
 
 #if JS_HAS_XML_SUPPORT
-static inline void
-FinalizeGCThing(JSContext *cx, JSXML *xml, unsigned thingKind)
+inline void
+FinalizeXML(JSContext *cx, JSXML *xml, unsigned thingKind)
 {
     js_FinalizeXML(cx, xml);
 }
@@ -2684,79 +2668,101 @@ js_ChangeExternalStringFinalizer(JSStringFinalizeOp oldop,
     return -1;
 }
 
-/*
- * cx is NULL when we are called from js_FinishAtomState to force the
- * finalization of the permanently interned strings.
- */
-static void
-FinalizeString(JSRuntime *rt, JSString *str, unsigned thingKind, JSContext *cx)
+inline void
+FinalizeString(JSContext *cx, JSString *str, unsigned thingKind)
 {
-    jschar *chars;
-    JSBool valid;
-    JSStringFinalizeOp finalizer;
-
-    JS_RUNTIME_UNMETER(rt, liveStrings);
+    JS_ASSERT(FINALIZE_STRING == thingKind);
     JS_ASSERT(!JSString::isStatic(str));
-    JS_ASSERT(IsFinalizableStringKind(thingKind));
+    JS_RUNTIME_UNMETER(cx->runtime, liveStrings);
     if (str->isDependent()) {
-        /* A dependent string can not be external and must be valid. */
-        JS_ASSERT(thingKind == FINALIZE_STRING);
         JS_ASSERT(str->dependentBase());
-        JS_RUNTIME_UNMETER(rt, liveDependentStrings);
-        valid = JS_TRUE;
+        JS_RUNTIME_UNMETER(cx->runtime, liveDependentStrings);
     } else {
-        /* A stillborn string has null chars, so is not valid. */
-        chars = str->flatChars();
-        valid = (chars != NULL);
-        if (valid) {
-            if (thingKind == FINALIZE_STRING) {
-                if (cx)
-                    cx->free(chars);
-                else
-                    rt->free(chars);
-            } else {
-                unsigned type = thingKind - FINALIZE_EXTERNAL_STRING0;
-                JS_ASSERT(type < JS_ARRAY_LENGTH(str_finalizers));
-                finalizer = str_finalizers[type];
-                if (finalizer) {
-                    /*
-                     * Assume that the finalizer for the permanently interned
-                     * string knows how to deal with null context.
-                     */
-                    finalizer(cx, str);
-                }
-            }
-        }
+        /*
+         * flatChars for stillborn string is null, but cx->free would checks
+         * for a null pointer on its own.
+         */
+        cx->free(str->flatChars());
     }
-    if (valid && str->isDeflated())
-        js_PurgeDeflatedStringCache(rt, str);
+    if (str->isDeflated())
+        js_PurgeDeflatedStringCache(cx->runtime, str);
 }
 
-static inline void
-FinalizeGCThing(JSContext *cx, JSString *str, unsigned thingKind)
+inline void
+FinalizeExternalString(JSContext *cx, JSString *str, unsigned thingKind)
 {
-    return FinalizeString(cx->runtime, str, thingKind, cx);
+    unsigned type = thingKind - FINALIZE_EXTERNAL_STRING0;
+    JS_ASSERT(type < JS_ARRAY_LENGTH(str_finalizers));
+    JS_ASSERT(!JSString::isStatic(str));
+    JS_ASSERT(!str->isDependent());
+
+    JS_RUNTIME_UNMETER(cx->runtime, liveStrings);
+
+    /* A stillborn string has null chars. */
+    jschar *chars = str->flatChars();
+    if (!chars)
+        return;
+    JSStringFinalizeOp finalizer = str_finalizers[type];
+    if (finalizer)
+        finalizer(cx, str);
+    if (str->isDeflated())
+        js_PurgeDeflatedStringCache(cx->runtime, str);
 }
 
+/*
+ * This function is called from js_FinishAtomState to force the finalization
+ * of the permanently interned strings when cx is not available.
+ */
 void
 js_FinalizeStringRT(JSRuntime *rt, JSString *str)
 {
+    JS_RUNTIME_UNMETER(rt, liveStrings);
     JS_ASSERT(!JSString::isStatic(str));
 
-    unsigned thingKind = THING_TO_ARENA(str)->list->thingKind;
-    FinalizeString(rt, str, thingKind, NULL);
+    if (str->isDependent()) {
+        /* A dependent string can not be external and must be valid. */
+        JS_ASSERT(JSGCArena::fromGCThing(str)->info.list->thingKind ==
+                  FINALIZE_STRING);
+        JS_ASSERT(str->dependentBase());
+        JS_RUNTIME_UNMETER(rt, liveDependentStrings);
+    } else {
+        unsigned thingKind = JSGCArena::fromGCThing(str)->info.list->thingKind;
+        JS_ASSERT(IsFinalizableStringKind(thingKind));
+
+        /* A stillborn string has null chars, so is not valid. */
+        jschar *chars = str->flatChars();
+        if (!chars)
+            return;
+        if (thingKind == FINALIZE_STRING) {
+            rt->free(chars);
+        } else {
+            unsigned type = thingKind - FINALIZE_EXTERNAL_STRING0;
+            JS_ASSERT(type < JS_ARRAY_LENGTH(str_finalizers));
+            JSStringFinalizeOp finalizer = str_finalizers[type];
+            if (finalizer) {
+                /*
+                 * Assume that the finalizer for the permanently interned
+                 * string knows how to deal with null context.
+                 */
+                finalizer(NULL, str);
+            }
+        }
+    }
+    if (str->isDeflated())
+        js_PurgeDeflatedStringCache(rt, str);
 }
 
-template<typename T>
+template<typename T,
+         void finalizer(JSContext *cx, T *thing, unsigned thingKind)>
 static void
-FinalizeArenaList(JSContext *cx, unsigned thingKind,
-                  JSGCArenaInfo **emptyArenas)
+FinalizeArenaList(JSContext *cx, unsigned thingKind, JSGCArena **emptyArenas)
 {
+    JS_STATIC_ASSERT(!(sizeof(T) & GC_CELL_MASK));
     JSGCArenaList *arenaList = &cx->runtime->gcArenaList[thingKind];
     JS_ASSERT(sizeof(T) == arenaList->thingSize);
 
-    JSGCArenaInfo **ap = &arenaList->head;
-    JSGCArenaInfo *a = *ap;
+    JSGCArena **ap = &arenaList->head;
+    JSGCArena *a = *ap;
     if (!a)
         return;
 
@@ -2764,28 +2770,34 @@ FinalizeArenaList(JSContext *cx, unsigned thingKind,
     uint32 nlivearenas = 0, nkilledarenas = 0, nthings = 0;
 #endif
     for (;;) {
-        JS_ASSERT(a->list == arenaList);
-        JS_ASSERT(a->prevUntracedPage == 0);
-        JS_ASSERT(a->finalizable.untracedThings == 0);
+        JS_ASSERT(a->info.list == arenaList);
+        JS_ASSERT(!a->hasPrevUnmarked());
+        JS_ASSERT(a->info.unmarkedChildren == 0);
 
         JSGCThing *freeList = NULL;
         JSGCThing **tailp = &freeList;
         bool allClear = true;
-        uint8 *flagp = THING_FLAGP(a, 0);
-        JSGCThing *thing =
-            reinterpret_cast<JSGCThing *>(ARENA_INFO_TO_START(a));
-        JSGCThing *thingsEnd =
-            reinterpret_cast<JSGCThing *>(ARENA_INFO_TO_START(a) +
-                                          THINGS_PER_ARENA(sizeof(T)) *
-                                          sizeof(T));
-        JSGCThing* nextFree = a->finalizable.freeList
-                              ? a->finalizable.freeList
-                              : thingsEnd;
-        for (;; thing = NextThing(thing, sizeof(T)), --flagp) {
-             if (thing == nextFree) {
+
+        JSGCThing *thing = reinterpret_cast<JSGCThing *>(a->toPageStart());
+        jsuword endOffset =  GC_ARENA_CELLS_SIZE / sizeof(T) * sizeof(T);
+        JSGCThing *thingsEnd = reinterpret_cast<JSGCThing *>(a->toPageStart() +
+                                                             endOffset);
+
+        JSGCThing *nextFree = a->info.freeList;
+        if (!nextFree) {
+            nextFree = thingsEnd;
+        } else {
+            JS_ASSERT(thing <= nextFree);
+            JS_ASSERT(nextFree < thingsEnd);
+        }
+
+        jsuword gcCellIndex = 0;
+        jsbitmap *bitmap = a->markBitmap;
+        for (;; thing = NextThing(thing, sizeof(T)),
+                gcCellIndex += sizeof(T) >> GC_CELL_SHIFT) {
+            if (thing == nextFree) {
                 if (thing == thingsEnd)
                     break;
-                JS_ASSERT(!*flagp);
                 nextFree = nextFree->link;
                 if (!nextFree) {
                     nextFree = thingsEnd;
@@ -2793,21 +2805,12 @@ FinalizeArenaList(JSContext *cx, unsigned thingKind,
                     JS_ASSERT(thing < nextFree);
                     JS_ASSERT(nextFree < thingsEnd);
                 }
+            } else if (JS_TEST_BIT(bitmap, gcCellIndex)) {
+                allClear = false;
+                METER(nthings++);
+                continue;
             } else {
-                JS_ASSERT(!(*flagp & ~(GCF_MARK | GCF_LOCK)));
-                if (*flagp) {
-                    *flagp &= ~GCF_MARK;
-                    allClear = false;
-                    METER(nthings++);
-                    continue;
-                }
-
-                /*
-                 * Call the finalizer with cleared flags so
-                 * js_IsAboutToBeFinalized will be false.
-                 */
-                *flagp = 0;
-                ::FinalizeGCThing(cx, reinterpret_cast<T *>(thing), thingKind);
+                finalizer(cx, reinterpret_cast<T *>(thing), thingKind);
 #ifdef DEBUG
                 memset(thing, JS_FREE_PATTERN, sizeof(T));
 #endif
@@ -2836,16 +2839,17 @@ FinalizeArenaList(JSContext *cx, unsigned thingKind,
              * Forget just assembled free list head for the arena and
              * add the arena itself to the destroy list.
              */
-            JS_ASSERT(nfree == THINGS_PER_ARENA(sizeof(T)));
-            *ap = a->prev;
-            a->prev = *emptyArenas;
+            JS_ASSERT(nfree == ThingsPerArena(sizeof(T)));
+            *ap = a->info.prev;
+            a->info.prev = *emptyArenas;
             *emptyArenas = a;
             METER(nkilledarenas++);
         } else {
-            JS_ASSERT(nfree < THINGS_PER_ARENA(sizeof(T)));
+            JS_ASSERT(nfree < ThingsPerArena(sizeof(T)));
+            a->clearMarkBitmap();
             *tailp = NULL;
-            a->finalizable.freeList = freeList;
-            ap = &a->prev;
+            a->info.freeList = freeList;
+            ap = &a->info.prev;
             METER(nlivearenas++);
         }
         if (!(a = *ap))
@@ -2853,7 +2857,7 @@ FinalizeArenaList(JSContext *cx, unsigned thingKind,
     }
     arenaList->cursor = arenaList->head;
 
-    METER(UpdateArenaStats(&rt->gcStats.arenaStats[thingKind],
+    METER(UpdateArenaStats(&cx->runtime->gcStats.arenaStats[thingKind],
                            nlivearenas, nkilledarenas, nthings));
 }
 
@@ -2865,12 +2869,12 @@ void
 js_GC(JSContext *cx, JSGCInvocationKind gckind)
 {
     JSRuntime *rt;
-    JSBool keepAtoms;
     JSGCCallback callback;
+    bool keepAtoms;
     JSTracer trc;
-    JSGCArenaInfo *emptyArenas, *a, **ap;
+    JSGCArena *emptyArenas, *a, **ap;
 #ifdef JS_THREADSAFE
-    uint32 requestDebit;
+    size_t requestDebit;
 #endif
 #ifdef JS_GCMETER
     uint32 nlivearenas, nkilledarenas, nthings;
@@ -2889,18 +2893,6 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
     /* Avoid deadlock. */
     JS_ASSERT(!JS_IS_RUNTIME_LOCKED(rt));
 #endif
-
-    if (gckind & GC_KEEP_ATOMS) {
-        /*
-         * The set slot request and last ditch GC kinds preserve all atoms and
-         * weak roots.
-         */
-        keepAtoms = JS_TRUE;
-    } else {
-        /* Keep atoms when a suspended compile is running on another context. */
-        keepAtoms = (rt->gcKeepAtoms != 0);
-        JS_CLEAR_WEAK_ROOTS(&cx->weakRoots);
-    }
 
     /*
      * Don't collect garbage if the runtime isn't up, and cx is not the last
@@ -2958,12 +2950,60 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
         METER_UPDATE_MAX(rt->gcStats.maxlevel, rt->gcLevel);
 
         /*
-         * If the GC runs on another thread, temporarily suspend the current
-         * request and wait until the GC is done.
+         * If the GC runs on another thread, temporarily suspend all requests
+         * running on the current thread and wait until the GC is done.
          */
         if (rt->gcThread != cx->thread) {
-            requestDebit = js_DiscountRequestsForGC(cx);
-            js_RecountRequestsAfterGC(rt, requestDebit);
+            requestDebit = js_CountThreadRequests(cx);
+            JS_ASSERT(requestDebit <= rt->requestCount);
+#ifdef JS_TRACER
+            JS_ASSERT_IF(requestDebit == 0, !JS_ON_TRACE(cx));
+#endif
+            if (requestDebit != 0) {
+#ifdef JS_TRACER
+                if (JS_ON_TRACE(cx)) {
+                    /*
+                     * Leave trace before we decrease rt->requestCount and
+                     * notify the GC. Otherwise the GC may start immediately
+                     * after we unlock while this thread is still on trace.
+                     */
+                    JS_UNLOCK_GC(rt);
+                    LeaveTrace(cx);
+                    JS_LOCK_GC(rt);
+                }
+#endif
+                rt->requestCount -= requestDebit;
+                if (rt->requestCount == 0)
+                    JS_NOTIFY_REQUEST_DONE(rt);
+
+                /*
+                 * See comments before another call to js_ShareWaitingTitles
+                 * below.
+                 */
+                cx->thread->gcWaiting = true;
+                js_ShareWaitingTitles(cx);
+
+                /*
+                 * Make sure that the GC from another thread respects
+                 * GC_KEEP_ATOMS.
+                 */
+                if (gckind & GC_KEEP_ATOMS)
+                    JS_KEEP_ATOMS(rt);
+
+                /*
+                 * Check that we did not release the GC lock above and let the
+                 * GC to finish before we wait.
+                 */
+                JS_ASSERT(rt->gcLevel > 0);
+                do {
+                    JS_AWAIT_GC_DONE(rt);
+                } while (rt->gcLevel > 0);
+
+                cx->thread->gcWaiting = false;
+                if (gckind & GC_KEEP_ATOMS)
+                    JS_UNKEEP_ATOMS(rt);
+                rt->requestCount += requestDebit;
+            }
         }
         if (!(gckind & GC_LOCK_HELD))
             JS_UNLOCK_GC(rt);
@@ -2990,10 +3030,24 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
      */
     requestDebit = js_CountThreadRequests(cx);
     JS_ASSERT_IF(cx->requestDepth != 0, requestDebit >= 1);
-    rt->requestCount -= requestDebit;
-    while (rt->requestCount > 0)
-        JS_AWAIT_REQUEST_DONE(rt);
-    rt->requestCount += requestDebit;
+    JS_ASSERT(requestDebit <= rt->requestCount);
+    if (requestDebit != rt->requestCount) {
+        rt->requestCount -= requestDebit;
+
+        /*
+         * Share any title that is owned by the GC thread before we wait, to
+         * avoid a deadlock with ClaimTitle. We also set the gcWaiting flag so
+         * that ClaimTitle can claim the title ownership from the GC thread if
+         * that function is called while the GC is waiting.
+         */
+        cx->thread->gcWaiting = true;
+        js_ShareWaitingTitles(cx);
+        do {
+            JS_AWAIT_REQUEST_DONE(rt);
+        } while (rt->requestCount > 0);
+        cx->thread->gcWaiting = false;
+        rt->requestCount += requestDebit;
+    }
 
 #else  /* !JS_THREADSAFE */
 
@@ -3067,13 +3121,8 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
 #endif
 
 #ifdef JS_TRACER
-    js_PurgeJITOracle();
+    PurgeJITOracle();
 #endif
-
-  restart:
-    rt->gcNumber++;
-    JS_ASSERT(!rt->gcUntracedArenaStackTop);
-    JS_ASSERT(rt->gcTraceLaterCount == 0);
 
     /*
      * Reset the property cache's type id generator so we can compress ids.
@@ -3092,12 +3141,33 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
     }
 
     js_PurgeThreads(cx);
+
 #ifdef JS_TRACER
     if (gckind == GC_LAST_CONTEXT) {
         /* Clear builtin functions, which are recreated on demand. */
         memset(rt->builtinFunctions, 0, sizeof rt->builtinFunctions);
     }
 #endif
+
+    if (gckind & GC_KEEP_ATOMS) {
+        /*
+         * The set slot request and last ditch GC kinds preserve all atoms and
+         * weak roots.
+         */
+        keepAtoms = true;
+    } else {
+        /*
+         * Query rt->gcKeepAtoms only when we know that all other threads are
+         * suspended, see bug 541790.
+         */
+        keepAtoms = (rt->gcKeepAtoms != 0);
+        JS_CLEAR_WEAK_ROOTS(&cx->weakRoots);
+    }
+
+  restart:
+    rt->gcNumber++;
+    JS_ASSERT(!rt->gcUnmarkedArenaStackTop);
+    JS_ASSERT(rt->gcMarkLaterCount == 0);
 
     /*
      * Mark phase.
@@ -3107,8 +3177,8 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
     JS_ASSERT(IS_GC_MARKING_TRACER(&trc));
 
 #ifdef DEBUG
-    for (a = rt->gcDoubleArenaList.head; a; a = a->prev)
-        JS_ASSERT(!a->hasMarkedDoubles);
+    for (a = rt->gcDoubleArenaList.head; a; a = a->info.prev)
+        JS_ASSERT(!a->info.hasMarkedDoubles);
 #endif
 
     js_TraceRuntime(&trc, keepAtoms);
@@ -3118,7 +3188,7 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
      * Mark children of things that caused too deep recursion during the above
      * tracing.
      */
-    TraceDelayedChildren(&trc);
+    MarkDelayedChildren(&trc);
 
     JS_ASSERT(!cx->insideGCMarkCallback);
     if (rt->gcCallback) {
@@ -3127,7 +3197,7 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
         JS_ASSERT(cx->insideGCMarkCallback);
         cx->insideGCMarkCallback = JS_FALSE;
     }
-    JS_ASSERT(rt->gcTraceLaterCount == 0);
+    JS_ASSERT(rt->gcMarkLaterCount == 0);
 
     rt->gcMarkingTracer = NULL;
 
@@ -3172,37 +3242,50 @@ js_GC(JSContext *cx, JSGCInvocationKind gckind)
      * installed.
      */
     emptyArenas = NULL;
-    FinalizeArenaList<JSObject>(cx, FINALIZE_OBJECT, &emptyArenas);
-    FinalizeArenaList<JSFunction>(cx, FINALIZE_FUNCTION, &emptyArenas);
+    if (!cx->debugHooks->objectHook) {
+        FinalizeArenaList<JSObject, FinalizeObject>
+            (cx, FINALIZE_OBJECT, &emptyArenas);
+        FinalizeArenaList<JSFunction, FinalizeFunction>
+            (cx, FINALIZE_FUNCTION, &emptyArenas);
+    } else {
+        FinalizeArenaList<JSObject, FinalizeHookedObject>
+            (cx, FINALIZE_OBJECT, &emptyArenas);
+        FinalizeArenaList<JSFunction, FinalizeHookedFunction>
+            (cx, FINALIZE_FUNCTION, &emptyArenas);
+    }
 #if JS_HAS_XML_SUPPORT
-    FinalizeArenaList<JSXML>(cx, FINALIZE_XML, &emptyArenas);
+    FinalizeArenaList<JSXML, FinalizeXML>(cx, FINALIZE_XML, &emptyArenas);
 #endif
-    FinalizeArenaList<JSString>(cx, FINALIZE_STRING, &emptyArenas);
+    FinalizeArenaList<JSString, FinalizeString>
+        (cx, FINALIZE_STRING, &emptyArenas);
     for (unsigned i = FINALIZE_EXTERNAL_STRING0;
          i <= FINALIZE_EXTERNAL_STRING_LAST;
          ++i) {
-        FinalizeArenaList<JSString>(cx, i, &emptyArenas);
+        FinalizeArenaList<JSString, FinalizeExternalString>
+            (cx, i, &emptyArenas);
     }
 
     ap = &rt->gcDoubleArenaList.head;
     METER((nlivearenas = 0, nkilledarenas = 0, nthings = 0));
     while ((a = *ap) != NULL) {
-        if (!a->hasMarkedDoubles) {
+        if (!a->info.hasMarkedDoubles) {
             /* No marked double values in the arena. */
-            *ap = a->prev;
-            a->prev = emptyArenas;
+            *ap = a->info.prev;
+            a->info.prev = emptyArenas;
             emptyArenas = a;
             METER(nkilledarenas++);
         } else {
-            a->hasMarkedDoubles = false;
-            ap = &a->prev;
 #ifdef JS_GCMETER
-            for (size_t i = 0; i != DOUBLES_PER_ARENA; ++i) {
-                if (IsMarkedDouble(a, index))
+            for (jsuword offset = 0;
+                 offset != DOUBLES_PER_ARENA * sizeof(jsdouble);
+                 offset += sizeof(jsdouble)) {
+                if (IsMarkedGCThing(a, offset))
                     METER(nthings++);
             }
             METER(nlivearenas++);
 #endif
+            a->info.hasMarkedDoubles = false;
+            ap = &a->info.prev;
         }
     }
     METER(UpdateArenaStats(&rt->gcStats.doubleArenaStats,

@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set ts=8 sw=4 et tw=78:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -49,8 +49,88 @@
  * is reference counted and the slot vector is malloc'ed.
  */
 #include "jshash.h" /* Added by JSIFY */
-#include "jsprvtd.h"
 #include "jspubtd.h"
+#include "jsprvtd.h"
+
+/*
+ * A representation of ECMA-262 ed. 5's internal property descriptor data
+ * structure.
+ */
+struct PropertyDescriptor {
+  friend class AutoDescriptorArray;
+
+  private:
+    PropertyDescriptor();
+
+  public:
+    /* 8.10.5 ToPropertyDescriptor(Obj) */
+    bool initialize(JSContext* cx, jsid id, jsval v);
+
+    /* 8.10.1 IsAccessorDescriptor(desc) */
+    bool isAccessorDescriptor() const {
+        return hasGet || hasSet;
+    }
+
+    /* 8.10.2 IsDataDescriptor(desc) */
+    bool isDataDescriptor() const {
+        return hasValue || hasWritable;
+    }
+
+    /* 8.10.3 IsGenericDescriptor(desc) */
+    bool isGenericDescriptor() const {
+        return !isAccessorDescriptor() && !isDataDescriptor();
+    }
+
+    bool configurable() const {
+        return (attrs & JSPROP_PERMANENT) == 0;
+    }
+
+    bool enumerable() const {
+        return (attrs & JSPROP_ENUMERATE) != 0;
+    }
+
+    bool writable() const {
+        return (attrs & JSPROP_READONLY) == 0;
+    }
+
+    JSObject* getterObject() const {
+        return get != JSVAL_VOID ? JSVAL_TO_OBJECT(get) : NULL;
+    }
+    JSObject* setterObject() const {
+        return set != JSVAL_VOID ? JSVAL_TO_OBJECT(set) : NULL;
+    }
+
+    jsval getterValue() const {
+        return get;
+    }
+    jsval setterValue() const {
+        return set;
+    }
+
+    JSPropertyOp getter() const {
+        return js_CastAsPropertyOp(getterObject());
+    }
+    JSPropertyOp setter() const {
+        return js_CastAsPropertyOp(setterObject());
+    }
+
+    static void traceDescriptorArray(JSTracer* trc, JSObject* obj);
+    static void finalizeDescriptorArray(JSContext* cx, JSObject* obj);
+
+    jsid id;
+    jsval value, get, set;
+
+    /* Property descriptor boolean fields. */
+    uint8 attrs;
+
+    /* Bits indicating which values are set. */
+    bool hasGet : 1;
+    bool hasSet : 1;
+    bool hasValue : 1;
+    bool hasWritable : 1;
+    bool hasEnumerable : 1;
+    bool hasConfigurable : 1;
+};
 
 JS_BEGIN_EXTERN_C
 
@@ -83,7 +163,22 @@ struct JSObjectOps {
     JSHasInstanceOp     hasInstance;
     JSTraceOp           trace;
     JSFinalizeOp        clear;
+
+    bool inline isNative() const;
 };
+
+extern JS_FRIEND_DATA(JSObjectOps) js_ObjectOps;
+extern JS_FRIEND_DATA(JSObjectOps) js_WithObjectOps;
+
+/*
+ * Test whether the ops is native. FIXME bug 492938: consider how it would
+ * affect the performance to do just the !objectMap check.
+ */
+inline bool
+JSObjectOps::isNative() const
+{
+    return JS_LIKELY(this == &js_ObjectOps) || !objectMap;
+}
 
 struct JSObjectMap {
     const JSObjectOps * const   ops;    /* high level object operation vtable */
@@ -150,8 +245,14 @@ struct JSObject {
     jsval       fslots[JS_INITIAL_NSLOTS];  /* small number of fixed slots */
     jsval       *dslots;                    /* dynamically allocated slots */
 
+    bool isNative() const { return map->ops->isNative(); }
+
     JSClass *getClass() const {
         return (JSClass *) (classword & ~JSSLOT_CLASS_MASK_BITS);
+    }
+
+    bool hasClass(const JSClass *clasp) const {
+        return clasp == getClass();
     }
 
     bool isDelegate() const {
@@ -258,6 +359,11 @@ struct JSObject {
     inline void initSharingEmptyScope(JSClass *clasp, JSObject *proto, JSObject *parent,
                                       jsval privateSlotValue);
 
+    inline bool hasSlotsArray() const { return dslots; }
+
+    /* This method can only be called when hasSlotsArray() returns true. */
+    inline void freeSlotsArray(JSContext *cx);
+
     JSBool lookupProperty(JSContext *cx, jsid id,
                           JSObject **objp, JSProperty **propp) {
         return map->ops->lookupProperty(cx, this, id, objp, propp);
@@ -315,9 +421,19 @@ struct JSObject {
         if (map->ops->dropProperty)
             map->ops->dropProperty(cx, this, prop);
     }
+
+    inline bool isArray() const;
+    inline bool isDenseArray() const;
+    inline bool isFunction() const;
+    inline bool isRegExp() const;
+    inline bool isXML() const;
+
+    inline bool unbrand(JSContext *cx);
 };
 
 /* Compatibility macros. */
+#define OBJ_IS_NATIVE(obj)              ((obj)->isNative())
+
 #define STOBJ_GET_PROTO(obj)            ((obj)->getProto())
 #define STOBJ_SET_PROTO(obj,proto)      ((obj)->setProto(proto))
 #define STOBJ_CLEAR_PROTO(obj)          ((obj)->clearProto())
@@ -385,7 +501,7 @@ STOBJ_GET_CLASS(const JSObject* obj)
 }
 
 #define OBJ_CHECK_SLOT(obj,slot)                                              \
-    (JS_ASSERT(OBJ_IS_NATIVE(obj)), JS_ASSERT(slot < OBJ_SCOPE(obj)->freeslot))
+    (JS_ASSERT(obj->isNative()), JS_ASSERT(slot < OBJ_SCOPE(obj)->freeslot))
 
 #define LOCKED_OBJ_GET_SLOT(obj,slot)                                         \
     (OBJ_CHECK_SLOT(obj, slot), STOBJ_GET_SLOT(obj, slot))
@@ -441,15 +557,6 @@ STOBJ_GET_CLASS(const JSObject* obj)
  */
 #define OBJ_GET_CLASS(cx,obj)           STOBJ_GET_CLASS(obj)
 
-/*
- * Test whether the object is native. FIXME bug 492938: consider how it would
- * affect the performance to do just the !ops->objectMap check.
- */
-#define OPS_IS_NATIVE(ops)                                                    \
-    JS_LIKELY((ops) == &js_ObjectOps || !(ops)->objectMap)
-
-#define OBJ_IS_NATIVE(obj)  OPS_IS_NATIVE((obj)->map->ops)
-
 #ifdef __cplusplus
 inline void
 OBJ_TO_INNER_OBJECT(JSContext *cx, JSObject *&obj)
@@ -478,8 +585,6 @@ OBJ_TO_OUTER_OBJECT(JSContext *cx, JSObject *&obj)
 }
 #endif
 
-extern JS_FRIEND_DATA(JSObjectOps) js_ObjectOps;
-extern JS_FRIEND_DATA(JSObjectOps) js_WithObjectOps;
 extern JSClass  js_ObjectClass;
 extern JSClass  js_WithClass;
 extern JSClass  js_BlockClass;
@@ -511,7 +616,7 @@ extern JSBool
 js_DefineBlockVariable(JSContext *cx, JSObject *obj, jsid id, intN index);
 
 #define OBJ_BLOCK_COUNT(cx,obj)                                               \
-    (OBJ_SCOPE(obj)->entryCount)
+    (OBJ_SCOPE(OBJ_IS_CLONED_BLOCK(obj) ? obj->getProto() : obj)->entryCount)
 #define OBJ_BLOCK_DEPTH(cx,obj)                                               \
     JSVAL_TO_INT(STOBJ_GET_SLOT(obj, JSSLOT_BLOCK_DEPTH))
 #define OBJ_SET_BLOCK_DEPTH(cx,obj,depth)                                     \
@@ -581,7 +686,7 @@ js_HasOwnPropertyHelper(JSContext *cx, JSLookupPropOp lookup, uintN argc,
 
 extern JSBool
 js_HasOwnProperty(JSContext *cx, JSLookupPropOp lookup, JSObject *obj, jsid id,
-                  JSBool *foundp);
+                  JSObject **objp, JSProperty **propp);
 
 extern JSBool
 js_PropertyIsEnumerable(JSContext *cx, JSObject *obj, jsid id, jsval *vp);
@@ -669,13 +774,6 @@ js_GrowSlots(JSContext *cx, JSObject *obj, size_t nslots);
 
 extern void
 js_ShrinkSlots(JSContext *cx, JSObject *obj, size_t nslots);
-
-static inline void
-js_FreeSlots(JSContext *cx, JSObject *obj)
-{
-    if (obj->dslots)
-        js_ShrinkSlots(cx, obj, 0);
-}
 
 /*
  * Ensure that the object has at least JSCLASS_RESERVED_SLOTS(clasp)+nreserved
@@ -990,7 +1088,7 @@ js_ComputeFilename(JSContext *cx, JSStackFrame *caller,
 extern JSBool
 js_IsCallable(JSObject *obj, JSContext *cx);
 
-void
+extern JSBool
 js_ReportGetterOnlyAssignment(JSContext *cx);
 
 extern JS_FRIEND_API(JSBool)
