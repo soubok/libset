@@ -78,7 +78,7 @@ public:
             memcpy(tmp, _data, _len * sizeof(T));
             _data = tmp;
         } else {
-            _data = (T*)realloc(_data, _max * sizeof(T));
+            _data = (T*)js_realloc(_data, _max * sizeof(T));
         }
 #if defined(DEBUG)
         memset(&_data[_len], 0xcd, _max - _len);
@@ -95,7 +95,7 @@ public:
 
     ~Queue() {
         if (!alloc)
-            free(_data);
+            js_free(_data);
     }
 
     bool contains(T a) {
@@ -1379,8 +1379,8 @@ class TraceRecorder
 # include "jsopcode.tbl"
 #undef OPDEF
 
-    inline void* operator new(size_t size) { return calloc(1, size); }
-    inline void operator delete(void *p) { free(p); }
+    inline void* operator new(size_t size) { return js_calloc(size); }
+    inline void operator delete(void *p) { js_free(p); }
 
     JS_REQUIRES_STACK
     TraceRecorder(JSContext* cx, VMSideExit*, VMFragment*,
