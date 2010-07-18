@@ -49,7 +49,7 @@ blx_lr_broken() {
 
 using namespace avmplus;
 
-Config AvmCore::config;
+nanojit::Config AvmCore::config;
 
 void
 avmplus::AvmLog(char const *msg, ...) {
@@ -60,17 +60,10 @@ avmplus::AvmLog(char const *msg, ...) {
 }
 
 #ifdef _DEBUG
-void NanoAssertFail()
-{
-    #if defined(WIN32)
-        DebugBreak();
-        exit(3);
-    #elif defined(XP_OS2) || (defined(__GNUC__) && defined(__i386))
-        asm("int $3");
+namespace avmplus {
+    void AvmAssertFail(const char* /* msg */) {
         abort();
-    #else
-        abort();
-    #endif
+    }
 }
 #endif
 

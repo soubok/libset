@@ -208,7 +208,7 @@ class Vector : AllocPolicy
     /*
      * Since a vector either stores elements inline or in a heap-allocated
      * buffer, reuse the storage. mLengthOrCapacity serves as the union
-     * discriminator. In inline mode (when elements are stored in u.mBuf),
+     * discriminator. In inline mode (when elements are stored in u.storage),
      * mLengthOrCapacity holds the vector's length. In heap mode (when elements
      * are stored in [u.ptrs.mBegin, u.ptrs.mEnd)), mLengthOrCapacity holds the
      * vector's capacity.
@@ -228,7 +228,7 @@ class Vector : AllocPolicy
 
     union {
         BufferPtrs ptrs;
-        char mBuf[sInlineBytes];
+        AlignedStorage<sInlineBytes> storage;
     } u;
 
     /* Only valid when usingInlineStorage() */
@@ -244,12 +244,12 @@ class Vector : AllocPolicy
 
     T *inlineBegin() const {
         JS_ASSERT(usingInlineStorage());
-        return (T *)u.mBuf;
+        return (T *)u.storage.addr();
     }
 
     T *inlineEnd() const {
         JS_ASSERT(usingInlineStorage());
-        return (T *)u.mBuf + mLengthOrCapacity;
+        return (T *)u.storage.addr() + mLengthOrCapacity;
     }
 
     /* Only valid when !usingInlineStorage() */
@@ -293,7 +293,7 @@ class Vector : AllocPolicy
 
 #ifdef DEBUG
     friend class ReentrancyGuard;
-    bool mEntered;
+    bool entered;
 #endif
 
     Vector(const Vector &);
@@ -318,42 +318,42 @@ class Vector : AllocPolicy
     }
 
     T *begin() {
-        JS_ASSERT(!mEntered);
+        JS_ASSERT(!entered);
         return usingInlineStorage() ? inlineBegin() : heapBegin();
     }
 
     const T *begin() const {
-        JS_ASSERT(!mEntered);
+        JS_ASSERT(!entered);
         return usingInlineStorage() ? inlineBegin() : heapBegin();
     }
 
     T *end() {
-        JS_ASSERT(!mEntered);
+        JS_ASSERT(!entered);
         return usingInlineStorage() ? inlineEnd() : heapEnd();
     }
 
     const T *end() const {
-        JS_ASSERT(!mEntered);
+        JS_ASSERT(!entered);
         return usingInlineStorage() ? inlineEnd() : heapEnd();
     }
 
     T &operator[](size_t i) {
-        JS_ASSERT(!mEntered && i < length());
+        JS_ASSERT(!entered && i < length());
         return begin()[i];
     }
 
     const T &operator[](size_t i) const {
-        JS_ASSERT(!mEntered && i < length());
+        JS_ASSERT(!entered && i < length());
         return begin()[i];
     }
 
     T &back() {
-        JS_ASSERT(!mEntered && !empty());
+        JS_ASSERT(!entered && !empty());
         return *(end() - 1);
     }
 
     const T &back() const {
-        JS_ASSERT(!mEntered && !empty());
+        JS_ASSERT(!entered && !empty());
         return *(end() - 1);
     }
 
@@ -365,11 +365,7 @@ class Vector : AllocPolicy
     /* Destroy elements in the range [begin() + incr, end()). */
     void shrinkBy(size_t incr);
 
-    /*
-     * Grow the vector by incr elements.  If T is a POD (as judged by
-     * tl::IsPodType), leave as uninitialized memory.  Otherwise, default
-     * construct each element.
-     */
+    /* Grow the vector by incr elements. */
     bool growBy(size_t incr);
 
     /* Call shrinkBy or growBy based on whether newSize > length(). */
@@ -424,7 +420,7 @@ inline
 Vector<T,N,AllocPolicy>::Vector(AllocPolicy ap)
   : AllocPolicy(ap), mLengthOrCapacity(0)
 #ifdef DEBUG
-    , mEntered(false)
+  , entered(false)
 #endif
 {}
 
@@ -558,8 +554,7 @@ Vector<T,N,AP>::growBy(size_t incr)
         size_t freespace = sInlineCapacity - inlineLength();
         if (incr <= freespace) {
             T *newend = inlineEnd() + incr;
-            if (!tl::IsPodType<T>::result)
-                Impl::initialize(inlineEnd(), newend);
+            Impl::initialize(inlineEnd(), newend);
             inlineLength() += incr;
             JS_ASSERT(usingInlineStorage());
             return true;
@@ -579,8 +574,7 @@ Vector<T,N,AP>::growBy(size_t incr)
     /* We are !usingInlineStorage(). Initialize new elements. */
     JS_ASSERT(heapCapacity() - heapLength() >= incr);
     T *newend = heapEnd() + incr;
-    if (!tl::IsPodType<T>::result)
-        Impl::initialize(heapEnd(), newend);
+    Impl::initialize(heapEnd(), newend);
     heapEnd() = newend;
     return true;
 }

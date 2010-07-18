@@ -407,6 +407,11 @@ def PRMJ_Now():
 
 */
 
+// We parameterize the delay count just so that shell builds can
+// set it to 0 in order to get high-resolution benchmarking.
+// 10 seems to be the number of calls to load with a blank homepage.
+int CALIBRATION_DELAY_COUNT = 10;
+
 JSInt64
 PRMJ_Now(void)
 {
@@ -424,8 +429,7 @@ PRMJ_Now(void)
        This does not appear to be needed on Vista as the timeBegin/timeEndPeriod
        calls seem to immediately take effect. */
     int thiscall = JS_ATOMIC_INCREMENT(&nCalls);
-    /* 10 seems to be the number of calls to load with a blank homepage */
-    if (thiscall <= 10) {
+    if (thiscall <= CALIBRATION_DELAY_COUNT) {
         LowResTime(&ft);
         return (FILETIME2INT64(ft)-win2un)/10L;
     }
@@ -550,68 +554,6 @@ PRMJ_Now(void)
     return returnedTime;
 }
 #endif
-
-/* Get the DST timezone offset for the time passed in */
-JSInt64
-PRMJ_DSTOffset(JSInt64 local_time)
-{
-    JSInt64 us2s;
-    time_t local;
-    JSInt32 diff;
-    JSInt64  maxtimet;
-    struct tm tm;
-    PRMJTime prtm;
-#ifndef HAVE_LOCALTIME_R
-    struct tm *ptm;
-#endif
-
-
-    JSLL_UI2L(us2s, PRMJ_USEC_PER_SEC);
-    JSLL_DIV(local_time, local_time, us2s);
-
-    /* get the maximum of time_t value */
-    JSLL_UI2L(maxtimet,PRMJ_MAX_UNIX_TIMET);
-
-    if(JSLL_CMP(local_time,>,maxtimet)){
-        JSLL_UI2L(local_time,PRMJ_MAX_UNIX_TIMET);
-    } else if(!JSLL_GE_ZERO(local_time)){
-        /*go ahead a day to make localtime work (does not work with 0) */
-        JSLL_UI2L(local_time,PRMJ_DAY_SECONDS);
-    }
-
-#if defined(XP_WIN) && !defined(WINCE)
-    /* Windows does not follow POSIX. Updates to the
-     * TZ environment variable are not reflected
-     * immediately on that platform as they are
-     * on UNIX systems without this call.
-     */
-    _tzset();
-#endif
-
-    JSLL_L2UI(local,local_time);
-    PRMJ_basetime(local_time,&prtm);
-#ifndef HAVE_LOCALTIME_R
-    ptm = localtime(&local);
-    if(!ptm){
-        return 0;
-    }
-    tm = *ptm;
-#else
-    localtime_r(&local,&tm); /* get dst information */
-#endif
-
-    diff = ((tm.tm_hour - prtm.tm_hour) * PRMJ_HOUR_SECONDS) +
-           ((tm.tm_min - prtm.tm_min) * 60);
-
-    if (diff < 0)
-        diff += PRMJ_DAY_SECONDS;
-
-    JSLL_UI2L(local_time,diff);
-
-    JSLL_MUL(local_time,local_time,us2s);
-
-    return(local_time);
-}
 
 #ifdef NS_HAVE_INVALID_PARAMETER_HANDLER
 static void
@@ -908,4 +850,53 @@ PRMJ_basetime(JSInt64 tsecs, PRMJTime *prtm)
     prtm->tm_wday  = (JSInt8)wday;
     prtm->tm_year  = (JSInt16)year;
     prtm->tm_yday  = (JSInt16)yday;
+}
+
+JSInt64
+DSTOffsetCache::computeDSTOffsetMilliseconds(int64 localTimeSeconds)
+{
+#if defined(XP_WIN) && !defined(WINCE)
+    /* Windows does not follow POSIX. Updates to the
+     * TZ environment variable are not reflected
+     * immediately on that platform as they are
+     * on UNIX systems without this call.
+     */
+    _tzset();
+#endif
+
+    time_t local = static_cast<time_t>(localTimeSeconds);
+    PRMJTime prtm;
+    struct tm tm;
+    PRMJ_basetime(localTimeSeconds, &prtm);
+#ifndef HAVE_LOCALTIME_R
+    struct tm *ptm = localtime(&local);
+    if (!ptm)
+        return 0;
+    tm = *ptm;
+#else
+    localtime_r(&local, &tm); /* get dst information */
+#endif
+
+    JSInt32 diff = ((tm.tm_hour - prtm.tm_hour) * SECONDS_PER_HOUR) +
+                   ((tm.tm_min - prtm.tm_min) * SECONDS_PER_MINUTE);
+
+    if (diff < 0)
+        diff += SECONDS_PER_DAY;
+
+    return diff * MILLISECONDS_PER_SECOND;
+}
+
+JSInt64
+DSTOffsetCache::getDSTOffsetMilliseconds(JSInt64 localTimeMilliseconds, JSContext *cx)
+{
+    JSInt64 localTimeSeconds = localTimeMilliseconds / MILLISECONDS_PER_SECOND;
+
+    if (localTimeSeconds > MAX_UNIX_TIMET) {
+        localTimeSeconds = MAX_UNIX_TIMET;
+    } else if (localTimeSeconds < 0) {
+        /* Go ahead a day to make localtime work (does not work with 0). */
+        localTimeSeconds = SECONDS_PER_DAY;
+    }
+
+    return computeDSTOffsetMilliseconds(localTimeSeconds);
 }
