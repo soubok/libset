@@ -44,7 +44,34 @@
 #ifndef jsutil_h___
 #define jsutil_h___
 
+#include "jstypes.h"
 #include <stdlib.h>
+
+JS_BEGIN_EXTERN_C
+
+#define JS_HAS_JSLIBS_RegisterCustomAllocators
+
+extern JS_PUBLIC_API(void)
+JSLIBS_RegisterCustomAllocators(
+  void* (*)( size_t ),
+  void* (*)( size_t, size_t ),
+  void* (*)( size_t, size_t ),
+  void* (*)( void*, size_t ),
+  size_t (*)( void* ),
+  void (*)( void* )
+);
+
+extern void* (*custom_malloc)( size_t );
+extern void* (*custom_calloc)( size_t, size_t );
+extern void* (*custom_realloc)( void*, size_t );
+extern void (*custom_free)( void* );
+
+JS_END_EXTERN_C
+
+#define malloc custom_malloc
+#define calloc custom_calloc
+#define realloc custom_realloc
+#define free custom_free
 
 JS_BEGIN_EXTERN_C
 
@@ -66,11 +93,14 @@ JS_Assert(const char *s, const char *file, JSIntn ln);
 #define JS_NOT_REACHED(reason)                                                \
     JS_Assert(reason, __FILE__, __LINE__)
 
+#define JS_ALWAYS_TRUE(expr) JS_ASSERT(expr)
+
 #else
 
 #define JS_ASSERT(expr)         ((void) 0)
 #define JS_ASSERT_IF(cond,expr) ((void) 0)
 #define JS_NOT_REACHED(reason)
+#define JS_ALWAYS_TRUE(expr)    ((void) (expr))
 
 #endif /* defined(DEBUG) */
 
@@ -179,27 +209,28 @@ extern JS_FRIEND_API(void)
 JS_DumpBacktrace(JSCallsite *trace);
 #endif
 
+#if defined JS_USE_CUSTOM_ALLOCATOR
+
+#include "jscustomallocator.h"
+
+#else
+
 static JS_INLINE void* js_malloc(size_t bytes) {
-    if (bytes < sizeof(void*)) /* for asyncFree */
-        bytes = sizeof(void*);
     return malloc(bytes);
 }
 
 static JS_INLINE void* js_calloc(size_t bytes) {
-    if (bytes < sizeof(void*)) /* for asyncFree */
-        bytes = sizeof(void*);
     return calloc(bytes, 1);
 }
 
 static JS_INLINE void* js_realloc(void* p, size_t bytes) {
-    if (bytes < sizeof(void*)) /* for asyncFree */
-        bytes = sizeof(void*);
     return realloc(p, bytes);
 }
 
 static JS_INLINE void js_free(void* p) {
     free(p);
 }
+#endif/* JS_USE_CUSTOM_ALLOCATOR */
 
 JS_END_EXTERN_C
 
@@ -299,5 +330,10 @@ public:
 #endif /* !defined(DEBUG) */
 
 #endif /* defined(__cplusplus) */
+
+#undef malloc
+#undef calloc
+#undef realloc
+#undef free
 
 #endif /* jsutil_h___ */
