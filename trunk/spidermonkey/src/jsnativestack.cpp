@@ -41,7 +41,11 @@
 #include "jsnativestack.h"
 
 #ifdef XP_WIN
-# include <windows.h>
+# include "jswin.h"
+
+#elif defined(XP_OS2)
+# define INCL_DOSPROCESS
+# include <os2.h>
 
 #elif defined(XP_MACOSX) || defined(DARWIN) || defined(XP_UNIX)
 # include <pthread.h>
@@ -118,7 +122,7 @@ GetNativeStackBase()
 void *
 GetNativeStackBaseImpl()
 {
-# if defined(_WIN32) && defined(_MSC_VER)
+# if defined(_M_IX86) && defined(_MSC_VER)
     /*
      * offset 0x18 from the FS segment register gives a pointer to
      * the thread information block for the current thread
@@ -130,7 +134,7 @@ GetNativeStackBaseImpl()
     }
     return static_cast<void*>(pTib->StackBase);
 
-# elif defined(_WIN64) && defined(_MSC_VER)
+# elif defined(_M_X64)
     PNT_TIB64 pTib = reinterpret_cast<PNT_TIB64>(NtCurrentTeb());
     return reinterpret_cast<void*>(pTib->StackBase);
 
@@ -142,7 +146,45 @@ GetNativeStackBaseImpl()
 # endif
 }
 
-#else /* !XP_WIN */
+#elif defined(SOLARIS)
+
+#include <ucontext.h>
+
+JS_STATIC_ASSERT(JS_STACK_GROWTH_DIRECTION < 0);
+
+void *
+GetNativeStackBaseImpl()
+{
+    stack_t st;
+    stack_getbounds(&st);
+    return static_cast<char*>(st.ss_sp) + st.ss_size;
+}
+
+#elif defined(XP_OS2)
+
+void *
+GetNativeStackBaseImpl()
+{
+    PTIB  ptib;
+    PPIB  ppib;
+
+    DosGetInfoBlocks(&ptib, &ppib);
+    return ptib->tib_pstacklimit;
+}
+
+#elif defined(SOLARIS)
+
+#include <ucontext.h>
+
+void *
+GetNativeStackBaseImpl()
+{
+    stack_t st;
+    stack_getbounds(&st);
+    return static_cast<char*>(st.ss_sp) + st.ss_size;
+}
+
+#else /* XP_UNIX */
 
 void *
 GetNativeStackBaseImpl()
