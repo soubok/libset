@@ -176,6 +176,7 @@ struct JSFunction : public JSObject_Slots2
     bool isNative()          const { return !FUN_INTERPRETED(this); }
     bool isConstructor()     const { return flags & JSFUN_CONSTRUCTOR; }
     bool isHeavyweight()     const { return JSFUN_HEAVYWEIGHT_TEST(flags); }
+    bool isFlatClosure()     const { return FUN_KIND(this) == JSFUN_FLAT_CLOSURE; }
 
     bool isFunctionPrototype() const { return flags & JSFUN_PROTOTYPE; }
 
@@ -489,6 +490,14 @@ IsConstructing_PossiblyWithGivenThisObject(const Value *vp, JSObject **ctorThis)
     return isCtor;
 }
 
+inline const char *
+GetFunctionNameBytes(JSContext *cx, JSFunction *fun, JSAutoByteString *bytes)
+{
+    if (fun->atom)
+        return bytes->encode(cx, ATOM_TO_STRING(fun->atom));
+    return js_anonymous_str;
+}
+
 } /* namespace js */
 
 extern JSString *
@@ -570,11 +579,20 @@ extern JSBool JS_FASTCALL
 js_PutCallObjectOnTrace(JSContext *cx, JSObject *scopeChain, uint32 nargs,
                         js::Value *argv, uint32 nvars, js::Value *slots);
 
-extern JSBool
-js_GetCallArg(JSContext *cx, JSObject *obj, jsid id, js::Value *vp);
+namespace js {
 
 extern JSBool
-js_GetCallVar(JSContext *cx, JSObject *obj, jsid id, js::Value *vp);
+GetCallArg(JSContext *cx, JSObject *obj, jsid id, js::Value *vp);
+
+extern JSBool
+GetCallVar(JSContext *cx, JSObject *obj, jsid id, js::Value *vp);
+
+/*
+ * Slower version of js_GetCallVar used when call_resolve detects an attempt to
+ * leak an optimized closure via indirect or debugger eval.
+ */
+extern JSBool
+GetCallVarChecked(JSContext *cx, JSObject *obj, jsid id, js::Value *vp);
 
 extern JSBool
 SetCallArg(JSContext *cx, JSObject *obj, jsid id, js::Value *vp);
@@ -582,12 +600,7 @@ SetCallArg(JSContext *cx, JSObject *obj, jsid id, js::Value *vp);
 extern JSBool
 SetCallVar(JSContext *cx, JSObject *obj, jsid id, js::Value *vp);
 
-/*
- * Slower version of js_GetCallVar used when call_resolve detects an attempt to
- * leak an optimized closure via indirect or debugger eval.
- */
-extern JSBool
-js_GetCallVarChecked(JSContext *cx, JSObject *obj, jsid id, js::Value *vp);
+} // namespace js
 
 extern JSBool
 js_GetArgsValue(JSContext *cx, JSStackFrame *fp, js::Value *vp);

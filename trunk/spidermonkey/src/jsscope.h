@@ -55,6 +55,7 @@
 #include "jsprvtd.h"
 #include "jspubtd.h"
 #include "jspropertytree.h"
+#include "jsstrinlines.h"
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -246,6 +247,19 @@ struct PropertyTable {
 
     /* By definition, hashShift = JS_DHASH_BITS - log2(capacity). */
     uint32 capacity() const { return JS_BIT(JS_DHASH_BITS - hashShift); }
+
+    /* Whether we need to grow.  We want to do this if the load factor is >= 0.75 */
+    bool needsToGrow() const {
+        uint32 size = capacity();
+        return entryCount + removedCount >= size - (size >> 2);
+    }
+
+    /*
+     * Try to grow the table.  On failure, reports out of memory on cx
+     * and returns false.  This will make any extant pointers into the
+     * table invalid.  Don't call this unless needsToGrow() is true.
+     */
+    bool grow(JSContext *cx);
 
     /*
      * NB: init and change are fallible but do not report OOM, so callers can

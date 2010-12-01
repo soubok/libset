@@ -556,7 +556,6 @@ JS_GetEmptyStringValue(JSContext *cx);
  *   j      int32           Rounded int32 (coordinate)
  *   d      jsdouble        IEEE double
  *   I      jsdouble        Integral IEEE double
- *   s      char *          C string
  *   S      JSString *      Unicode string, accessed by a JSString pointer
  *   W      jschar *        Unicode character vector, 0-terminated (W for wide)
  *   o      JSObject *      Object reference
@@ -1645,7 +1644,7 @@ JS_SetNativeStackQuota(JSContext *cx, size_t stackSize);
  * Set the quota on the number of bytes that stack-like data structures can
  * use when the runtime compiles and executes scripts. These structures
  * consume heap space, so JS_SetThreadStackLimit does not bound their size.
- * The default quota is 32MB which is quite generous.
+ * The default quota is 128MB which is very generous.
  *
  * The function must be called before any script compilation or execution API
  * calls, i.e. either immediately after JS_NewContext or from JSCONTEXT_NEW
@@ -1654,7 +1653,7 @@ JS_SetNativeStackQuota(JSContext *cx, size_t stackSize);
 extern JS_PUBLIC_API(void)
 JS_SetScriptStackQuota(JSContext *cx, size_t quota);
 
-#define JS_DEFAULT_SCRIPT_STACK_QUOTA   ((size_t) 0x2000000)
+#define JS_DEFAULT_SCRIPT_STACK_QUOTA   ((size_t) 0x8000000)
 
 /************************************************************************/
 
@@ -2469,7 +2468,8 @@ JS_CompileFileHandleForPrincipals(JSContext *cx, JSObject *obj,
 extern JS_PUBLIC_API(JSScript *)
 JS_CompileFileHandleForPrincipalsVersion(JSContext *cx, JSObject *obj,
                                          const char *filename, FILE *fh,
-                                         JSPrincipals *principals);
+                                         JSPrincipals *principals,
+                                         JSVersion version);
 
 /*
  * NB: you must use JS_NewScriptObject and root a pointer to its return value
@@ -2772,9 +2772,6 @@ JS_InternUCStringN(JSContext *cx, const jschar *s, size_t length);
 extern JS_PUBLIC_API(JSString *)
 JS_InternUCString(JSContext *cx, const jschar *s);
 
-extern JS_PUBLIC_API(char *)
-JS_GetStringBytes(JSString *str);
-
 /*
  * Deprecated. Use JS_GetStringCharsZ() instead.
  */
@@ -2783,9 +2780,6 @@ JS_GetStringChars(JSString *str);
 
 extern JS_PUBLIC_API(size_t)
 JS_GetStringLength(JSString *str);
-
-extern JS_PUBLIC_API(const char *)
-JS_GetStringBytesZ(JSContext *cx, JSString *str);
 
 /*
  * Return the char array and length for this string. The array is not
@@ -2918,6 +2912,80 @@ JS_DecodeBytes(JSContext *cx, const char *src, size_t srclen, jschar *dst,
 JS_PUBLIC_API(char *)
 JS_EncodeString(JSContext *cx, JSString *str);
 
+/*
+ * Get number of bytes in the string encoding (without accounting for a
+ * terminating zero bytes. The function returns (size_t) -1 if the string
+ * can not be encoded into bytes and reports an error using cx accordingly.
+ */
+JS_PUBLIC_API(size_t)
+JS_GetStringEncodingLength(JSContext *cx, JSString *str);
+
+/*
+ * Encode string into a buffer. The function does not stores an additional
+ * zero byte. The function returns (size_t) -1 if the string can not be
+ * encoded into bytes with no error reported. Otherwise it returns the number
+ * of bytes that are necessary to encode the string. If that exceeds the
+ * length parameter, the string will be cut and only length bytes will be
+ * written into the buffer.
+ *
+ * If JS_CStringsAreUTF8() is true, the string does not fit into the buffer
+ * and the the first length bytes ends in the middle of utf-8 encoding for
+ * some character, then such partial utf-8 encoding is replaced by zero bytes.
+ * This way the result always represents the valid UTF-8 sequence.
+ */
+JS_PUBLIC_API(size_t)
+JS_EncodeStringToBuffer(JSString *str, char *buffer, size_t length);
+
+#ifdef __cplusplus
+
+class JSAutoByteString {
+  public:
+    JSAutoByteString(JSContext *cx, JSString *str JS_GUARD_OBJECT_NOTIFIER_PARAM)
+      : mBytes(JS_EncodeString(cx, str)) {
+        JS_ASSERT(cx);
+        JS_GUARD_OBJECT_NOTIFIER_INIT;
+    }
+
+    JSAutoByteString(JS_GUARD_OBJECT_NOTIFIER_PARAM0)
+      : mBytes(NULL) {
+        JS_GUARD_OBJECT_NOTIFIER_INIT;
+    }
+
+    ~JSAutoByteString() {
+        js_free(mBytes);
+    }
+
+    char *encode(JSContext *cx, JSString *str) {
+        JS_ASSERT(!mBytes);
+        JS_ASSERT(cx);
+        mBytes = JS_EncodeString(cx, str);
+        return mBytes;
+    }
+
+    void clear() {
+        js_free(mBytes);
+        mBytes = NULL;
+    }
+
+    char *ptr() const {
+        return mBytes;
+    }
+
+    bool operator!() const {
+        return !mBytes;
+    }
+
+  private:
+    char        *mBytes;
+    JS_DECL_USE_GUARD_OBJECT_NOTIFIER
+
+    /* Copy and assignment are not supported. */
+    JSAutoByteString(const JSAutoByteString &another);
+    JSAutoByteString &operator=(const JSAutoByteString &another);
+};
+
+#endif
+
 /************************************************************************/
 /*
  * JSON functions
@@ -2957,7 +3025,7 @@ JS_FinishJSONParse(JSContext *cx, JSONParser *jp, jsval reviver);
 #define JS_STRUCTURED_CLONE_VERSION 1
 
 JS_PUBLIC_API(JSBool)
-JS_ReadStructuredClone(JSContext *cx, const uint64 *data, size_t nbytes, jsval *vp);
+JS_ReadStructuredClone(JSContext *cx, const uint64 *data, size_t nbytes, uint32 version, jsval *vp);
 
 /* Note: On success, the caller is responsible for calling js_free(*datap). */
 JS_PUBLIC_API(JSBool)
@@ -2972,9 +3040,12 @@ class JSAutoStructuredCloneBuffer {
     JSContext *cx;
     uint64 *data_;
     size_t nbytes_;
+    uint32 version_;
 
   public:
-    explicit JSAutoStructuredCloneBuffer(JSContext *cx) : cx(cx), data_(NULL), nbytes_(0) {}
+    explicit JSAutoStructuredCloneBuffer(JSContext *cx)
+        : cx(cx), data_(NULL), nbytes_(0), version_(JS_STRUCTURED_CLONE_VERSION) {}
+
     ~JSAutoStructuredCloneBuffer() { clear(); }
 
     uint64 *data() const { return data_; }
@@ -2992,10 +3063,11 @@ class JSAutoStructuredCloneBuffer {
      * Adopt some memory. It will be automatically freed by the destructor.
      * data must have been allocated using JS_malloc.
      */
-    void adopt(uint64 *data, size_t nbytes) {
+    void adopt(uint64 *data, size_t nbytes, uint32 version=JS_STRUCTURED_CLONE_VERSION) {
         clear();
         data_ = data;
         nbytes_ = nbytes;
+        version_ = version;
     }
 
     /*
@@ -3011,7 +3083,7 @@ class JSAutoStructuredCloneBuffer {
 
     bool read(jsval *vp) const {
         JS_ASSERT(data_);
-        return !!JS_ReadStructuredClone(cx, data_, nbytes_, vp);
+        return !!JS_ReadStructuredClone(cx, data_, nbytes_, version_, vp);
     }
 
     bool write(jsval v) {

@@ -487,9 +487,14 @@ stubs::GetElem(VMFrame &f)
             goto intern_big_int;
 
     } else {
-      intern_big_int:
-        if (!js_InternNonIntElementId(cx, obj, rref, &id))
-            THROW();
+        int32_t i;
+        if (ValueFitsInInt32(rref, &i) && INT_FITS_IN_JSID(i)) {
+            id = INT_TO_JSID(i);
+        } else {
+          intern_big_int:
+            if (!js_InternNonIntElementId(cx, obj, rref, &id))
+                THROW();
+        }
     }
 
     if (!obj->getProperty(cx, id, &rval))
@@ -1023,6 +1028,7 @@ StubEqualityOp(VMFrame &f)
                 cond = JSDOUBLE_COMPARE(l, !=, r, IFNAN);
         } else if (lval.isObject()) {
             JSObject *l = &lval.toObject(), *r = &rval.toObject();
+            l->assertSpecialEqualitySynced();
             if (EqualityOp eq = l->getClass()->ext.equality) {
                 if (!eq(cx, l, &rval, &cond))
                     return false;
@@ -1267,15 +1273,6 @@ stubs::Mod(VMFrame &f)
     }
 }
 
-JSObject *JS_FASTCALL
-stubs::NewArray(VMFrame &f, uint32 len)
-{
-    JSObject *obj = js_NewArrayObject(f.cx, len, f.regs.sp - len);
-    if (!obj)
-        THROWV(NULL);
-    return obj;
-}
-
 void JS_FASTCALL
 stubs::Debugger(VMFrame &f, jsbytecode *pc)
 {
@@ -1377,19 +1374,28 @@ stubs::NewInitArray(VMFrame &f, uint32 count)
     JSObject *obj = NewArrayWithKind(cx, kind);
     if (!obj || !obj->ensureSlots(cx, count))
         THROWV(NULL);
+
+    obj->setArrayLength(count);
     return obj;
 }
 
 JSObject * JS_FASTCALL
-stubs::NewInitObject(VMFrame &f, uint32 count)
+stubs::NewInitObject(VMFrame &f, JSObject *baseobj)
 {
     JSContext *cx = f.cx;
-    gc::FinalizeKind kind = GuessObjectGCKind(count, false);
 
-    JSObject *obj = NewBuiltinClassInstance(cx, &js_ObjectClass, kind);
-    if (!obj || !obj->ensureSlots(cx, count))
+    if (!baseobj) {
+        gc::FinalizeKind kind = GuessObjectGCKind(0, false);
+        JSObject *obj = NewBuiltinClassInstance(cx, &js_ObjectClass, kind);
+        if (!obj)
+            THROWV(NULL);
+        return obj;
+    }
+
+    JSObject *obj = CopyInitializerObject(cx, baseobj);
+
+    if (!obj)
         THROWV(NULL);
-
     return obj;
 }
 

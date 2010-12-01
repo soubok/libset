@@ -95,6 +95,7 @@
 #include "jsscopeinlines.h"
 #include "jscntxtinlines.h"
 #include "jsregexpinlines.h"
+#include "jsstrinlines.h"
 #include "assembler/wtf/Platform.h"
 
 #if ENABLE_YARR_JIT
@@ -120,13 +121,18 @@ class AutoVersionAPI
     explicit AutoVersionAPI(JSContext *cx, JSVersion newVersion)
       : cx(cx), oldVersion(cx->findVersion()), oldVersionWasOverride(cx->isVersionOverridden()),
         oldOptions(cx->options) {
-        JS_ASSERT(!VersionExtractFlags(newVersion) ||
-                  VersionExtractFlags(newVersion) == VersionFlags::HAS_XML);
+        /* 
+         * Note: ANONFUNFIX in newVersion is ignored for backwards
+         * compatibility, must be set via JS_SetOptions. (Because of this, we
+         * inherit the current ANONFUNFIX setting from the options.
+         */
         cx->options = VersionHasXML(newVersion)
                       ? (cx->options | JSOPTION_XML)
                       : (cx->options & ~JSOPTION_XML);
+
+        VersionSetAnonFunFix(&newVersion, OptionsHasAnonFunFix(cx->options));
         cx->maybeOverrideVersion(newVersion);
-        SyncOptionsToVersion(cx);
+        cx->checkOptionVersionSync();
     }
 
     ~AutoVersionAPI() {
@@ -253,10 +259,11 @@ JS_ConvertArgumentsVA(JSContext *cx, uintN argc, jsval *argv, const char *format
                 if (fun) {
                     char numBuf[12];
                     JS_snprintf(numBuf, sizeof numBuf, "%u", argc);
-                    JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
-                                         JSMSG_MORE_ARGS_NEEDED,
-                                         JS_GetFunctionName(fun), numBuf,
-                                         (argc == 1) ? "" : "s");
+                    JSAutoByteString funNameBytes;
+                    if (const char *name = GetFunctionNameBytes(cx, fun, &funNameBytes)) {
+                        JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_MORE_ARGS_NEEDED,
+                                             name, numBuf, (argc == 1) ? "" : "s");
+                    }
                 }
                 return JS_FALSE;
             }
@@ -291,19 +298,13 @@ JS_ConvertArgumentsVA(JSContext *cx, uintN argc, jsval *argv, const char *format
                 return JS_FALSE;
             *va_arg(ap, jsdouble *) = js_DoubleToInteger(d);
             break;
-          case 's':
           case 'S':
           case 'W':
             str = js_ValueToString(cx, Valueify(*sp));
             if (!str)
                 return JS_FALSE;
             *sp = STRING_TO_JSVAL(str);
-            if (c == 's') {
-                const char *bytes = js_GetStringBytes(cx, str);
-                if (!bytes)
-                    return JS_FALSE;
-                *va_arg(ap, const char **) = bytes;
-            } else if (c == 'W') {
+            if (c == 'W') {
                 const jschar *chars = js_GetStringChars(cx, str);
                 if (!chars)
                     return JS_FALSE;
@@ -628,7 +629,7 @@ JSRuntime::init(uint32 maxbytes)
         return false;
 
 #if ENABLE_YARR_JIT
-    regExpAllocator = new JSC::ExecutableAllocator();
+    regExpAllocator = JSC::ExecutableAllocator::create();
     if (!regExpAllocator)
         return false;
 #endif
@@ -809,7 +810,7 @@ StartRequest(JSContext *cx)
 {
     JSThread *t = cx->thread;
     JS_ASSERT(CURRENT_THREAD_IS_ME(t));
-   
+
     if (t->data.requestDepth) {
         t->data.requestDepth++;
     } else {
@@ -1018,16 +1019,6 @@ JS_GetVersion(JSContext *cx)
     return VersionNumber(cx->findVersion());
 }
 
-static void
-CheckOptionVersionSync(JSContext *cx)
-{
-#if DEBUG
-    uint32 options = cx->options;
-    JSVersion version = cx->findVersion();
-    JS_ASSERT(OptionsHasXML(options) == VersionHasXML(version));
-#endif
-}
-
 JS_PUBLIC_API(JSVersion)
 JS_SetVersion(JSContext *cx, JSVersion newVersion)
 {
@@ -1044,9 +1035,9 @@ JS_SetVersion(JSContext *cx, JSVersion newVersion)
     if (newVersionNumber != JSVERSION_DEFAULT && newVersionNumber <= JSVERSION_1_4)
         return oldVersionNumber;
 
-    VersionCloneFlags(oldVersion, &newVersion);
+    cx->optionFlagsToVersion(&newVersion);
     cx->maybeOverrideVersion(newVersion);
-    CheckOptionVersionSync(cx);
+    cx->checkOptionVersionSync();
     return oldVersionNumber;
 }
 
@@ -1108,9 +1099,9 @@ JS_SetOptions(JSContext *cx, uint32 options)
     AutoLockGC lock(cx->runtime);
     uint32 oldopts = cx->options;
     cx->options = options;
-    SyncOptionsToVersion(cx);
+    cx->syncOptionsToVersion();
     cx->updateJITEnabled();
-    CheckOptionVersionSync(cx);
+    cx->checkOptionVersionSync();
     return oldopts;
 }
 
@@ -1118,12 +1109,12 @@ JS_PUBLIC_API(uint32)
 JS_ToggleOptions(JSContext *cx, uint32 options)
 {
     AutoLockGC lock(cx->runtime);
-    CheckOptionVersionSync(cx);
+    cx->checkOptionVersionSync();
     uint32 oldopts = cx->options;
     cx->options ^= options;
-    (void) SyncOptionsToVersion(cx);
+    cx->syncOptionsToVersion();
     cx->updateJITEnabled();
-    CheckOptionVersionSync(cx);
+    cx->checkOptionVersionSync();
     return oldopts;
 }
 
@@ -1534,8 +1525,8 @@ static JSStdName standard_class_names[] = {
     {js_InitObjectClass,        EAGER_ATOM(eval), CLASP(Object)},
 
     /* Global properties and functions defined by the Number class. */
-    {js_InitNumberClass,        LAZY_ATOM(NaN), CLASP(Number)},
-    {js_InitNumberClass,        LAZY_ATOM(Infinity), CLASP(Number)},
+    {js_InitNumberClass,        EAGER_ATOM(NaN), CLASP(Number)},
+    {js_InitNumberClass,        EAGER_ATOM(Infinity), CLASP(Number)},
     {js_InitNumberClass,        LAZY_ATOM(isNaN), CLASP(Number)},
     {js_InitNumberClass,        LAZY_ATOM(isFinite), CLASP(Number)},
     {js_InitNumberClass,        LAZY_ATOM(parseFloat), CLASP(Number)},
@@ -2680,25 +2671,26 @@ JS_FlushCaches(JSContext *cx)
 JS_PUBLIC_API(intN)
 JS_AddExternalStringFinalizer(JSStringFinalizeOp finalizer)
 {
-    return js_ChangeExternalStringFinalizer(NULL, finalizer);
+    return JSExternalString::changeFinalizer(NULL, finalizer);
 }
 
 JS_PUBLIC_API(intN)
 JS_RemoveExternalStringFinalizer(JSStringFinalizeOp finalizer)
 {
-    return js_ChangeExternalStringFinalizer(finalizer, NULL);
+    return JSExternalString::changeFinalizer(finalizer, NULL);
 }
 
 JS_PUBLIC_API(JSString *)
 JS_NewExternalString(JSContext *cx, jschar *chars, size_t length, intN type)
 {
     CHECK_REQUEST(cx);
-    JS_ASSERT(uintN(type) < JS_EXTERNAL_STRING_LIMIT);
+    JS_ASSERT(uintN(type) < JSExternalString::TYPE_LIMIT);
 
-    JSString *str = js_NewGCExternalString(cx, uintN(type));
+    JSExternalString *str = js_NewGCExternalString(cx, uintN(type));
     if (!str)
         return NULL;
     str->initFlat(chars, length);
+    str->externalStringType = type;
     cx->runtime->updateMallocCounter((length + 1) * sizeof(jschar));
     return str;
 }
@@ -2957,6 +2949,8 @@ JS_NewGlobalObject(JSContext *cx, JSClass *clasp)
     if (!obj)
         return NULL;
 
+    obj->syncSpecialEquality();
+
     /* Construct a regexp statics object for this global object. */
     JSObject *res = regexp_statics_construct(cx, obj);
     if (!res ||
@@ -2999,6 +2993,8 @@ JS_NewObject(JSContext *cx, JSClass *jsclasp, JSObject *proto, JSObject *parent)
     JS_ASSERT(!(clasp->flags & JSCLASS_IS_GLOBAL));
 
     JSObject *obj = NewNonFunction<WithProto::Class>(cx, clasp, proto, parent);
+    if (obj)
+        obj->syncSpecialEquality();
 
     JS_ASSERT_IF(obj, obj->getParent());
     return obj;
@@ -3018,7 +3014,10 @@ JS_NewObjectWithGivenProto(JSContext *cx, JSClass *jsclasp, JSObject *proto, JSO
     JS_ASSERT(clasp != &js_FunctionClass);
     JS_ASSERT(!(clasp->flags & JSCLASS_IS_GLOBAL));
 
-    return NewNonFunction<WithProto::Given>(cx, clasp, proto, parent);
+    JSObject *obj = NewNonFunction<WithProto::Given>(cx, clasp, proto, parent);
+    if (obj)
+        obj->syncSpecialEquality();
+    return obj;
 }
 
 JS_PUBLIC_API(JSObject *)
@@ -3052,7 +3051,7 @@ JS_DeepFreezeObject(JSContext *cx, JSObject *obj)
     assertSameCompartment(cx, obj);
 
     /* Assume that non-extensible objects are already deep-frozen, to avoid divergence. */
-    if (obj->isExtensible())
+    if (!obj->isExtensible())
         return true;
 
     if (!obj->freeze(cx))
@@ -3127,16 +3126,26 @@ LookupResult(JSContext *cx, JSObject *obj, JSObject *obj2, jsid id,
         }
 
         /* Peek at the native property's slot value, without doing a Get. */
-        if (obj2->containsSlot(shape->slot))
+        if (obj2->containsSlot(shape->slot)) {
             *vp = obj2->nativeGetSlot(shape->slot);
-        else
-            vp->setBoolean(true);
-    } else if (obj2->isDenseArray()) {
-        return js_GetDenseArrayElementValue(cx, obj2, id, vp);
+            return true;
+        }
     } else {
-        /* XXX bad API: no way to return "defined but value unknown" */
-        vp->setBoolean(true);
+        if (obj2->isDenseArray())
+            return js_GetDenseArrayElementValue(cx, obj2, id, vp);
+        if (obj2->isProxy()) {
+            AutoPropertyDescriptorRooter desc(cx);
+            if (!JSProxy::getPropertyDescriptor(cx, obj2, id, false, &desc))
+                return false;
+            if (!(desc.attrs & JSPROP_SHARED)) {
+                *vp = desc.value;
+                return true;
+            }
+        }
     }
+
+    /* XXX bad API: no way to return "defined but value unknown" */
+    vp->setBoolean(true);
     return true;
 }
 
@@ -3390,6 +3399,8 @@ JS_DefineObject(JSContext *cx, JSObject *obj, const char *name, JSClass *jsclasp
     JSObject *nobj = NewObject<WithProto::Class>(cx, clasp, proto, obj);
     if (!nobj)
         return NULL;
+
+    nobj->syncSpecialEquality();
 
     if (!DefineProperty(cx, obj, name, ObjectValue(*nobj), NULL, NULL, attrs, 0, 0))
         return NULL;
@@ -3945,7 +3956,6 @@ JS_PUBLIC_API(JSBool)
 JS_NextProperty(JSContext *cx, JSObject *iterobj, jsid *idp)
 {
     jsint i;
-    JSObject *obj;
     const Shape *shape;
     JSIdArray *ida;
 
@@ -3954,15 +3964,9 @@ JS_NextProperty(JSContext *cx, JSObject *iterobj, jsid *idp)
     i = iterobj->getSlot(JSSLOT_ITER_INDEX).toInt32();
     if (i < 0) {
         /* Native case: private data is a property tree node pointer. */
-        obj = iterobj->getParent();
-        JS_ASSERT(obj->isNative());
+        JS_ASSERT(iterobj->getParent()->isNative());
         shape = (Shape *) iterobj->getPrivate();
 
-        /*
-         * If the next property mapped by obj in the property tree ancestor
-         * line is not enumerable, or it's an alias, skip it and keep on trying
-         * to find an enumerable property that is still in obj.
-         */
         while (shape->previous() && (!shape->enumerable() || shape->isAlias()))
             shape = shape->previous();
 
@@ -4213,9 +4217,10 @@ JS_GetFunctionObject(JSFunction *fun)
 JS_PUBLIC_API(const char *)
 JS_GetFunctionName(JSFunction *fun)
 {
-    return fun->atom
-           ? JS_GetStringBytes(ATOM_TO_STRING(fun->atom))
-           : js_anonymous_str;
+    if (!fun->atom)
+        return js_anonymous_str;
+    const char *byte = js_GetStringBytes(fun->atom);
+    return byte ? byte : "";
 }
 
 JS_PUBLIC_API(JSString *)
@@ -4396,10 +4401,10 @@ LAST_FRAME_CHECKS(JSContext *cx, bool result)
     }
 }
 
-inline static uint32 
+inline static uint32
 JS_OPTIONS_TO_TCFLAGS(JSContext *cx)
 {
-    return ((cx->options & JSOPTION_COMPILE_N_GO) ? TCF_COMPILE_N_GO : 0) | 
+    return ((cx->options & JSOPTION_COMPILE_N_GO) ? TCF_COMPILE_N_GO : 0) |
            ((cx->options & JSOPTION_NO_SCRIPT_RVAL) ? TCF_NO_SCRIPT_RVAL : 0);
 }
 
@@ -4450,7 +4455,7 @@ JS_CompileScriptForPrincipalsVersion(JSContext *cx, JSObject *obj,
                                      JSVersion version)
 {
     AutoVersionAPI ava(cx, version);
-    return JS_CompileScriptForPrincipals(cx, obj, principals, bytes, length, filename, lineno);   
+    return JS_CompileScriptForPrincipals(cx, obj, principals, bytes, length, filename, lineno);
 }
 
 JS_PUBLIC_API(JSScript *)
@@ -5008,8 +5013,11 @@ JS_New(JSContext *cx, JSObject *ctor, uintN argc, jsval *argv)
              * Although constructors may return primitives (via proxies), this
              * API is asking for an object, so we report an error.
              */
-            JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_BAD_NEW_RESULT,
-                                 js_ValueToPrintableString(cx, args.rval()));
+            JSAutoByteString bytes;
+            if (js_ValueToPrintable(cx, args.rval(), &bytes)) {
+                JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_BAD_NEW_RESULT,
+                                     bytes.ptr());
+            }
         }
     }
 
@@ -5112,14 +5120,8 @@ JS_NewString(JSContext *cx, char *bytes, size_t nbytes)
 
     /* Free chars (but not bytes, which caller frees on error) if we fail. */
     str = js_NewString(cx, chars, length);
-    if (!str) {
+    if (!str)
         cx->free(chars);
-        return NULL;
-    }
-
-    /* Hand off bytes to the deflated string cache, if possible. */
-    if (!cx->runtime->deflatedStringCache->setBytes(cx, str, bytes))
-        cx->free(bytes);
     return str;
 }
 
@@ -5218,15 +5220,6 @@ JS_InternUCString(JSContext *cx, const jschar *s)
     return JS_InternUCStringN(cx, s, js_strlen(s));
 }
 
-JS_PUBLIC_API(char *)
-JS_GetStringBytes(JSString *str)
-{
-    const char *bytes;
-
-    bytes = js_GetStringBytes(NULL, str);
-    return (char *)(bytes ? bytes : "");
-}
-
 JS_PUBLIC_API(jschar *)
 JS_GetStringChars(JSString *str)
 {
@@ -5236,9 +5229,9 @@ JS_GetStringChars(JSString *str)
     str->ensureNotRope();
 
     /*
-     * API botch (again, shades of JS_GetStringBytes): we have no cx to report
-     * out-of-memory when undepending strings, so we replace JSString::undepend
-     * with explicit malloc call and ignore its errors.
+     * API botch: we have no cx to report out-of-memory when undepending
+     * strings, so we replace JSString::undepend with explicit malloc call and
+     * ignore its errors.
      *
      * If we fail to convert a dependent string into an independent one, our
      * caller will not be guaranteed a \u0000 terminator as a backstop.  This
@@ -5270,13 +5263,6 @@ JS_PUBLIC_API(size_t)
 JS_GetStringLength(JSString *str)
 {
     return str->length();
-}
-
-JS_PUBLIC_API(const char *)
-JS_GetStringBytesZ(JSContext *cx, JSString *str)
-{
-    assertSameCompartment(cx, str);
-    return js_GetStringBytes(cx, str);
 }
 
 JS_PUBLIC_API(const jschar *)
@@ -5356,7 +5342,6 @@ JS_PUBLIC_API(JSBool)
 JS_EncodeCharacters(JSContext *cx, const jschar *src, size_t srclen, char *dst, size_t *dstlenp)
 {
     size_t n;
-
     if (!dst) {
         n = js_GetDeflatedStringLength(cx, src, srclen);
         if (n == (size_t)-1) {
@@ -5380,6 +5365,37 @@ JS_PUBLIC_API(char *)
 JS_EncodeString(JSContext *cx, JSString *str)
 {
     return js_DeflateString(cx, str->chars(), str->length());
+}
+
+JS_PUBLIC_API(size_t)
+JS_GetStringEncodingLength(JSContext *cx, JSString *str)
+{
+    return js_GetDeflatedStringLength(cx, str->chars(), str->length());
+}
+
+JS_PUBLIC_API(size_t)
+JS_EncodeStringToBuffer(JSString *str, char *buffer, size_t length)
+{
+    /*
+     * FIXME bug 612141 - fix js_DeflateStringToBuffer interface so the result
+     * would allow to distinguish between insufficient buffer and encoding
+     * error.
+     */
+    size_t writtenLength = length;
+    if (js_DeflateStringToBuffer(NULL, str->chars(), str->length(), buffer, &writtenLength)) {
+        JS_ASSERT(writtenLength <= length);
+        return writtenLength;
+    }
+    JS_ASSERT(writtenLength <= length);
+    size_t necessaryLength = js_GetDeflatedStringLength(NULL, str->chars(), str->length());
+    if (necessaryLength == size_t(-1))
+        return size_t(-1);
+    if (writtenLength != length) {
+        /* Make sure that the buffer contains only valid UTF-8 sequences. */
+        JS_ASSERT(js_CStringsAreUTF8);
+        PodZero(buffer + writtenLength, length - writtenLength);
+    }
+    return necessaryLength;
 }
 
 JS_PUBLIC_API(JSBool)
@@ -5425,8 +5441,12 @@ JS_FinishJSONParse(JSContext *cx, JSONParser *jp, jsval reviver)
 }
 
 JS_PUBLIC_API(JSBool)
-JS_ReadStructuredClone(JSContext *cx, const uint64 *buf, size_t nbytes, jsval *vp)
+JS_ReadStructuredClone(JSContext *cx, const uint64 *buf, size_t nbytes, uint32 version, jsval *vp)
 {
+    if (version > JS_STRUCTURED_CLONE_VERSION) {
+        JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_BAD_CLONE_VERSION);
+        return false;
+    }
     return ReadStructuredClone(cx, buf, nbytes, Valueify(vp));
 }
 
@@ -5683,7 +5703,7 @@ JS_ExecuteRegExpNoStatics(JSContext *cx, JSObject *obj, jschar *chars, size_t le
                           size_t *indexp, JSBool test, jsval *rval)
 {
     CHECK_REQUEST(cx);
-    
+
     RegExp *re = RegExp::extractFrom(obj);
     if (!re)
         return false;
@@ -5894,7 +5914,7 @@ JS_ClearContextThread(JSContext *cx)
     js_WaitForGC(rt);
     js_ClearContextThread(cx);
     JS_ASSERT_IF(JS_CLIST_IS_EMPTY(&t->contextList), !t->data.requestDepth);
-   
+
     /*
      * We can access t->id as long as the GC lock is held and we cannot race
      * with the GC that may delete t.

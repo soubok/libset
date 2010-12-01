@@ -115,9 +115,6 @@ using namespace js::gc;
 #define MAXINDEX 4294967295u
 #define MAXSTR   "4294967295"
 
-/* Small arrays are dense, no matter what. */
-#define MIN_SPARSE_INDEX 256
-
 /*
  * Use the limit on number of object slots for sanity and consistency (see the
  * assertion in JSObject::makeDenseArraySlow).
@@ -503,7 +500,7 @@ DeleteArrayElement(JSContext *cx, JSObject *obj, jsdouble index, JSBool strict)
             jsuint idx = jsuint(index);
             if (idx < obj->getDenseArrayCapacity()) {
                 obj->setDenseArrayElement(idx, MagicValue(JS_ARRAY_HOLE));
-                return JS_TRUE;
+                return js_SuppressDeletedIndexProperties(cx, obj, idx, idx+1);
             }
         }
         return JS_TRUE;
@@ -1043,12 +1040,10 @@ JSObject::makeDenseArraySlow(JSContext *cx)
      */
     JSObjectMap *oldMap = map;
 
-    /*
-     * Create a native scope. All slow arrays other than Array.prototype get
-     * the same initial shape.
-     */
+    /* Create a native scope. */
     JSObject *arrayProto = getProto();
-    if (!InitScopeForObject(cx, this, &js_SlowArrayClass, arrayProto, FINALIZE_OBJECT0))
+    js::gc::FinalizeKind kind = js::gc::FinalizeKind(arena()->header()->thingKind);
+    if (!InitScopeForObject(cx, this, &js_SlowArrayClass, arrayProto, kind))
         return false;
 
     uint32 capacity = getDenseArrayCapacity();
@@ -1064,7 +1059,11 @@ JSObject::makeDenseArraySlow(JSContext *cx)
         return false;
     }
 
-    /* Create new properties pointing to existing elements. */
+    /*
+     * Create new properties pointing to existing elements. Pack the array to
+     * remove holes, so that shapes use successive slots (as for other objects).
+     */
+    uint32 next = 0;
     for (uint32 i = 0; i < capacity; i++) {
         jsid id;
         if (!ValueToId(cx, Int32Value(i), &id)) {
@@ -1072,16 +1071,27 @@ JSObject::makeDenseArraySlow(JSContext *cx)
             return false;
         }
 
-        if (getDenseArrayElement(i).isMagic(JS_ARRAY_HOLE)) {
-            setDenseArrayElement(i, UndefinedValue());
+        if (getDenseArrayElement(i).isMagic(JS_ARRAY_HOLE))
             continue;
-        }
 
-        if (!addDataProperty(cx, id, i, JSPROP_ENUMERATE)) {
+        setDenseArrayElement(next, getDenseArrayElement(i));
+
+        if (!addDataProperty(cx, id, next, JSPROP_ENUMERATE)) {
             setMap(oldMap);
             return false;
         }
+
+        next++;
     }
+
+    /*
+     * Dense arrays with different numbers of slots but the same number of fixed
+     * slots and the same non-hole indexes must use their fixed slots consistently.
+     */
+    if (hasSlotsArray() && next <= numFixedSlots())
+        revertToFixedSlots(cx);
+
+    ClearValueRange(slots + next, this->capacity - next, false);
 
     /*
      * Finally, update class. If |this| is Array.prototype, then js_InitClass
@@ -2038,6 +2048,7 @@ js_ArrayCompPush(JSContext *cx, JSObject *obj, const Value &vp)
     return ArrayCompPushImpl(cx, obj, vp);
 }
 
+#ifdef JS_TRACER
 JSBool JS_FASTCALL
 js_ArrayCompPush_tn(JSContext *cx, JSObject *obj, ValueArgType v)
 {
@@ -2050,6 +2061,7 @@ js_ArrayCompPush_tn(JSContext *cx, JSObject *obj, ValueArgType v)
 }
 JS_DEFINE_CALLINFO_3(extern, BOOL_FAIL, js_ArrayCompPush_tn, CONTEXT, OBJECT,
                      VALUE, 0, nanojit::ACCSET_STORE_ANY)
+#endif
 
 static JSBool
 array_push(JSContext *cx, uintN argc, Value *vp)
@@ -2210,9 +2222,9 @@ array_unshift(JSContext *cx, uintN argc, Value *vp)
             return JS_FALSE;
 
         newlen += argc;
-        if (!js_SetLengthProperty(cx, obj, newlen))
-            return JS_FALSE;
     }
+    if (!js_SetLengthProperty(cx, obj, newlen))
+        return JS_FALSE;
 
     /* Follow Perl by returning the new array length. */
     vp->setNumber(newlen);
@@ -2972,17 +2984,6 @@ js_NewPreallocatedArray(JSContext* cx, JSObject* proto, int32 len)
 #ifdef JS_TRACER
 JS_DEFINE_CALLINFO_3(extern, OBJECT, js_NewPreallocatedArray, CONTEXT, OBJECT, INT32,
                      0, nanojit::ACCSET_STORE_ANY)
-#endif
-
-JSObject* JS_FASTCALL
-js_InitializerArray(JSContext* cx, int32 count)
-{
-    gc::FinalizeKind kind = GuessObjectGCKind(count, true);
-    return NewArrayWithKind(cx, kind);
-}
-#ifdef JS_TRACER
-JS_DEFINE_CALLINFO_2(extern, OBJECT, js_InitializerArray, CONTEXT, INT32, 0,
-                     nanojit::ACCSET_STORE_ANY)
 #endif
 
 JSObject *

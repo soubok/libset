@@ -56,6 +56,14 @@ JS_BEGIN_EXTERN_C
 extern JS_PUBLIC_API(void)
 JS_Assert(const char *s, const char *file, JSIntn ln);
 
+#define JS_CRASH_UNLESS(__cond)                                                 \
+    JS_BEGIN_MACRO                                                              \
+        if (!(__cond)) {                                                        \
+            *(int *)(uintptr_t)0xccadbeef = 0;                                  \
+            ((void(*)())0)(); /* More reliable, but doesn't say CCADBEEF */     \
+        }                                                                       \
+    JS_END_MACRO
+
 #ifdef DEBUG
 
 #define JS_ASSERT(expr)                                                       \
@@ -300,6 +308,8 @@ public:
     JSGuardObjectNotificationReceiver _mCheckNotUsedAsTemporary;
 #define JS_GUARD_OBJECT_NOTIFIER_PARAM \
     , const JSGuardObjectNotifier& _notifier = JSGuardObjectNotifier()
+#define JS_GUARD_OBJECT_NOTIFIER_PARAM0 \
+    const JSGuardObjectNotifier& _notifier = JSGuardObjectNotifier()
 #define JS_GUARD_OBJECT_NOTIFIER_INIT \
     JS_BEGIN_MACRO _mCheckNotUsedAsTemporary.Init(_notifier); JS_END_MACRO
 
@@ -307,6 +317,7 @@ public:
 
 #define JS_DECL_USE_GUARD_OBJECT_NOTIFIER
 #define JS_GUARD_OBJECT_NOTIFIER_PARAM
+#define JS_GUARD_OBJECT_NOTIFIER_PARAM0
 #define JS_GUARD_OBJECT_NOTIFIER_INIT JS_BEGIN_MACRO JS_END_MACRO
 
 #endif /* !defined(DEBUG) */

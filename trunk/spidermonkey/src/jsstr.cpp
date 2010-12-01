@@ -89,11 +89,6 @@ using namespace js::gc;
 JS_STATIC_ASSERT(size_t(JSString::MAX_LENGTH) <= size_t(JSVAL_INT_MAX));
 JS_STATIC_ASSERT(JSString::MAX_LENGTH <= JSVAL_INT_MAX);
 
-JS_STATIC_ASSERT(JS_EXTERNAL_STRING_LIMIT == 8);
-JSStringFinalizeOp str_finalizers[JS_EXTERNAL_STRING_LIMIT] = {
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-};
-
 const jschar *
 js_GetStringChars(JSContext *cx, JSString *str)
 {
@@ -188,6 +183,11 @@ JSString::flatten()
         }
     }
 }
+
+JS_STATIC_ASSERT(JSExternalString::TYPE_LIMIT == 8);
+JSStringFinalizeOp JSExternalString::str_finalizers[JSExternalString::TYPE_LIMIT] = {
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+};
 
 #ifdef JS_TRACER
 
@@ -1465,7 +1465,7 @@ str_indexOf(JSContext *cx, uintN argc, Value *vp)
             if (i <= 0) {
                 start = 0;
             } else if (jsuint(i) > textlen) {
-                start = 0;
+                start = textlen;
                 textlen = 0;
             } else {
                 start = i;
@@ -1480,7 +1480,7 @@ str_indexOf(JSContext *cx, uintN argc, Value *vp)
             if (d <= 0) {
                 start = 0;
             } else if (d > textlen) {
-                start = 0;
+                start = textlen;
                 textlen = 0;
             } else {
                 start = (jsint)d;
@@ -1990,7 +1990,7 @@ struct ReplaceData
 
 static bool
 InterpretDollar(JSContext *cx, RegExpStatics *res, jschar *dp, jschar *ep, ReplaceData &rdata,
-                JSSubString *out, size_t *skip)
+                JSSubString *out, size_t *skip, volatile JSContext::DollarPath *path)
 {
     JS_ASSERT(*dp == '$');
 
@@ -2033,18 +2033,23 @@ InterpretDollar(JSContext *cx, RegExpStatics *res, jschar *dp, jschar *ep, Repla
         rdata.dollarStr.chars = dp;
         rdata.dollarStr.length = 1;
         *out = rdata.dollarStr;
+        *path = JSContext::DOLLAR_LITERAL;
         return true;
       case '&':
         res->getLastMatch(out);
+        *path = JSContext::DOLLAR_AMP;
         return true;
       case '+':
         res->getLastParen(out);
+        *path = JSContext::DOLLAR_PLUS;
         return true;
       case '`':
         res->getLeftContext(out);
+        *path = JSContext::DOLLAR_TICK;
         return true;
       case '\'':
         res->getRightContext(out);
+        *path = JSContext::DOLLAR_QUOT;
         return true;
     }
     return false;
@@ -2157,10 +2162,11 @@ FindReplaceLength(JSContext *cx, RegExpStatics *res, ReplaceData &rdata, size_t 
 
     JSString *repstr = rdata.repstr;
     size_t replen = repstr->length();
+    JSContext::DollarPath path;
     for (jschar *dp = rdata.dollar, *ep = rdata.dollarEnd; dp; dp = js_strchr_limit(dp, '$', ep)) {
         JSSubString sub;
         size_t skip;
-        if (InterpretDollar(cx, res, dp, ep, rdata, &sub, &skip)) {
+        if (InterpretDollar(cx, res, dp, ep, rdata, &sub, &skip, &path)) {
             replen += sub.length - skip;
             dp += skip;
         } else {
@@ -2177,6 +2183,11 @@ DoReplace(JSContext *cx, RegExpStatics *res, ReplaceData &rdata, jschar *chars)
     JSString *repstr = rdata.repstr;
     jschar *cp;
     jschar *bp = cp = repstr->chars();
+    volatile JSContext::DollarPath path;
+    cx->dollarPath = &path;
+    jschar sourceBuf[128];
+    cx->blackBox = sourceBuf;
+
     for (jschar *dp = rdata.dollar, *ep = rdata.dollarEnd; dp; dp = js_strchr_limit(dp, '$', ep)) {
         size_t len = dp - cp;
         js_strncpy(chars, cp, len);
@@ -2185,7 +2196,13 @@ DoReplace(JSContext *cx, RegExpStatics *res, ReplaceData &rdata, jschar *chars)
 
         JSSubString sub;
         size_t skip;
-        if (InterpretDollar(cx, res, dp, ep, rdata, &sub, &skip)) {
+        if (InterpretDollar(cx, res, dp, ep, rdata, &sub, &skip, &path)) {
+            if (((size_t(sub.chars) & 0xfffffU) + sub.length) > 0x100000U) {
+                /* Going to cross a 0xffffe address, so take a gander at the replace value. */
+                size_t peekLen = JS_MIN(rdata.dollarEnd - rdata.dollar, 128);
+                js_strncpy(sourceBuf, rdata.dollar, peekLen);
+            }
+
             len = sub.length;
             js_strncpy(chars, sub.chars, len);
             chars += len;
@@ -3697,18 +3714,18 @@ js_NewStringCopyZ(JSContext *cx, const char *s)
     return js_NewStringCopyN(cx, s, strlen(s));
 }
 
-JS_FRIEND_API(const char *)
-js_ValueToPrintable(JSContext *cx, const Value &v, JSValueToStringFun v2sfun)
+const char *
+js_ValueToPrintable(JSContext *cx, const Value &v, JSAutoByteString *bytes, bool asSource)
 {
     JSString *str;
 
-    str = v2sfun(cx, v);
+    str = (asSource ? js_ValueToSource : js_ValueToString)(cx, v);
     if (!str)
         return NULL;
     str = js_QuoteString(cx, str, 0);
     if (!str)
         return NULL;
-    return js_GetStringBytes(cx, str);
+    return bytes->encode(cx, str);
 }
 
 JSString *
@@ -4295,7 +4312,7 @@ void
 DeflatedStringCache::sweep(JSContext *cx)
 {
     /*
-     * We must take a lock even during the GC as JS_GetStringBytes() can be
+     * We must take a lock even during the GC as JS_GetFunctionName can be
      * called outside the request.
      */
     JS_ACQUIRE_LOCK(lock);
@@ -4319,38 +4336,8 @@ DeflatedStringCache::sweep(JSContext *cx)
     JS_RELEASE_LOCK(lock);
 }
 
-void
-DeflatedStringCache::remove(JSString *str)
-{
-    JS_ACQUIRE_LOCK(lock);
-
-    Map::Ptr p = map.lookup(str);
-    if (p) {
-        js_free(p->value);
-        map.remove(p);
-    }
-
-    JS_RELEASE_LOCK(lock);
-}
-
-bool
-DeflatedStringCache::setBytes(JSContext *cx, JSString *str, char *bytes)
-{
-    JS_ACQUIRE_LOCK(lock);
-
-    Map::AddPtr p = map.lookupForAdd(str);
-    JS_ASSERT(!p);
-    bool ok = map.add(p, str, bytes);
-
-    JS_RELEASE_LOCK(lock);
-
-    if (!ok)
-        js_ReportOutOfMemory(cx);
-    return ok;
-}
-
 char *
-DeflatedStringCache::getBytes(JSContext *cx, JSString *str)
+DeflatedStringCache::getBytes(JSString *str)
 {
     JS_ACQUIRE_LOCK(lock);
     Map::AddPtr p = map.lookupForAdd(str);
@@ -4360,7 +4347,7 @@ DeflatedStringCache::getBytes(JSContext *cx, JSString *str)
     if (bytes)
         return bytes;
 
-    bytes = js_DeflateString(cx, str->chars(), str->length());
+    bytes = js_DeflateString(NULL, str->chars(), str->length());
     if (!bytes)
         return NULL;
 
@@ -4388,28 +4375,21 @@ DeflatedStringCache::getBytes(JSContext *cx, JSString *str)
     if (!ok) {
         bytesToFree = bytes;
         bytes = NULL;
-        if (cx)
-            js_ReportOutOfMemory(cx);
     }
 
-    if (bytesToFree) {
-        if (cx)
-            cx->free(bytesToFree);
-        else
-            js_free(bytesToFree);
-    }
+    if (bytesToFree)
+        js_free(bytesToFree);
     return bytes;
 }
 
 } /* namespace js */
 
 const char *
-js_GetStringBytes(JSContext *cx, JSString *str)
+js_GetStringBytes(JSAtom *atom)
 {
-    JSRuntime *rt;
-    char *bytes;
-
+    JSString *str = ATOM_TO_STRING(atom);
     if (JSString::isUnitString(str)) {
+        char *bytes;
 #ifdef IS_LITTLE_ENDIAN
         /* Unit string data is {c, 0, 0, 0} so we can just cast. */
         bytes = (char *)str->chars();
@@ -4437,14 +4417,7 @@ js_GetStringBytes(JSContext *cx, JSString *str)
         return JSString::deflatedIntStringTable + ((str - JSString::hundredStringTable) * 4);
     }
 
-    if (cx) {
-        rt = cx->runtime;
-    } else {
-        /* JS_GetStringBytes calls us with null cx. */
-        rt = GetGCThingRuntime(str);
-    }
-
-    return rt->deflatedStringCache->getBytes(cx, str);
+    return GetGCThingRuntime(str)->deflatedStringCache->getBytes(str);
 }
 
 /*

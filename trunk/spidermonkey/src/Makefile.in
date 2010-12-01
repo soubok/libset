@@ -237,6 +237,7 @@ INSTALLED_HEADERS = \
 		jsstaticcheck.h \
 		jsstdint.h \
 		jsstr.h \
+		jsstrinlines.h \
 		jstracer.h \
 		jstypedarray.h \
 		jstypes.h \

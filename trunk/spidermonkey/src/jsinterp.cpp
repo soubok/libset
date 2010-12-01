@@ -499,10 +499,11 @@ ReportIncompatibleMethod(JSContext *cx, Value *vp, Class *clasp)
                            : thisv.isUndefined()
                            ? js_undefined_str
                            : "value";
-        JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
-                             JSMSG_INCOMPATIBLE_PROTO,
-                             clasp->name, JS_GetFunctionName(fun),
-                             name);
+        JSAutoByteString funNameBytes;
+        if (const char *funName = GetFunctionNameBytes(cx, fun, &funNameBytes)) {
+            JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_INCOMPATIBLE_PROTO,
+                                 clasp->name, funName, name);
+        }
     }
 }
 
@@ -761,6 +762,10 @@ InvokeSessionGuard::start(JSContext *cx, const Value &calleev, const Value &this
     savedThis_ = args_.thisv() = thisv;
 
     do {
+        /* In debug mode, script->getJIT(fp->isConstructing()) can change. */
+        if (cx->compartment->debugMode)
+            break;
+
         /* Hoist dynamic checks from scripted Invoke. */
         if (!calleev.isObject())
             break;
@@ -1113,7 +1118,8 @@ CheckRedeclaration(JSContext *cx, JSObject *obj, jsid id, uintN attrs,
            : isFunction
            ? js_function_str
            : js_var_str;
-    name = js_ValueToPrintableString(cx, IdToValue(id));
+    JSAutoByteString bytes;
+    name = js_ValueToPrintable(cx, IdToValue(id), &bytes);
     if (!name)
         return JS_FALSE;
     return !!JS_ReportErrorFlagsAndNumber(cx, report,
@@ -1218,12 +1224,12 @@ InstanceOfSlow(JSContext *cx, JSObject *obj, Class *clasp, Value *argv)
     if (argv) {
         JSFunction *fun = js_ValueToFunction(cx, &argv[-2], 0);
         if (fun) {
-            JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
-                                 JSMSG_INCOMPATIBLE_PROTO,
-                                 clasp->name, JS_GetFunctionName(fun),
-                                 obj
-                                 ? obj->getClass()->name
-                                 : js_null_str);
+            JSAutoByteString funNameBytes;
+            if (const char *funName = GetFunctionNameBytes(cx, fun, &funNameBytes)) {
+                JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_INCOMPATIBLE_PROTO,
+                                     clasp->name, funName,
+                                     obj ? obj->getClass()->name : js_null_str);
+            }
         }
     }
     return false;
@@ -1269,10 +1275,12 @@ InvokeConstructor(JSContext *cx, const CallArgs &argsRef)
     if (args.rval().isPrimitive()) {
         if (clasp != &js_FunctionClass) {
             /* native [[Construct]] returning primitive is error */
-            JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
-                                 JSMSG_BAD_NEW_RESULT,
-                                 js_ValueToPrintableString(cx, args.rval()));
-            return false;
+            JSAutoByteString bytes;
+            if (js_ValueToPrintable(cx, args.rval(), &bytes)) {
+                JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
+                                     JSMSG_BAD_NEW_RESULT, bytes.ptr());
+                return false;
+            }
         }
 
         /* The interpreter fixes rval for us. */
@@ -3380,16 +3388,8 @@ END_CASE(JSOP_BITAND)
             goto error;                                                       \
         cond = cond OP JS_TRUE;                                               \
     } else
-
-#define EXTENDED_EQUALITY_OP(OP)                                              \
-    if (EqualityOp eq = l->getClass()->ext.equality) {                        \
-        if (!eq(cx, l, &rval, &cond))                                         \
-            goto error;                                                       \
-        cond = cond OP JS_TRUE;                                               \
-    } else
 #else
 #define XML_EQUALITY_OP(OP)             /* nothing */
-#define EXTENDED_EQUALITY_OP(OP)        /* nothing */
 #endif
 
 #define EQUALITY_OP(OP, IFNAN)                                                \
@@ -3407,8 +3407,14 @@ END_CASE(JSOP_BITAND)
                 cond = JSDOUBLE_COMPARE(l, OP, r, IFNAN);                     \
             } else if (lval.isObject()) {                                     \
                 JSObject *l = &lval.toObject(), *r = &rval.toObject();        \
-                EXTENDED_EQUALITY_OP(OP)                                      \
-                cond = l OP r;                                                \
+                l->assertSpecialEqualitySynced();                             \
+                if (EqualityOp eq = l->getClass()->ext.equality) {            \
+                    if (!eq(cx, l, &rval, &cond))                             \
+                        goto error;                                           \
+                    cond = cond OP JS_TRUE;                                   \
+                } else {                                                      \
+                    cond = l OP r;                                            \
+                }                                                             \
             } else {                                                          \
                 cond = lval.payloadAsRawUint32() OP rval.payloadAsRawUint32();\
             }                                                                 \
@@ -4498,9 +4504,14 @@ BEGIN_CASE(JSOP_GETELEM)
         else
             goto intern_big_int;
     } else {
-      intern_big_int:
-        if (!js_InternNonIntElementId(cx, obj, rref, &id))
-            goto error;
+        int32_t i;
+        if (ValueFitsInInt32(rref, &i) && INT_FITS_IN_JSID(i)) {
+            id = INT_TO_JSID(i);
+        } else {
+          intern_big_int:
+            if (!js_InternNonIntElementId(cx, obj, rref, &id))
+                goto error;
+        }
     }
 
     if (!obj->getProperty(cx, id, &rval))
@@ -5873,42 +5884,55 @@ BEGIN_CASE(JSOP_HOLE)
     PUSH_HOLE();
 END_CASE(JSOP_HOLE)
 
-BEGIN_CASE(JSOP_NEWARRAY)
-{
-    len = GET_UINT16(regs.pc);
-    cx->assertValidStackDepth(len);
-    JSObject *obj = js_NewArrayObject(cx, len, regs.sp - len);
-    if (!obj)
-        goto error;
-    regs.sp -= len - 1;
-    regs.sp[-1].setObject(*obj);
-}
-END_CASE(JSOP_NEWARRAY)
-
 BEGIN_CASE(JSOP_NEWINIT)
 {
-    jsint i = GET_UINT16(regs.pc);
-    jsint count = GET_UINT16(regs.pc + UINT16_LEN);
+    jsint i = regs.pc[1];
 
     JS_ASSERT(i == JSProto_Array || i == JSProto_Object);
     JSObject *obj;
 
-    gc::FinalizeKind kind = GuessObjectGCKind(count, i == JSProto_Array);
-
     if (i == JSProto_Array) {
-        obj = NewArrayWithKind(cx, kind);
-        if (!obj)
-            goto error;
+        obj = js_NewArrayObject(cx, 0, NULL);
     } else {
+        gc::FinalizeKind kind = GuessObjectGCKind(0, false);
         obj = NewBuiltinClassInstance(cx, &js_ObjectClass, kind);
-        if (!obj)
-            goto error;
     }
+
+    if (!obj)
+        goto error;
 
     PUSH_OBJECT(*obj);
     CHECK_INTERRUPT_HANDLER();
 }
 END_CASE(JSOP_NEWINIT)
+
+BEGIN_CASE(JSOP_NEWARRAY)
+{
+    unsigned count = GET_UINT24(regs.pc);
+    JSObject *obj = js_NewArrayObject(cx, count, NULL);
+
+    if (!obj || !obj->ensureDenseArrayElements(cx, count))
+        goto error;
+
+    PUSH_OBJECT(*obj);
+    CHECK_INTERRUPT_HANDLER();
+}
+END_CASE(JSOP_NEWARRAY)
+
+BEGIN_CASE(JSOP_NEWOBJECT)
+{
+    JSObject *baseobj;
+    LOAD_OBJECT(0, baseobj);
+
+    JSObject *obj = CopyInitializerObject(cx, baseobj);
+
+    if (!obj)
+        goto error;
+
+    PUSH_OBJECT(*obj);
+    CHECK_INTERRUPT_HANDLER();
+}
+END_CASE(JSOP_NEWOBJECT)
 
 BEGIN_CASE(JSOP_ENDINIT)
 {
@@ -5931,10 +5955,6 @@ BEGIN_CASE(JSOP_INITMETHOD)
 
     /*
      * Probe the property cache.
-     *
-     * We can not assume that the object created by JSOP_NEWINIT is still
-     * single-threaded as the debugger can access it from other threads.
-     * So check first.
      *
      * On a hit, if the cached shape has a non-default setter, it must be
      * __proto__. If shape->previous() != obj->lastProperty(), there must be a
@@ -6969,13 +6989,11 @@ END_CASE(JSOP_ARRAYPUSH)
 
   atom_not_defined:
     {
-        const char *printable;
-
-        printable = js_AtomToPrintableString(cx, atomNotDefined);
-        if (printable)
-            js_ReportIsNotDefined(cx, printable);
-        goto error;
+        JSAutoByteString printable;
+        if (js_AtomToPrintableString(cx, atomNotDefined, &printable))
+            js_ReportIsNotDefined(cx, printable.ptr());
     }
+    goto error;
 
     /*
      * This path is used when it's guaranteed the method can be finished

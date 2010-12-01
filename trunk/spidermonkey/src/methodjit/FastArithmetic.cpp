@@ -73,8 +73,12 @@ mjit::Compiler::tryBinaryConstantFold(JSContext *cx, FrameState &frame, JSOp op,
       case JSOP_SUB:
       case JSOP_MUL:
       case JSOP_DIV:
-      case JSOP_MOD:
         needInt = false;
+        break;
+
+      case JSOP_MOD:
+        needInt = (L.isInt32() && R.isInt32() &&
+                   L.toInt32() >= 0 && R.toInt32() > 0);
         break;
 
       case JSOP_RSH:
@@ -129,10 +133,12 @@ mjit::Compiler::tryBinaryConstantFold(JSContext *cx, FrameState &frame, JSOp op,
         }
         break;
       case JSOP_MOD:
-        if (dL == 0)
+        if (needInt)
+            nL %= nR;
+        else if (dR == 0)
             dL = js_NaN;
         else
-            dL = js_fmod(dR, dL);
+            dL = js_fmod(dL, dR);
         break;
 
       case JSOP_RSH:
@@ -558,6 +564,7 @@ mjit::Compiler::jsop_binary_full(FrameEntry *lhs, FrameEntry *rhs, JSOp op, Void
     int32 value = 0;
     JSOp origOp = op;
     MaybeRegisterID reg;
+    MaybeJump preOverflow;
     if (!regs.resultHasRhs) {
         if (!regs.rhsData.isSet())
             value = rhs->getValue().toInt32();
@@ -569,6 +576,9 @@ mjit::Compiler::jsop_binary_full(FrameEntry *lhs, FrameEntry *rhs, JSOp op, Void
         else
             reg = regs.lhsData.reg();
         if (op == JSOP_SUB) {
+            // If the RHS is 0x80000000, the smallest negative value, neg does
+            // not work. Guard against this and treat it as an overflow.
+            preOverflow = masm.branch32(Assembler::Equal, regs.result, Imm32(0x80000000));
             masm.neg32(regs.result);
             op = JSOP_ADD;
         }
@@ -658,6 +668,8 @@ mjit::Compiler::jsop_binary_full(FrameEntry *lhs, FrameEntry *rhs, JSOp op, Void
      * know never to try and convert back to integer.
      */
     MaybeJump overflowDone;
+    if (preOverflow.isSet())
+        stubcc.linkExitDirect(preOverflow.get(), stubcc.masm.label());
     stubcc.linkExitDirect(overflow.get(), stubcc.masm.label());
     {
         if (regs.lhsNeedsRemat) {
@@ -822,6 +834,10 @@ mjit::Compiler::jsop_mod()
 #if defined(JS_CPU_X86)
     FrameEntry *lhs = frame.peek(-2);
     FrameEntry *rhs = frame.peek(-1);
+
+    if (tryBinaryConstantFold(cx, frame, JSOP_MOD, lhs, rhs))
+        return;
+
     if ((lhs->isTypeKnown() && lhs->getKnownType() != JSVAL_TYPE_INT32) ||
         (rhs->isTypeKnown() && rhs->getKnownType() != JSVAL_TYPE_INT32))
 #endif
