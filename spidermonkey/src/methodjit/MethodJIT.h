@@ -55,6 +55,8 @@
 
 namespace js {
 
+namespace mjit { struct JITScript; }
+
 struct VMFrame
 {
     union Arguments {
@@ -85,7 +87,7 @@ struct VMFrame
 
 # ifdef JS_NO_FASTCALL
     inline void** returnAddressLocation() {
-        return reinterpret_cast<void**>(this) - 3;
+        return reinterpret_cast<void**>(this) - 5;
     }
 # else
     inline void** returnAddressLocation() {
@@ -136,6 +138,7 @@ struct VMFrame
     JSRuntime *runtime() { return cx->runtime; }
 
     JSStackFrame *&fp() { return regs.fp; }
+    mjit::JITScript *jit() { return fp()->jit(); }
 };
 
 #ifdef JS_CPU_ARM

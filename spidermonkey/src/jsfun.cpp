@@ -1232,6 +1232,8 @@ CallPropertyOp(JSContext *cx, JSObject *obj, jsid id, Value *vp,
     return true;
 }
 
+namespace js {
+
 static JSBool
 GetCallArguments(JSContext *cx, JSObject *obj, jsid id, Value *vp)
 {
@@ -1245,7 +1247,7 @@ SetCallArguments(JSContext *cx, JSObject *obj, jsid id, Value *vp)
 }
 
 JSBool
-js_GetCallArg(JSContext *cx, JSObject *obj, jsid id, Value *vp)
+GetCallArg(JSContext *cx, JSObject *obj, jsid id, Value *vp)
 {
     return CallPropertyOp(cx, obj, id, vp, JSCPK_ARG);
 }
@@ -1269,13 +1271,13 @@ SetFlatUpvar(JSContext *cx, JSObject *obj, jsid id, Value *vp)
 }
 
 JSBool
-js_GetCallVar(JSContext *cx, JSObject *obj, jsid id, Value *vp)
+GetCallVar(JSContext *cx, JSObject *obj, jsid id, Value *vp)
 {
     return CallPropertyOp(cx, obj, id, vp, JSCPK_VAR);
 }
 
 JSBool
-js_GetCallVarChecked(JSContext *cx, JSObject *obj, jsid id, Value *vp)
+GetCallVarChecked(JSContext *cx, JSObject *obj, jsid id, Value *vp)
 {
     if (!CallPropertyOp(cx, obj, id, vp, JSCPK_VAR))
         return false;
@@ -1288,6 +1290,8 @@ SetCallVar(JSContext *cx, JSObject *obj, jsid id, Value *vp)
 {
     return CallPropertyOp(cx, obj, id, vp, JSCPK_VAR, true);
 }
+
+} // namespace js
 
 #if JS_TRACER
 JSBool JS_FASTCALL
@@ -1806,15 +1810,17 @@ js_XDRFunctionObject(JSXDRState *xdr, JSObject **objp)
     if (xdr->mode == JSXDR_ENCODE) {
         fun = GET_FUNCTION_PRIVATE(cx, *objp);
         if (!FUN_INTERPRETED(fun)) {
-            JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
-                                 JSMSG_NOT_SCRIPTED_FUNCTION,
-                                 JS_GetFunctionName(fun));
+            JSAutoByteString funNameBytes;
+            if (const char *name = GetFunctionNameBytes(cx, fun, &funNameBytes)) {
+                JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_NOT_SCRIPTED_FUNCTION,
+                                     name);
+            }
             return false;
         }
         if (fun->u.i.wrapper) {
-            JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
-                                 JSMSG_XDR_CLOSURE_WRAPPER,
-                                 JS_GetFunctionName(fun));
+            JSAutoByteString funNameBytes;
+            if (const char *name = GetFunctionNameBytes(cx, fun, &funNameBytes))
+                JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_XDR_CLOSURE_WRAPPER, name);
             return false;
         }
         JS_ASSERT((fun->u.i.wrapper & ~1U) == 0);
@@ -2060,7 +2066,7 @@ fun_finalize(JSContext *cx, JSObject *obj)
      * very early.
      */
     if (FUN_INTERPRETED(fun) && fun->u.i.script)
-        js_DestroyScript(cx, fun->u.i.script);
+        js_DestroyScriptFromGC(cx, fun->u.i.script, NULL);
 }
 
 int
@@ -2188,13 +2194,12 @@ js_fun_call(JSContext *cx, uintN argc, Value *vp)
     if (!js_IsCallable(fval)) {
         JSString *str = js_ValueToString(cx, fval);
         if (str) {
-            const char *bytes = js_GetStringBytes(cx, str);
-
-            if (bytes) {
+            JSAutoByteString bytes(cx, str);
+            if (!!bytes) {
                 JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
                                      JSMSG_INCOMPATIBLE_PROTO,
                                      js_Function_str, js_call_str,
-                                     bytes);
+                                     bytes.ptr());
             }
         }
         return JS_FALSE;
@@ -2238,11 +2243,12 @@ js_fun_apply(JSContext *cx, uintN argc, Value *vp)
     Value fval = vp[1];
     if (!js_IsCallable(fval)) {
         if (JSString *str = js_ValueToString(cx, fval)) {
-            if (const char *bytes = js_GetStringBytes(cx, str)) {
+            JSAutoByteString bytes(cx, str);
+            if (!!bytes) {
                 JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
                                      JSMSG_INCOMPATIBLE_PROTO,
                                      js_Function_str, js_apply_str,
-                                     bytes);
+                                     bytes.ptr());
             }
         }
         return false;
@@ -2414,10 +2420,11 @@ fun_bind(JSContext *cx, uintN argc, Value *vp)
     /* Step 2. */
     if (!target->isCallable()) {
         if (JSString *str = js_ValueToString(cx, vp[1])) {
-            if (const char *bytes = js_GetStringBytes(cx, str)) {
+            JSAutoByteString bytes(cx, str);
+            if (!!bytes) {
                 JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
                                      JSMSG_INCOMPATIBLE_PROTO,
-                                     js_Function_str, "bind", bytes);
+                                     js_Function_str, "bind", bytes.ptr());
             }
         }
         return false;
@@ -2636,12 +2643,14 @@ Function(JSContext *cx, uintN argc, Value *vp)
 
                 /* Check for a duplicate parameter name. */
                 if (fun->lookupLocal(cx, atom, NULL) != JSLOCAL_NONE) {
-                    const char *name;
-
-                    name = js_AtomToPrintableString(cx, atom);
-                    if (!name && ReportCompileErrorNumber(cx, &ts, NULL,
-                                                          JSREPORT_WARNING | JSREPORT_STRICT,
-                                                          JSMSG_DUPLICATE_FORMAL, name)) {
+                    JSAutoByteString name;
+                    if (!js_AtomToPrintableString(cx, atom, &name)) {
+                        state = BAD;
+                        goto after_args;
+                    }
+                    if (!ReportCompileErrorNumber(cx, &ts, NULL,
+                                                  JSREPORT_WARNING | JSREPORT_STRICT,
+                                                  JSMSG_DUPLICATE_FORMAL, name.ptr())) {
                         goto after_args;
                     }
                 }
@@ -3065,7 +3074,7 @@ JSFunction::lastArg() const
 {
     const Shape *shape = lastVar();
     if (u.i.nvars != 0) {
-        while (shape->previous() && shape->getter() != js_GetCallArg)
+        while (shape->previous() && shape->getter() != GetCallArg)
             shape = shape->previous();
     }
     return shape;
@@ -3102,7 +3111,7 @@ JSFunction::addLocal(JSContext *cx, JSAtom *atom, JSLocalKind kind)
         JS_ASSERT(u.i.nupvars == 0);
 
         indexp = &nargs;
-        getter = js_GetCallArg;
+        getter = GetCallArg;
         setter = SetCallArg;
         slot += nargs;
     } else if (kind == JSLOCAL_UPVAR) {
@@ -3114,7 +3123,7 @@ JSFunction::addLocal(JSContext *cx, JSAtom *atom, JSLocalKind kind)
         JS_ASSERT(u.i.nupvars == 0);
 
         indexp = &u.i.nvars;
-        getter = js_GetCallVar;
+        getter = GetCallVar;
         setter = SetCallVar;
         if (kind == JSLOCAL_CONST)
             attrs |= JSPROP_READONLY;
@@ -3163,7 +3172,7 @@ JSFunction::addLocal(JSContext *cx, JSAtom *atom, JSLocalKind kind)
     }
 
     if (findArgInsertionPoint) {
-        while (parent->parent && parent->getter() != js_GetCallArg) {
+        while (parent->parent && parent->getter() != GetCallArg) {
             ++parent->slot;
             JS_ASSERT(parent->slot == parent->slotSpan);
             ++parent->slotSpan;
@@ -3192,7 +3201,7 @@ JSFunction::lookupLocal(JSContext *cx, JSAtom *atom, uintN *indexp)
     if (shape) {
         JSLocalKind localKind;
 
-        if (shape->getter() == js_GetCallArg)
+        if (shape->getter() == GetCallArg)
             localKind = JSLOCAL_ARG;
         else if (shape->getter() == GetFlatUpvar)
             localKind = JSLOCAL_UPVAR;
@@ -3236,7 +3245,7 @@ JSFunction::getLocalNameArray(JSContext *cx, JSArenaPool *pool)
         uintN index = uint16(shape.shortid);
         jsuword constFlag = 0;
 
-        if (shape.getter() == js_GetCallArg) {
+        if (shape.getter() == GetCallArg) {
             JS_ASSERT(index < nargs);
         } else if (shape.getter() == GetFlatUpvar) {
             JS_ASSERT(index < u.i.nupvars);
@@ -3253,7 +3262,7 @@ JSFunction::getLocalNameArray(JSContext *cx, JSArenaPool *pool)
             atom = JSID_TO_ATOM(shape.id);
         } else {
             JS_ASSERT(JSID_IS_INT(shape.id));
-            JS_ASSERT(shape.getter() == js_GetCallArg);
+            JS_ASSERT(shape.getter() == GetCallArg);
             atom = NULL;
         }
 
