@@ -243,9 +243,11 @@ RegExp::handlePCREError(JSContext *cx, int error)
 bool
 RegExp::parseFlags(JSContext *cx, JSString *flagStr, uint32 &flagsOut)
 {
-    const jschar *s;
-    size_t n;
-    flagStr->getCharsAndLength(s, n);
+    size_t n = flagStr->length();
+    const jschar *s = flagStr->getChars(cx);
+    if (!s)
+        return false;
+
     flagsOut = 0;
     for (size_t i = 0; i < n; i++) {
 #define HANDLE_FLAG(__name)                                             \
@@ -401,15 +403,15 @@ DEFINE_STATIC_GETTER(static_lastParen_getter,    return res->createLastParen(cx,
 DEFINE_STATIC_GETTER(static_leftContext_getter,  return res->createLeftContext(cx, Valueify(vp)))
 DEFINE_STATIC_GETTER(static_rightContext_getter, return res->createRightContext(cx, Valueify(vp)))
 
-DEFINE_STATIC_GETTER(static_paren1_getter,       return res->createParen(cx, 0, Valueify(vp)))
-DEFINE_STATIC_GETTER(static_paren2_getter,       return res->createParen(cx, 1, Valueify(vp)))
-DEFINE_STATIC_GETTER(static_paren3_getter,       return res->createParen(cx, 2, Valueify(vp)))
-DEFINE_STATIC_GETTER(static_paren4_getter,       return res->createParen(cx, 3, Valueify(vp)))
-DEFINE_STATIC_GETTER(static_paren5_getter,       return res->createParen(cx, 4, Valueify(vp)))
-DEFINE_STATIC_GETTER(static_paren6_getter,       return res->createParen(cx, 5, Valueify(vp)))
-DEFINE_STATIC_GETTER(static_paren7_getter,       return res->createParen(cx, 6, Valueify(vp)))
-DEFINE_STATIC_GETTER(static_paren8_getter,       return res->createParen(cx, 7, Valueify(vp)))
-DEFINE_STATIC_GETTER(static_paren9_getter,       return res->createParen(cx, 8, Valueify(vp)))
+DEFINE_STATIC_GETTER(static_paren1_getter,       return res->createParen(cx, 1, Valueify(vp)))
+DEFINE_STATIC_GETTER(static_paren2_getter,       return res->createParen(cx, 2, Valueify(vp)))
+DEFINE_STATIC_GETTER(static_paren3_getter,       return res->createParen(cx, 3, Valueify(vp)))
+DEFINE_STATIC_GETTER(static_paren4_getter,       return res->createParen(cx, 4, Valueify(vp)))
+DEFINE_STATIC_GETTER(static_paren5_getter,       return res->createParen(cx, 5, Valueify(vp)))
+DEFINE_STATIC_GETTER(static_paren6_getter,       return res->createParen(cx, 6, Valueify(vp)))
+DEFINE_STATIC_GETTER(static_paren7_getter,       return res->createParen(cx, 7, Valueify(vp)))
+DEFINE_STATIC_GETTER(static_paren8_getter,       return res->createParen(cx, 8, Valueify(vp)))
+DEFINE_STATIC_GETTER(static_paren9_getter,       return res->createParen(cx, 9, Valueify(vp)))
 
 #define DEFINE_STATIC_SETTER(name, code)                                        \
     static JSBool                                                               \
@@ -578,9 +580,12 @@ js_regexp_toString(JSContext *cx, JSObject *obj, Value *vp)
         return true;
     }
 
-    const jschar *source;
-    size_t length;
-    re->getSource()->getCharsAndLength(source, length);
+    JSLinearString *src = re->getSource();
+    size_t length = src->length();
+    const jschar *source = src->getChars(cx);
+    if (!source)
+        return false;
+
     if (length == 0) {
         source = empty_regexp_ucstr;
         length = JS_ARRAY_LENGTH(empty_regexp_ucstr) - 1;
@@ -632,9 +637,11 @@ regexp_toString(JSContext *cx, uintN argc, Value *vp)
 static JSString *
 EscapeNakedForwardSlashes(JSContext *cx, JSString *unescaped)
 {
-    const jschar *oldChars;
-    size_t oldLen;
-    unescaped->getCharsAndLength(oldChars, oldLen);
+    size_t oldLen = unescaped->length();
+    const jschar *oldChars = unescaped->getChars(cx);
+    if (!oldChars)
+        return NULL;
+
     js::Vector<jschar, 128> newChars(cx);
     for (const jschar *it = oldChars; it < oldChars + oldLen; ++it) {
         if (*it == '/' && (it == oldChars || it[-1] != '\\')) {
@@ -652,9 +659,9 @@ EscapeNakedForwardSlashes(JSContext *cx, JSString *unescaped)
 
     if (newChars.length()) {
         size_t len = newChars.length();
-        jschar *chars = newChars.extractRawBuffer();
-        if (!chars)
+        if (!newChars.append('\0'))
             return NULL;
+        jschar *chars = newChars.extractRawBuffer();
         JSString *escaped = js_NewString(cx, chars, len);
         if (!escaped)
             cx->free(chars);

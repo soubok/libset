@@ -115,6 +115,28 @@ JS_SetRuntimeDebugMode(JSRuntime *rt, JSBool debug)
     rt->debugMode = debug;
 }
 
+static void
+PurgeCallICs(JSContext *cx, JSScript *start)
+{
+#ifdef JS_METHODJIT
+    for (JSScript *script = start;
+         &script->links != &cx->compartment->scripts;
+         script = (JSScript *)script->links.next)
+    {
+        // Debug mode does not use call ICs.
+        if (script->debugMode)
+            continue;
+
+        JS_ASSERT(!IsScriptLive(cx, script));
+
+        if (script->jitNormal)
+            script->jitNormal->nukeScriptDependentICs();
+        if (script->jitCtor)
+            script->jitCtor->nukeScriptDependentICs();
+    }
+#endif
+}
+
 JS_FRIEND_API(JSBool)
 js_SetDebugMode(JSContext *cx, JSBool debug)
 {
@@ -123,7 +145,7 @@ js_SetDebugMode(JSContext *cx, JSBool debug)
     for (JSScript *script = (JSScript *)cx->compartment->scripts.next;
          &script->links != &cx->compartment->scripts;
          script = (JSScript *)script->links.next) {
-        if (script->debugMode != (bool) debug &&
+        if (script->debugMode != !!debug &&
             script->hasJITCode() &&
             !IsScriptLive(cx, script)) {
             /*
@@ -134,6 +156,12 @@ js_SetDebugMode(JSContext *cx, JSBool debug)
              */
             js::mjit::Recompiler recompiler(cx, script);
             if (!recompiler.recompile()) {
+                /*
+                 * If recompilation failed, we could be in a state where
+                 * remaining compiled scripts hold call IC references that
+                 * have been destroyed by recompilation. Clear those ICs now.
+                 */
+                PurgeCallICs(cx, script);
                 cx->compartment->debugMode = JS_FALSE;
                 return JS_FALSE;
             }
@@ -154,6 +182,30 @@ JS_SetDebugMode(JSContext *cx, JSBool debug)
     return js_SetDebugMode(cx, debug);
 }
 
+JS_FRIEND_API(JSBool)
+js_SetSingleStepMode(JSContext *cx, JSScript *script, JSBool singleStep)
+{
+    if (!script->singleStepMode == !singleStep)
+        return JS_TRUE;
+
+    JS_ASSERT_IF(singleStep, cx->compartment->debugMode);
+
+#ifdef JS_METHODJIT
+    /* request the next recompile to inject single step interrupts */
+    script->singleStepMode = !!singleStep;
+
+    js::mjit::JITScript *jit = script->jitNormal ? script->jitNormal : script->jitCtor;
+    if (jit && script->singleStepMode != jit->singleStepMode) {
+        js::mjit::Recompiler recompiler(cx, script);
+        if (!recompiler.recompile()) {
+            script->singleStepMode = !singleStep;
+            return JS_FALSE;
+        }
+    }
+#endif
+    return JS_TRUE;
+}
+
 static JSBool
 CheckDebugMode(JSContext *cx)
 {
@@ -168,6 +220,15 @@ CheckDebugMode(JSContext *cx)
                                      NULL, JSMSG_NEED_DEBUG_MODE);
     }
     return debugMode;
+}
+
+JS_PUBLIC_API(JSBool)
+JS_SetSingleStepMode(JSContext *cx, JSScript *script, JSBool singleStep)
+{
+    if (!CheckDebugMode(cx))
+        return JS_FALSE;
+
+    return js_SetSingleStepMode(cx, script, singleStep);
 }
 
 /*
@@ -236,12 +297,6 @@ JS_SetTrap(JSContext *cx, JSScript *script, jsbytecode *pc,
 
     if (!CheckDebugMode(cx))
         return JS_FALSE;
-
-    if (script == JSScript::emptyScript()) {
-        JS_ReportErrorFlagsAndNumber(cx, JSREPORT_ERROR, js_GetErrorMessage,
-                                     NULL, JSMSG_READ_ONLY, "empty script");
-        return JS_FALSE;
-    }
 
     JS_ASSERT((JSOp) *pc != JSOP_TRAP);
     junk = NULL;
@@ -1430,7 +1485,7 @@ JS_EvaluateUCInStackFrame(JSContext *cx, JSStackFrame *fp,
      * variable references made by this frame.
      */
     JSScript *script = Compiler::compileScript(cx, scobj, fp, js_StackFramePrincipals(cx, fp),
-                                               TCF_COMPILE_N_GO, chars, length, NULL,
+                                               TCF_COMPILE_N_GO, chars, length,
                                                filename, lineno, NULL,
                                                UpvarCookie::UPVAR_LEVEL_LIMIT);
 
@@ -1733,7 +1788,7 @@ JS_GetScriptTotalSize(JSContext *cx, JSScript *script)
         continue;
     nbytes += (sn - notes + 1) * sizeof *sn;
 
-    if (script->objectsOffset != 0) {
+    if (JSScript::isValidOffset(script->objectsOffset)) {
         objarray = script->objects();
         i = objarray->length;
         nbytes += sizeof *objarray + i * sizeof objarray->vector[0];
@@ -1742,7 +1797,7 @@ JS_GetScriptTotalSize(JSContext *cx, JSScript *script)
         } while (i != 0);
     }
 
-    if (script->regexpsOffset != 0) {
+    if (JSScript::isValidOffset(script->regexpsOffset)) {
         objarray = script->regexps();
         i = objarray->length;
         nbytes += sizeof *objarray + i * sizeof objarray->vector[0];
@@ -1751,7 +1806,7 @@ JS_GetScriptTotalSize(JSContext *cx, JSScript *script)
         } while (i != 0);
     }
 
-    if (script->trynotesOffset != 0) {
+    if (JSScript::isValidOffset(script->trynotesOffset)) {
         nbytes += sizeof(JSTryNoteArray) +
             script->trynotes()->length * sizeof(JSTryNote);
     }

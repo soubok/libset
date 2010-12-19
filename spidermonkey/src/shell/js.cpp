@@ -458,9 +458,7 @@ Process(JSContext *cx, JSObject *obj, char *filename, JSBool forceTTY)
             JS_DestroyScript(cx, script);
         }
 
-        if (file != stdin)
-            fclose(file);
-        return;
+        goto cleanup;
     }
 
     /* It's an interactive filehandle; drop into read-eval-print loop. */
@@ -491,7 +489,7 @@ Process(JSContext *cx, JSObject *obj, char *filename, JSBool forceTTY)
                 if (errno) {
                     JS_ReportError(cx, strerror(errno));
                     free(buffer);
-                    return;
+                    goto cleanup;
                 }
                 hitEOF = JS_TRUE;
                 break;
@@ -512,7 +510,7 @@ Process(JSContext *cx, JSObject *obj, char *filename, JSBool forceTTY)
                         free(buffer);
                         free(line);
                         JS_ReportOutOfMemory(cx);
-                        return;
+                        goto cleanup;
                     }
                     buffer = newBuf;
                 }
@@ -566,6 +564,7 @@ Process(JSContext *cx, JSObject *obj, char *filename, JSBool forceTTY)
 
     free(buffer);
     fprintf(gOutFile, "\n");
+cleanup:
     if (file != stdin)
         fclose(file);
     return;
@@ -1014,11 +1013,10 @@ Options(JSContext *cx, uintN argc, jsval *vp)
         JS_ReportOutOfMemory(cx);
         return JS_FALSE;
     }
-    str = JS_NewString(cx, names, strlen(names));
-    if (!str) {
-        free(names);
+    str = JS_NewStringCopyZ(cx, names);
+    free(names);
+    if (!str)
         return JS_FALSE;
-    }
     *vp = STRING_TO_JSVAL(str);
     return JS_TRUE;
 }
@@ -1137,11 +1135,10 @@ ReadLine(JSContext *cx, uintN argc, jsval *vp)
      * Turn buf into a JSString. Note that buflength includes the trailing null
      * character.
      */
-    str = JS_NewString(cx, buf, sawNewline ? buflength - 1 : buflength);
-    if (!str) {
-        JS_free(cx, buf);
+    str = JS_NewStringCopyN(cx, buf, sawNewline ? buflength - 1 : buflength);
+    JS_free(cx, buf);
+    if (!str)
         return JS_FALSE;
-    }
 
     *vp = STRING_TO_JSVAL(str);
     return JS_TRUE;
@@ -1250,7 +1247,10 @@ AssertEq(JSContext *cx, uintN argc, jsval *vp)
     }
 
     jsval *argv = JS_ARGV(cx, vp);
-    if (!JS_SameValue(cx, argv[0], argv[1])) {
+    JSBool same;
+    if (!JS_SameValue(cx, argv[0], argv[1], &same))
+        return JS_FALSE;
+    if (!same) {
         JSAutoByteString bytes0, bytes1;
         const char *actual = ToSource(cx, &argv[0], &bytes0);
         const char *expected = ToSource(cx, &argv[1], &bytes1);
@@ -1341,6 +1341,10 @@ GCParameter(JSContext *cx, uintN argc, jsval *vp)
         vp[2] = STRING_TO_JSVAL(str);
     }
 
+    JSFlatString *flatStr = JS_FlattenString(cx, str);
+    if (!flatStr)
+        return JS_FALSE;
+
     size_t paramIndex = 0;
     for (;; paramIndex++) {
         if (paramIndex == JS_ARRAY_LENGTH(paramMap)) {
@@ -1350,7 +1354,7 @@ GCParameter(JSContext *cx, uintN argc, jsval *vp)
                            "gcNumber or gcTriggerFactor");
             return JS_FALSE;
         }
-        if (JS_MatchStringAndAscii(str, paramMap[paramIndex].name))
+        if (JS_FlatStringEqualsAscii(flatStr, paramMap[paramIndex].name))
             break;
     }
     JSGCParamKey param = paramMap[paramIndex].param;
@@ -1497,8 +1501,11 @@ CountHeap(JSContext *cx, uintN argc, jsval *vp)
         str = JS_ValueToString(cx, JS_ARGV(cx, vp)[1]);
         if (!str)
             return JS_FALSE;
+        JSFlatString *flatStr = JS_FlattenString(cx, str);
+        if (!flatStr)
+            return JS_FALSE;
         for (i = 0; ;) {
-            if (JS_MatchStringAndAscii(str, traceKindNames[i].name)) {
+            if (JS_FlatStringEqualsAscii(flatStr, traceKindNames[i].name)) {
                 traceKind = traceKindNames[i].kind;
                 break;
             }
@@ -1669,8 +1676,13 @@ TrapHandler(JSContext *cx, JSScript *script, jsbytecode *pc, jsval *rval,
 {
     JSString *str = JSVAL_TO_STRING(closure);
     JSStackFrame *caller = JS_GetScriptedCaller(cx, NULL);
-    if (!JS_EvaluateUCInStackFrame(cx, caller,
-                                   JS_GetStringChars(str), JS_GetStringLength(str),
+
+    size_t length;
+    const jschar *chars = JS_GetStringCharsAndLength(cx, str, &length);
+    if (!chars)
+        return JSTRAP_ERROR;
+
+    if (!JS_EvaluateUCInStackFrame(cx, caller, chars, length,
                                    caller->script()->filename,
                                    caller->script()->lineno,
                                    rval)) {
@@ -1978,7 +1990,7 @@ TryNotes(JSContext *cx, JSScript *script)
 {
     JSTryNote *tn, *tnlimit;
 
-    if (script->trynotesOffset == 0)
+    if (!JSScript::isValidOffset(script->trynotesOffset))
         return JS_TRUE;
 
     tn = script->trynotes()->vector;
@@ -2056,7 +2068,7 @@ DisassembleValue(JSContext *cx, jsval v, bool lines, bool recursive)
     SrcNotes(cx, script);
     TryNotes(cx, script);
 
-    if (recursive && script->objectsOffset != 0) {
+    if (recursive && JSScript::isValidOffset(script->objectsOffset)) {
         JSObjectArray *objects = script->objects();
         for (uintN i = 0; i != objects->length; ++i) {
             JSObject *obj = objects->vector[i];
@@ -2081,17 +2093,32 @@ Disassemble(JSContext *cx, uintN argc, jsval *vp)
     bool lines = false, recursive = false;
     while (argc > 0 && JSVAL_IS_STRING(argv[0])) {
         JSString *str = JSVAL_TO_STRING(argv[0]);
-        lines |= !!JS_MatchStringAndAscii(str, "-l");
-        recursive |= !!JS_MatchStringAndAscii(str, "-r");
+        JSFlatString *flatStr = JS_FlattenString(cx, str);
+        if (!flatStr)
+            return JS_FALSE;
+        lines |= JS_FlatStringEqualsAscii(flatStr, "-l");
+        recursive |= JS_FlatStringEqualsAscii(flatStr, "-r");
         if (!lines && !recursive)
             break;
         argv++, argc--;
     }
 
-    for (uintN i = 0; i < argc; i++) {
-        if (!DisassembleValue(cx, argv[i], lines, recursive))
-            return false;
+    if (argc == 0) {
+        /* Without arguments, disassemble the current script. */
+        if (JSStackFrame *frame = JS_GetScriptedCaller(cx, NULL)) {
+            JSScript *script = JS_GetFrameScript(cx, frame);
+            if (!js_Disassemble(cx, script, lines, stdout))
+                return false;
+            SrcNotes(cx, script);
+            TryNotes(cx, script);
+        }
+    } else {
+        for (uintN i = 0; i < argc; i++) {
+            if (!DisassembleValue(cx, argv[i], lines, recursive))
+                return false;
+        }
     }
+
     JS_SET_RVAL(cx, vp, JSVAL_VOID);
     return true;
 }
@@ -2129,11 +2156,6 @@ DisassFile(JSContext *cx, uintN argc, jsval *vp)
     JS_SetOptions(cx, oldopts);
     if (!script)
         return JS_FALSE;
-
-    if (script->isEmpty()) {
-        JS_SET_RVAL(cx, vp, JSVAL_VOID);
-        return JS_TRUE;
-    }
 
     JSObject *obj = JS_NewScriptObject(cx, script);
     if (!obj)
@@ -2315,13 +2337,16 @@ DumpStats(JSContext *cx, uintN argc, jsval *vp)
         if (!str)
             return JS_FALSE;
         argv[i] = STRING_TO_JSVAL(str);
-        if (JS_MatchStringAndAscii(str, "arena")) {
+        JSFlatString *flatStr = JS_FlattenString(cx, str);
+        if (!flatStr)
+            return JS_FALSE;
+        if (JS_FlatStringEqualsAscii(flatStr, "arena")) {
 #ifdef JS_ARENAMETER
             JS_DumpArenaStats(stdout);
 #endif
-        } else if (JS_MatchStringAndAscii(str, "atom")) {
+        } else if (JS_FlatStringEqualsAscii(flatStr, "atom")) {
             js_DumpAtoms(cx, gOutFile);
-        } else if (JS_MatchStringAndAscii(str, "global")) {
+        } else if (JS_FlatStringEqualsAscii(flatStr, "global")) {
             DumpScope(cx, cx->globalObject, stdout);
         } else {
             if (!JS_ValueToId(cx, STRING_TO_JSVAL(str), &id))
@@ -2613,17 +2638,20 @@ Clear(JSContext *cx, uintN argc, jsval *vp)
 static JSBool
 Intern(JSContext *cx, uintN argc, jsval *vp)
 {
-    JSString *str;
-
-    str = JS_ValueToString(cx, argc == 0 ? JSVAL_VOID : vp[2]);
+    JSString *str = JS_ValueToString(cx, argc == 0 ? JSVAL_VOID : vp[2]);
     if (!str)
-        return JS_FALSE;
-    if (!JS_InternUCStringN(cx, JS_GetStringChars(str),
-                                JS_GetStringLength(str))) {
-        return JS_FALSE;
-    }
-    *vp = JSVAL_VOID;
-    return JS_TRUE;
+        return false;
+
+    size_t length;
+    const jschar *chars = JS_GetStringCharsAndLength(cx, str, &length);
+    if (!chars)
+        return false;
+
+    if (!JS_InternUCStringN(cx, chars, length))
+        return false;
+
+    JS_SET_RVAL(cx, vp, JSVAL_VOID);
+    return true;
 }
 
 static JSBool
@@ -2844,18 +2872,21 @@ split_getProperty(JSContext *cx, JSObject *obj, jsid id, jsval *vp)
     if (!cpx)
         return JS_TRUE;
 
-    if (JSID_IS_ATOM(id) && JS_MatchStringAndAscii(JSID_TO_STRING(id), "isInner")) {
+    if (JSID_IS_ATOM(id) && JS_FlatStringEqualsAscii(JSID_TO_FLAT_STRING(id), "isInner")) {
         *vp = BOOLEAN_TO_JSVAL(cpx->isInner);
         return JS_TRUE;
     }
 
     if (!cpx->isInner && cpx->inner) {
         if (JSID_IS_ATOM(id)) {
-            JSString *str;
+            JSString *str = JSID_TO_STRING(id);
 
-            str = JSID_TO_STRING(id);
-            return JS_GetUCProperty(cx, cpx->inner, JS_GetStringChars(str),
-                                    JS_GetStringLength(str), vp);
+            size_t length;
+            const jschar *chars = JS_GetStringCharsAndLength(cx, str, &length);
+            if (!chars)
+                return false;
+
+            return JS_GetUCProperty(cx, cpx->inner, chars, length, vp);
         }
         if (JSID_IS_INT(id))
             return JS_GetElement(cx, cpx->inner, JSID_TO_INT(id), vp);
@@ -2872,21 +2903,24 @@ split_setProperty(JSContext *cx, JSObject *obj, jsid id, jsval *vp)
 
     cpx = split_get_private(cx, obj);
     if (!cpx)
-        return JS_TRUE;
+        return true;
     if (!cpx->isInner && cpx->inner) {
         if (JSID_IS_ATOM(id)) {
-            JSString *str;
+            JSString *str = JSID_TO_STRING(id);
 
-            str = JSID_TO_STRING(id);
-            return JS_SetUCProperty(cx, cpx->inner, JS_GetStringChars(str),
-                                    JS_GetStringLength(str), vp);
+            size_t length;
+            const jschar *chars = JS_GetStringCharsAndLength(cx, str, &length);
+            if (!chars)
+                return false;
+
+            return JS_SetUCProperty(cx, cpx->inner, chars, length, vp);
         }
         if (JSID_IS_INT(id))
             return JS_SetElement(cx, cpx->inner, JSID_TO_INT(id), vp);
-        return JS_TRUE;
+        return true;
     }
 
-    return JS_TRUE;
+    return true;
 }
 
 static JSBool
@@ -2971,7 +3005,7 @@ split_resolve(JSContext *cx, JSObject *obj, jsid id, uintN flags, JSObject **obj
 {
     ComplexObject *cpx;
 
-    if (JSID_IS_ATOM(id) && JS_MatchStringAndAscii(JSID_TO_STRING(id), "isInner")) {
+    if (JSID_IS_ATOM(id) && JS_FlatStringEqualsAscii(JSID_TO_FLAT_STRING(id), "isInner")) {
         *objp = obj;
         return JS_DefinePropertyById(cx, obj, id, JSVAL_VOID, NULL, NULL, JSPROP_SHARED);
     }
@@ -3278,8 +3312,11 @@ EvalInContext(JSContext *cx, uintN argc, jsval *vp)
     if (!JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "S / o", &str, &sobj))
         return false;
 
-    const jschar *src = JS_GetStringChars(str);
-    size_t srclen = JS_GetStringLength(str);
+    size_t srclen;
+    const jschar *src = JS_GetStringCharsAndLength(cx, str, &srclen);
+    if (!src)
+        return false;
+
     bool split = false, lazy = false;
     if (srclen == 4) {
         if (src[0] == 'l' && src[1] == 'a' && src[2] == 'z' && src[3] == 'y') {
@@ -3365,7 +3402,12 @@ EvalInFrame(JSContext *cx, uintN argc, jsval *vp)
     if (saveCurrent)
         oldfp = JS_SaveFrameChain(cx);
 
-    JSBool ok = JS_EvaluateUCInStackFrame(cx, fp, str->chars(), str->length(),
+    size_t length;
+    const jschar *chars = JS_GetStringCharsAndLength(cx, str, &length);
+    if (!chars)
+        return JS_FALSE;
+
+    JSBool ok = JS_EvaluateUCInStackFrame(cx, fp, chars, length,
                                           fp->script()->filename,
                                           JS_PCToLineNumber(cx, fp->script(),
                                                             fi.pc()),
@@ -3380,8 +3422,8 @@ EvalInFrame(JSContext *cx, uintN argc, jsval *vp)
 static JSBool
 ShapeOf(JSContext *cx, uintN argc, jsval *vp)
 {
-    jsval v = JS_ARGV(cx, vp)[0];
-    if (!JSVAL_IS_OBJECT(v)) {
+    jsval v;
+    if (argc < 1 || !JSVAL_IS_OBJECT(v = JS_ARGV(cx, vp)[0])) {
         JS_ReportError(cx, "shapeOf: object expected");
         return JS_FALSE;
     }
@@ -4058,7 +4100,7 @@ Parse(JSContext *cx, uintN argc, jsval *vp)
     JSString *scriptContents = JSVAL_TO_STRING(arg0);
     js::Parser parser(cx);
     parser.init(JS_GetStringCharsZ(cx, scriptContents), JS_GetStringLength(scriptContents),
-                NULL, "<string>", 0);
+                "<string>", 0);
     if (!parser.parse(NULL))
         return JS_FALSE;
     JS_SET_RVAL(cx, vp, JSVAL_VOID);
@@ -4132,12 +4174,10 @@ Snarf(JSContext *cx, uintN argc, jsval *vp)
         return ok;
     }
 
-    buf[len] = '\0';
-    str = JS_NewString(cx, buf, len);
-    if (!str) {
-        JS_free(cx, buf);
+    str = JS_NewStringCopyN(cx, buf, len);
+    JS_free(cx, buf);
+    if (!str)
         return JS_FALSE;
-    }
     *vp = STRING_TO_JSVAL(str);
     return JS_TRUE;
 }
@@ -4204,6 +4244,59 @@ Deserialize(JSContext *cx, uintN argc, jsval *vp)
     }
     JS_SET_RVAL(cx, vp, v);
     return true;
+}
+
+JSBool
+SetGlobalPropIf(JSContext *cx, uintN argc, jsval *vp)
+{
+    if (argc != 3) {
+        JS_ReportErrorNumber(cx, my_GetErrorMessage, NULL, JSSMSG_INVALID_ARGS, "setGlobalPropIf");
+        return false;
+    }
+
+    jsval *argv = JS_ARGV(cx, vp);
+
+    JSBool doSet;
+    if (!JS_ValueToBoolean(cx, argv[0], &doSet))
+        return false;
+
+    JS_SET_RVAL(cx, vp, JSVAL_VOID);
+    if (!doSet)
+        return true;
+
+    jsid id;
+    if (!JS_ValueToId(cx, argv[1], &id))
+        return false;
+
+    JSObject *global = JS_GetGlobalForScopeChain(cx);
+    return global && JS_SetPropertyById(cx, global, id, &argv[2]);
+}
+
+JSBool
+DefGlobalPropIf(JSContext *cx, uintN argc, jsval *vp)
+{
+    if (argc != 3) {
+        JS_ReportErrorNumber(cx, my_GetErrorMessage, NULL, JSSMSG_INVALID_ARGS, "setGlobalPropIf");
+        return false;
+    }
+
+    jsval *argv = JS_ARGV(cx, vp);
+
+    JSBool doSet;
+    if (!JS_ValueToBoolean(cx, argv[0], &doSet))
+        return false;
+
+    JS_SET_RVAL(cx, vp, JSVAL_VOID);
+    if (!doSet)
+        return true;
+
+    jsid id;
+    if (!JS_ValueToId(cx, argv[1], &id))
+        return false;
+
+    JSObject *global = JS_GetGlobalForScopeChain(cx);
+    JSBool ignore;
+    return global && JS_DefineOwnProperty(cx, global, id, argv[2], &ignore);
 }
 
 /* We use a mix of JS_FS and JS_FN to test both kinds of natives. */
@@ -4286,7 +4379,7 @@ static JSFunctionSpec shell_functions[] = {
     JS_FN("startTraceVis",  StartTraceVisNative, 1,0),
     JS_FN("stopTraceVis",   StopTraceVisNative,  0,0),
 #endif
-#ifdef DEBUG_ARRAYS
+#ifdef DEBUG
     JS_FN("arrayInfo",      js_ArrayInfo,   1,0),
 #endif
 #ifdef JS_THREADSAFE
@@ -4303,6 +4396,8 @@ static JSFunctionSpec shell_functions[] = {
     JS_FN("wrap",           Wrap,           1,0),
     JS_FN("serialize",      Serialize,      1,0),
     JS_FN("deserialize",    Deserialize,    1,0),
+    JS_FN("setGlobalPropIf",SetGlobalPropIf,3,0),
+    JS_FN("defGlobalPropIf",DefGlobalPropIf,3,0),
     JS_FS_END
 };
 
@@ -4413,7 +4508,7 @@ static const char *const shell_help_messages[] = {
 "startTraceVis(filename)  Start TraceVis recording (stops any current recording)",
 "stopTraceVis()           Stop TraceVis recording",
 #endif
-#ifdef DEBUG_ARRAYS
+#ifdef DEBUG
 "arrayInfo(a1, a2, ...)   Report statistics about arrays",
 #endif
 #ifdef JS_THREADSAFE
@@ -4431,7 +4526,10 @@ static const char *const shell_help_messages[] = {
 "parent(obj)              Returns the parent of obj.\n",
 "wrap(obj)                Wrap an object into a noop wrapper.\n",
 "serialize(sd)            Serialize sd using JS_WriteStructuredClone. Returns a TypedArray.\n",
-"deserialize(a)           Deserialize data generated by serialize.\n"
+"deserialize(a)           Deserialize data generated by serialize.\n",
+"setGlobalPropIf(b,id,v)  If b, get the global object o and perform o[id] = v.\n",
+"defGlobalPropIf(b,id,dsc)If b, get the global object o and perform\n"
+"                         Object.defineProperty(o, id, dsc).\n"
 };
 
 /* Help messages must match shell functions. */
@@ -4486,8 +4584,11 @@ Help(JSContext *cx, uintN argc, jsval *vp)
                 str = NULL;
             }
             if (str) {
+                JSFlatString *flatStr = JS_FlattenString(cx, str);
+                if (!flatStr)
+                    return JS_FALSE;
                 for (j = 0; shell_functions[j].name; j++) {
-                    if (JS_MatchStringAndAscii(str, shell_functions[j].name)) {
+                    if (JS_FlatStringEqualsAscii(flatStr, shell_functions[j].name)) {
                         if (!did_header) {
                             did_header = 1;
                             fputs(shell_help_header, gOutFile);

@@ -510,7 +510,7 @@ NodeBuilder::newNode(ASTType type, TokenPos *pos, JSObject **dst)
 bool
 NodeBuilder::newArray(NodeVector &elts, Value *dst)
 {
-    JSObject *array = js_NewArrayObject(cx, 0, NULL);
+    JSObject *array = NewDenseEmptyArray(cx);
     if (!array)
         return false;
 
@@ -2829,7 +2829,12 @@ reflect_parse(JSContext *cx, uint32 argc, jsval *vp)
                 if (!str)
                     return JS_FALSE;
 
-                filename = js_DeflateString(cx, str->chars(), str->length());
+                size_t length = str->length();
+                const jschar *chars = str->getChars(cx);
+                if (!chars)
+                    return JS_FALSE;
+
+                filename = js_DeflateString(cx, chars, length);
                 if (!filename)
                     return JS_FALSE;
                 filenamep.reset(filename);
@@ -2844,14 +2849,14 @@ reflect_parse(JSContext *cx, uint32 argc, jsval *vp)
         }
     }
 
-    const jschar *chars;
-    size_t length;
-
-    src->getCharsAndLength(chars, length);
+    size_t length = src->length();
+    const jschar *chars = src->getChars(cx);
+    if (!chars)
+        return JS_FALSE;
 
     Parser parser(cx);
 
-    if (!parser.init(chars, length, NULL, filename, lineno))
+    if (!parser.init(chars, length, filename, lineno))
         return JS_FALSE;
 
     JSParseNode *pn = parser.parse(NULL);

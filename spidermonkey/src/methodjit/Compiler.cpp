@@ -42,6 +42,7 @@
 #include "MethodJIT.h"
 #include "jsnum.h"
 #include "jsbool.h"
+#include "jsemit.h"
 #include "jsiter.h"
 #include "Compiler.h"
 #include "StubCalls.h"
@@ -122,7 +123,6 @@ mjit::Compiler::Compiler(JSContext *cx, JSStackFrame *fp)
 CompileStatus
 mjit::Compiler::compile()
 {
-    JS_ASSERT(!script->isEmpty());
     JS_ASSERT_IF(isConstructing, !script->jitCtor);
     JS_ASSERT_IF(!isConstructing, !script->jitNormal);
 
@@ -407,8 +407,15 @@ mjit::Compiler::finishThisUp(JITScript **jitp)
     JSC::LinkBuffer fullCode(result, totalSize);
     JSC::LinkBuffer stubCode(result + masm.size(), stubcc.size());
 
+    size_t nNmapLive = 0;
+    for (size_t i = 0; i < script->length; i++) {
+        analyze::Bytecode *opinfo = analysis->maybeCode(i);
+        if (opinfo && opinfo->safePoint)
+            nNmapLive++;
+    }
+
     size_t totalBytes = sizeof(JITScript) +
-                        sizeof(void *) * script->length +
+                        sizeof(NativeMapEntry) * nNmapLive +
 #if defined JS_MONOIC
                         sizeof(ic::MICInfo) * mics.length() +
                         sizeof(ic::CallICInfo) * callICs.length() +
@@ -434,19 +441,26 @@ mjit::Compiler::finishThisUp(JITScript **jitp)
     jit->code = JSC::MacroAssemblerCodeRef(result, execPool, masm.size() + stubcc.size());
     jit->nCallSites = callSites.length();
     jit->invokeEntry = result;
+    jit->singleStepMode = script->singleStepMode;
 
     /* Build the pc -> ncode mapping. */
-    void **nmap = (void **)cursor;
-    cursor += sizeof(void *) * script->length;
+    NativeMapEntry *nmap = (NativeMapEntry *)cursor;
+    cursor += sizeof(NativeMapEntry) * nNmapLive;
 
-    for (size_t i = 0; i < script->length; i++) {
-        Label L = jumpMap[i];
-        analyze::Bytecode *opinfo = analysis->maybeCode(i);
-        if (opinfo && opinfo->safePoint) {
-            JS_ASSERT(L.isValid());
-            nmap[i] = (uint8 *)(result + masm.distanceOf(L));
+    size_t ix = 0;
+    if (nNmapLive > 0) {
+        for (size_t i = 0; i < script->length; i++) {
+            analyze::Bytecode *opinfo = analysis->maybeCode(i);
+            if (opinfo && opinfo->safePoint) {
+                Label L = jumpMap[i];
+                JS_ASSERT(L.isValid());
+                nmap[ix].bcOff = i;
+                nmap[ix].ncode = (uint8 *)(result + masm.distanceOf(L));
+                ix++;
+            }
         }
     }
+    JS_ASSERT(ix == nNmapLive);
 
     if (fun) {
         jit->arityCheckEntry = stubCode.locationOf(arityLabel).executableAddress();
@@ -773,10 +787,37 @@ mjit::Compiler::finishThisUp(JITScript **jitp)
     JS_ASSERT(size_t(cursor - (uint8*)jit) == totalBytes);
 
     jit->nmap = nmap;
+    jit->nNmapPairs = nNmapLive;
     *jitp = jit;
 
     return Compile_Okay;
 }
+
+class SrcNoteLineScanner {
+    ptrdiff_t offset;
+    jssrcnote *sn;
+
+public:
+    SrcNoteLineScanner(jssrcnote *sn) : offset(0), sn(sn) {}
+
+    bool firstOpInLine(ptrdiff_t relpc) {
+        while ((offset < relpc) && !SN_IS_TERMINATOR(sn)) {
+            offset += SN_DELTA(sn);
+            sn = SN_NEXT(sn);
+        }
+
+        while ((offset == relpc) && !SN_IS_TERMINATOR(sn)) {
+            JSSrcNoteType type = (JSSrcNoteType) SN_TYPE(sn);
+            if (type == SRC_SETLINE || type == SRC_NEWLINE)
+                return true;
+                
+            offset += SN_DELTA(sn);
+            sn = SN_NEXT(sn);
+        }
+
+        return false;
+    }
+};
 
 #ifdef DEBUG
 #define SPEW_OPCODE()                                                         \
@@ -802,16 +843,19 @@ CompileStatus
 mjit::Compiler::generateMethod()
 {
     mjit::AutoScriptRetrapper trapper(cx, script);
+    SrcNoteLineScanner scanner(script->notes());
 
     for (;;) {
         JSOp op = JSOp(*PC);
-        bool trap = (op == JSOP_TRAP);
-
-        if (trap) {
+        int trap = stubs::JSTRAP_NONE;
+        if (op == JSOP_TRAP) {
             if (!trapper.untrap(PC))
                 return Compile_Error;
             op = JSOp(*PC);
+            trap |= stubs::JSTRAP_TRAP;
         }
+        if (script->singleStepMode && scanner.firstOpInLine(PC - script->code))
+            trap |= stubs::JSTRAP_SINGLESTEP;
 
         analyze::Bytecode *opinfo = analysis->maybeCode(PC);
 
@@ -837,7 +881,7 @@ mjit::Compiler::generateMethod()
 
         if (trap) {
             prepareStubCall(Uses(0));
-            masm.move(ImmPtr(PC), Registers::ArgReg1);
+            masm.move(Imm32(trap), Registers::ArgReg1);
             Call cl = emitStubCall(JS_FUNC_TO_DATA_PTR(void *, stubs::Trap));
             InternalCallSite site(masm.callReturnOffset(cl), PC,
                                   CallSite::MAGIC_TRAP_ID, true, false);
@@ -2177,8 +2221,12 @@ mjit::Compiler::fixPrimitiveReturn(Assembler *masm, FrameEntry *fe)
     bool ool = (masm != &this->masm);
     Address thisv(JSFrameReg, JSStackFrame::offsetOfThis(fun));
 
-    // Easy cases - no return value, or known primitive, so just return thisv.
-    if (!fe || (fe->isTypeKnown() && fe->getKnownType() != JSVAL_TYPE_OBJECT)) {
+    // We can just load |thisv| if either of the following is true:
+    //  (1) There is no explicit return value, AND fp->rval is not used.
+    //  (2) There is an explicit return value, and it's known to be primitive.
+    if ((!fe && !analysis->usesReturnValue()) ||
+        (fe && fe->isTypeKnown() && fe->getKnownType() != JSVAL_TYPE_OBJECT))
+    {
         if (ool)
             masm->loadValueAsComponents(thisv, JSReturnReg_Type, JSReturnReg_Data);
         else
@@ -2187,7 +2235,7 @@ mjit::Compiler::fixPrimitiveReturn(Assembler *masm, FrameEntry *fe)
     }
 
     // If the type is known to be an object, just load the return value as normal.
-    if (fe->isTypeKnown() && fe->getKnownType() == JSVAL_TYPE_OBJECT) {
+    if (fe && fe->isTypeKnown() && fe->getKnownType() == JSVAL_TYPE_OBJECT) {
         loadReturnValue(masm, fe);
         return;
     }
@@ -2782,7 +2830,8 @@ mjit::Compiler::compareTwoValues(JSContext *cx, JSOp op, const Value &lhs, const
     JS_ASSERT(rhs.isPrimitive());
 
     if (lhs.isString() && rhs.isString()) {
-        int cmp = js_CompareStrings(lhs.toString(), rhs.toString());
+        int32 cmp;
+        CompareStrings(cx, lhs.toString(), rhs.toString(), &cmp);
         switch (op) {
           case JSOP_LT:
             return cmp < 0;
@@ -2913,8 +2962,8 @@ mjit::Compiler::jsop_length()
             frame.push(v);
         } else {
             RegisterID str = frame.ownRegForData(top);
-            masm.loadPtr(Address(str, offsetof(JSString, mLengthAndFlags)), str);
-            masm.rshiftPtr(Imm32(JSString::FLAGS_LENGTH_SHIFT), str);
+            masm.loadPtr(Address(str, JSString::offsetOfLengthAndFlags()), str);
+            masm.rshiftPtr(Imm32(JSString::LENGTH_SHIFT), str);
             frame.pop();
             frame.pushTypedPayload(JSVAL_TYPE_INT32, str);
         }

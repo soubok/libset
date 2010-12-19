@@ -45,6 +45,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include "jstypes.h"
 #include "jsstdint.h"
 #include "jsarena.h"
@@ -109,6 +110,16 @@
 
 using namespace js;
 using namespace js::gc;
+
+static JSClass dummy_class = {
+    "jdummy",
+    JSCLASS_GLOBAL_FLAGS,
+    JS_PropertyStub,  JS_PropertyStub,
+    JS_PropertyStub,  JS_PropertyStub,
+    JS_EnumerateStub, JS_ResolveStub,
+    JS_ConvertStub,   NULL,
+    JSCLASS_NO_OPTIONAL_MEMBERS
+};
 
 class AutoVersionAPI
 {
@@ -200,6 +211,13 @@ JS_PUBLIC_API(jsval)
 JS_GetEmptyStringValue(JSContext *cx)
 {
     return STRING_TO_JSVAL(cx->runtime->emptyString);
+}
+
+JS_PUBLIC_API(JSString *)
+JS_GetEmptyString(JSRuntime *rt)
+{
+    JS_ASSERT(rt->state == JSRTS_UP);
+    return rt->emptyString;
 }
 
 static JSBool
@@ -563,17 +581,17 @@ JS_GetTypeName(JSContext *cx, JSType type)
 }
 
 JS_PUBLIC_API(JSBool)
-JS_StrictlyEqual(JSContext *cx, jsval v1, jsval v2)
+JS_StrictlyEqual(JSContext *cx, jsval v1, jsval v2, JSBool *equal)
 {
     assertSameCompartment(cx, v1, v2);
-    return StrictlyEqual(cx, Valueify(v1), Valueify(v2));
+    return StrictlyEqual(cx, Valueify(v1), Valueify(v2), equal);
 }
 
 JS_PUBLIC_API(JSBool)
-JS_SameValue(JSContext *cx, jsval v1, jsval v2)
+JS_SameValue(JSContext *cx, jsval v1, jsval v2, JSBool *same)
 {
     assertSameCompartment(cx, v1, v2);
-    return SameValue(Valueify(v1), Valueify(v2), cx);
+    return SameValue(cx, Valueify(v1), Valueify(v2), same);
 }
 
 /************************************************************************/
@@ -634,10 +652,6 @@ JSRuntime::init(uint32 maxbytes)
         return false;
 #endif
 
-    deflatedStringCache = new js::DeflatedStringCache();
-    if (!deflatedStringCache || !deflatedStringCache->init())
-        return false;
-
     wrapObjectCallback = js::TransparentObjectWrapper;
 
 #ifdef JS_THREADSAFE
@@ -683,11 +697,6 @@ JSRuntime::~JSRuntime()
     js_FreeRuntimeScriptState(this);
     js_FinishAtomState(this);
 
-    /*
-     * Finish the deflated string cache after the last GC and after
-     * calling js_FinishAtomState, which finalizes strings.
-     */
-    delete deflatedStringCache;
 #if ENABLE_YARR_JIT
     delete regExpAllocator;
 #endif
@@ -943,6 +952,17 @@ JS_ResumeRequest(JSContext *cx, jsrefcount saveDepth)
 #endif
 }
 
+JS_PUBLIC_API(JSBool)
+JS_IsInRequest(JSContext *cx)
+{
+#ifdef JS_THREADSAFE
+    JS_ASSERT(CURRENT_THREAD_IS_ME(cx->thread));
+    return JS_THREAD_DATA(cx)->requestDepth != 0;
+#else
+    return false;
+#endif
+}
+
 JS_PUBLIC_API(void)
 JS_Lock(JSRuntime *rt)
 {
@@ -1159,6 +1179,22 @@ JS_EnterCrossCompartmentCall(JSContext *cx, JSObject *target)
     return reinterpret_cast<JSCrossCompartmentCall *>(call);
 }
 
+JS_PUBLIC_API(JSCrossCompartmentCall *)
+JS_EnterCrossCompartmentCallScript(JSContext *cx, JSScript *target)
+{
+    CHECK_REQUEST(cx);
+
+    JS_ASSERT(target);
+    JSObject *scriptObject = target->u.object;
+    if (!scriptObject) {
+        SwitchToCompartment sc(cx, target->compartment);
+        scriptObject = JS_NewGlobalObject(cx, &dummy_class);
+        if (!scriptObject)
+            return NULL;        
+    }
+    return JS_EnterCrossCompartmentCall(cx, scriptObject);
+}
+
 JS_PUBLIC_API(void)
 JS_LeaveCrossCompartmentCall(JSCrossCompartmentCall *call)
 {
@@ -1178,6 +1214,18 @@ JSAutoEnterCompartment::enter(JSContext *cx, JSObject *target)
     }
     call = JS_EnterCrossCompartmentCall(cx, target);
     return call != NULL;
+}
+
+bool
+JSAutoEnterCompartment::enter(JSContext *cx, JSScript *target)
+{
+    JS_ASSERT(!call);
+    if (cx->compartment == target->compartment) {
+        call = reinterpret_cast<JSCrossCompartmentCall*>(1);
+        return true;
+    }
+    call = JS_EnterCrossCompartmentCallScript(cx, target);
+    return call != NULL;    
 }
 
 void
@@ -1217,31 +1265,29 @@ JS_WrapValue(JSContext *cx, jsval *vp)
 }
 
 JS_PUBLIC_API(JSObject *)
-JS_TransplantWrapper(JSContext *cx, JSObject *wrapper, JSObject *target)
+JS_TransplantObject(JSContext *cx, JSObject *origobj, JSObject *target)
 {
-    JS_ASSERT(wrapper->isWrapper());
-
-    /*
-     * This function is called when a window is navigating. In that case, we
-     * need to "move" the window from wrapper's compartment to target's
-     * compartment.
-     */
+     // This function is called when an object moves between two different
+     // compartments. In that case, we need to "move" the window from origobj's
+     // compartment to target's compartment.
     JSCompartment *destination = target->getCompartment();
-    if (wrapper->getCompartment() == destination) {
-        // If the wrapper is in the same compartment as the destination, then
-        // we know that we won't find wrapper in the destination's cross
-        // compartment map and that the same object will continue to work.
-        if (!wrapper->swap(cx, target))
+    if (origobj->getCompartment() == destination) {
+        // If the original object is in the same compartment as the
+        // destination, then we know that we won't find wrapper in the
+        // destination's cross compartment map and that the same object
+        // will continue to work.
+        if (!origobj->swap(cx, target))
             return NULL;
-        return wrapper;
+        return origobj;
     }
 
     JSObject *obj;
     WrapperMap &map = destination->crossCompartmentWrappers;
-    Value wrapperv = ObjectValue(*wrapper);
+    Value origv = ObjectValue(*origobj);
 
-    // There might already be a wrapper for the window in the new compartment.
-    if (WrapperMap::Ptr p = map.lookup(wrapperv)) {
+    // There might already be a wrapper for the original object in the new
+    // compartment.
+    if (WrapperMap::Ptr p = map.lookup(origv)) {
         // If there is, make it the primary outer window proxy around the
         // inner (accomplished by swapping target's innards with the old,
         // possibly security wrapper, innards).
@@ -1266,7 +1312,7 @@ JS_TransplantWrapper(JSContext *cx, JSObject *wrapper, JSObject *target)
 
     for (JSCompartment **p = vector.begin(), **end = vector.end(); p != end; ++p) {
         WrapperMap &pmap = (*p)->crossCompartmentWrappers;
-        if (WrapperMap::Ptr wp = pmap.lookup(wrapperv)) {
+        if (WrapperMap::Ptr wp = pmap.lookup(origv)) {
             // We found a wrapper. Remember and root it.
             toTransplant.append(wp->value);
         }
@@ -1276,8 +1322,8 @@ JS_TransplantWrapper(JSContext *cx, JSObject *wrapper, JSObject *target)
         JSObject *wobj = &begin->toObject();
         JSCompartment *wcompartment = wobj->compartment();
         WrapperMap &pmap = wcompartment->crossCompartmentWrappers;
-        JS_ASSERT(pmap.lookup(wrapperv));
-        pmap.remove(wrapperv);
+        JS_ASSERT(pmap.lookup(origv));
+        pmap.remove(origv);
 
         // First, we wrap it in the new compartment. This will return a
         // new wrapper.
@@ -1296,15 +1342,15 @@ JS_TransplantWrapper(JSContext *cx, JSObject *wrapper, JSObject *target)
         pmap.put(targetv, ObjectValue(*wobj));
     }
 
-    // Lastly, update the old outer window proxy to point to the new one.
+    // Lastly, update the original object to point to the new one.
     {
-        AutoCompartment ac(cx, wrapper);
+        AutoCompartment ac(cx, origobj);
         JSObject *tobj = obj;
         if (!ac.enter() || !JS_WrapObject(cx, &tobj))
             return NULL;
-        if (!wrapper->swap(cx, tobj))
+        if (!origobj->swap(cx, tobj))
             return NULL;
-        wrapper->getCompartment()->crossCompartmentWrappers.put(targetv, wrapperv);
+        origobj->getCompartment()->crossCompartmentWrappers.put(targetv, origv);
     }
 
     return obj;
@@ -2191,8 +2237,14 @@ JS_PrintTraceThingInfo(char *buf, size_t bufsize, JSTracer *trc, void *thing, ui
           }
 
           case JSTRACE_STRING:
-            PutEscapedString(buf, bufsize, (JSString *)thing, 0);
+          {
+            JSString *str = (JSString *)thing;
+            if (str->isLinear())
+                PutEscapedString(buf, bufsize, str->assertIsLinear(), 0);
+            else
+                JS_snprintf(buf, bufsize, "<rope: length %d>", (int)str->length());
             break;
+          }
 
 #if JS_HAS_XML_SUPPORT
           case JSTRACE_XML:
@@ -4015,7 +4067,7 @@ JS_NewArrayObject(JSContext *cx, jsint length, jsval *vector)
     CHECK_REQUEST(cx);
     /* NB: jsuint cast does ToUint32. */
     assertSameCompartment(cx, JSValueArray(vector, vector ? (jsuint)length : 0));
-    return js_NewArrayObject(cx, (jsuint)length, Valueify(vector));
+    return NewDenseCopiedArray(cx, (jsuint)length, Valueify(vector));
 }
 
 JS_PUBLIC_API(JSBool)
@@ -4212,15 +4264,6 @@ JS_PUBLIC_API(JSObject *)
 JS_GetFunctionObject(JSFunction *fun)
 {
     return FUN_OBJECT(fun);
-}
-
-JS_PUBLIC_API(const char *)
-JS_GetFunctionName(JSFunction *fun)
-{
-    if (!fun->atom)
-        return js_anonymous_str;
-    const char *byte = js_GetStringBytes(fun->atom);
-    return byte ? byte : "";
 }
 
 JS_PUBLIC_API(JSString *)
@@ -4430,7 +4473,7 @@ JS_CompileUCScriptForPrincipals(JSContext *cx, JSObject *obj, JSPrincipals *prin
 
     uint32 tcflags = JS_OPTIONS_TO_TCFLAGS(cx) | TCF_NEED_MUTABLE_SCRIPT;
     JSScript *script = Compiler::compileScript(cx, obj, NULL, principals, tcflags,
-                                               chars, length, NULL, filename, lineno);
+                                               chars, length, filename, lineno);
     if (script && !js_NewScriptObject(cx, script)) {
         js_DestroyScript(cx, script);
         script = NULL;
@@ -4505,7 +4548,7 @@ JS_BufferIsCompilableUnit(JSContext *cx, JSObject *obj, const char *bytes, size_
     exnState = JS_SaveExceptionState(cx);
     {
         Parser parser(cx);
-        if (parser.init(chars, length, NULL, NULL, 1)) {
+        if (parser.init(chars, length, NULL, 1)) {
             older = JS_SetErrorReporter(cx, NULL);
             if (!parser.parse(obj) &&
                 parser.tokenStream.isUnexpectedEOF()) {
@@ -4522,6 +4565,70 @@ JS_BufferIsCompilableUnit(JSContext *cx, JSObject *obj, const char *bytes, size_
     cx->free(chars);
     JS_RestoreExceptionState(cx, exnState);
     return result;
+}
+
+/* Use the fastest available getc. */
+#if defined(HAVE_GETC_UNLOCKED)
+# define fast_getc getc_unlocked
+#elif defined(HAVE__GETC_NOLOCK)
+# define fast_getc _getc_nolock
+#else
+# define fast_getc getc
+#endif
+
+static JSScript *
+CompileFileHelper(JSContext *cx, JSObject *obj, JSPrincipals *principals, uint32 tcflags,
+                  const char* filename, FILE *fp)
+{
+    struct stat st;
+    int ok = fstat(fileno(fp), &st);
+    if (ok != 0)
+        return NULL;
+
+    jschar *buf = NULL;
+    size_t len = st.st_size;
+    size_t i = 0;
+    JSScript *script;
+
+    /* Read in the whole file, then compile it. */
+    if (fp == stdin) {
+        JS_ASSERT(len == 0);
+        len = 8;  /* start with a small buffer, expand as necessary */
+        int c;
+        bool hitEOF = false;
+        while (!hitEOF) {
+            len *= 2;
+            jschar* tmpbuf = (jschar *) cx->realloc(buf, len * sizeof(jschar));
+            if (!tmpbuf) {
+                cx->free(buf);
+                return NULL;
+            }
+            buf = tmpbuf;
+
+            while (i < len) {
+                c = fast_getc(fp);
+                if (c == EOF) {
+                    hitEOF = true;
+                    break;
+                }
+                buf[i++] = (jschar) (unsigned char) c;
+            }
+        }
+    } else {
+        buf = (jschar *) cx->malloc(len * sizeof(jschar));
+        if (!buf)
+            return NULL;
+
+        int c;
+        while ((c = fast_getc(fp)) != EOF)
+            buf[i++] = (jschar) (unsigned char) c;
+    }
+
+    JS_ASSERT(i <= len);
+    len = i;
+    script = Compiler::compileScript(cx, obj, NULL, principals, tcflags, buf, len, filename, 1);
+    cx->free(buf);
+    return script;
 }
 
 JS_PUBLIC_API(JSScript *)
@@ -4546,8 +4653,8 @@ JS_CompileFile(JSContext *cx, JSObject *obj, const char *filename)
     }
 
     tcflags = JS_OPTIONS_TO_TCFLAGS(cx) | TCF_NEED_MUTABLE_SCRIPT;
-    script = Compiler::compileScript(cx, obj, NULL, NULL, tcflags,
-                                     NULL, 0, fp, filename, 1);
+    script = CompileFileHelper(cx, obj, NULL, tcflags, filename, fp);
+
     if (fp != stdin)
         fclose(fp);
     if (script && !js_NewScriptObject(cx, script)) {
@@ -4569,8 +4676,8 @@ JS_CompileFileHandleForPrincipals(JSContext *cx, JSObject *obj, const char *file
     CHECK_REQUEST(cx);
     assertSameCompartment(cx, obj, principals);
     tcflags = JS_OPTIONS_TO_TCFLAGS(cx) | TCF_NEED_MUTABLE_SCRIPT;
-    script = Compiler::compileScript(cx, obj, NULL, principals, tcflags,
-                                     NULL, 0, file, filename, 1);
+    script = CompileFileHelper(cx, obj, principals, tcflags, filename, file);
+
     if (script && !js_NewScriptObject(cx, script)) {
         js_DestroyScript(cx, script);
         script = NULL;
@@ -4609,7 +4716,6 @@ JS_NewScriptObject(JSContext *cx, JSScript *script)
      * described in the comment for JSScript::u.object.
      */
     JS_ASSERT(script->u.object);
-    JS_ASSERT(script != JSScript::emptyScript());
     return script->u.object;
 }
 
@@ -4826,7 +4932,7 @@ JS_ExecuteScript(JSContext *cx, JSObject *obj, JSScript *script, jsval *rval)
     CHECK_REQUEST(cx);
     assertSameCompartment(cx, obj, script);
     /* This should receive only scripts handed out via the JSAPI. */
-    JS_ASSERT(script == JSScript::emptyScript() || script->u.object);
+    JS_ASSERT(script->u.object);
     ok = Execute(cx, obj, script, NULL, 0, Valueify(rval));
     LAST_FRAME_CHECKS(cx, ok);
     return ok;
@@ -4869,7 +4975,7 @@ JS_EvaluateUCScriptForPrincipals(JSContext *cx, JSObject *obj,
                                      !rval
                                      ? TCF_COMPILE_N_GO | TCF_NO_SCRIPT_RVAL
                                      : TCF_COMPILE_N_GO,
-                                     chars, length, NULL, filename, lineno);
+                                     chars, length, filename, lineno);
     if (!script) {
         LAST_FRAME_CHECKS(cx, script);
         return JS_FALSE;
@@ -5103,42 +5209,11 @@ JS_RestoreFrameChain(JSContext *cx, JSStackFrame *fp)
 }
 
 /************************************************************************/
-
-JS_PUBLIC_API(JSString *)
-JS_NewString(JSContext *cx, char *bytes, size_t nbytes)
-{
-    size_t length = nbytes;
-    jschar *chars;
-    JSString *str;
-
-    CHECK_REQUEST(cx);
-
-    /* Make a UTF-16 vector from the 8-bit char codes in bytes. */
-    chars = js_InflateString(cx, bytes, &length);
-    if (!chars)
-        return NULL;
-
-    /* Free chars (but not bytes, which caller frees on error) if we fail. */
-    str = js_NewString(cx, chars, length);
-    if (!str)
-        cx->free(chars);
-    return str;
-}
-
 JS_PUBLIC_API(JSString *)
 JS_NewStringCopyN(JSContext *cx, const char *s, size_t n)
 {
-    jschar *js;
-    JSString *str;
-
     CHECK_REQUEST(cx);
-    js = js_InflateString(cx, s, &n);
-    if (!js)
-        return NULL;
-    str = js_NewString(cx, js, n);
-    if (!str)
-        cx->free(js);
-    return str;
+    return js_NewStringCopyN(cx, s, n);
 }
 
 JS_PUBLIC_API(JSString *)
@@ -5165,6 +5240,16 @@ JS_PUBLIC_API(JSBool)
 JS_StringHasBeenInterned(JSString *str)
 {
     return str->isAtomized();
+}
+
+JS_PUBLIC_API(JSString *)
+JS_InternJSString(JSContext *cx, JSString *str)
+{
+    CHECK_REQUEST(cx);
+    JSAtom *atom = js_AtomizeString(cx, str, 0);
+    if (!atom)
+        return NULL;
+    return ATOM_TO_STRING(atom);
 }
 
 JS_PUBLIC_API(JSString *)
@@ -5220,45 +5305,6 @@ JS_InternUCString(JSContext *cx, const jschar *s)
     return JS_InternUCStringN(cx, s, js_strlen(s));
 }
 
-JS_PUBLIC_API(jschar *)
-JS_GetStringChars(JSString *str)
-{
-    size_t n, size;
-    jschar *s;
-
-    str->ensureNotRope();
-
-    /*
-     * API botch: we have no cx to report out-of-memory when undepending
-     * strings, so we replace JSString::undepend with explicit malloc call and
-     * ignore its errors.
-     *
-     * If we fail to convert a dependent string into an independent one, our
-     * caller will not be guaranteed a \u0000 terminator as a backstop.  This
-     * may break some clients who already misbehave on embedded NULs.
-     *
-     * The gain of dependent strings, which cure quadratic and cubic growth
-     * rate bugs in string concatenation, is worth this slight loss in API
-     * compatibility.
-     */
-    if (str->isDependent()) {
-        n = str->dependentLength();
-        size = (n + 1) * sizeof(jschar);
-        s = (jschar *) js_malloc(size);
-        if (s) {
-            memcpy(s, str->dependentChars(), n * sizeof *s);
-            s[n] = 0;
-            str->initFlat(s, n);
-        } else {
-            s = str->dependentChars();
-        }
-    } else {
-        str->flatClearExtensible();
-        s = str->flatChars();
-    }
-    return s;
-}
-
 JS_PUBLIC_API(size_t)
 JS_GetStringLength(JSString *str)
 {
@@ -5266,41 +5312,102 @@ JS_GetStringLength(JSString *str)
 }
 
 JS_PUBLIC_API(const jschar *)
-JS_GetStringCharsAndLength(JSString *str, size_t *lengthp)
+JS_GetStringCharsZ(JSContext *cx, JSString *str)
 {
-    *lengthp = str->length();
-    return str->chars();
+    CHECK_REQUEST(cx);
+    assertSameCompartment(cx, str);
+    return str->getCharsZ(cx);
 }
 
 JS_PUBLIC_API(const jschar *)
-JS_GetStringCharsZ(JSContext *cx, JSString *str)
+JS_GetStringCharsZAndLength(JSContext *cx, JSString *str, size_t *plength)
 {
+    CHECK_REQUEST(cx);
     assertSameCompartment(cx, str);
-    return str->undepend(cx);
+    *plength = str->length();
+    return str->getCharsZ(cx);
 }
 
-JS_PUBLIC_API(intN)
-JS_CompareStrings(JSString *str1, JSString *str2)
+JS_PUBLIC_API(const jschar *)
+JS_GetStringCharsAndLength(JSContext *cx, JSString *str, size_t *plength)
 {
-    return js_CompareStrings(str1, str2);
+    CHECK_REQUEST(cx);
+    assertSameCompartment(cx, str);
+    *plength = str->length();
+    return str->getChars(cx);
+}
+
+JS_PUBLIC_API(const jschar *)
+JS_GetInternedStringChars(JSString *str)
+{
+    JS_ASSERT(str->isAtomized());
+    return str->flatChars();
+}
+
+JS_PUBLIC_API(const jschar *)
+JS_GetInternedStringCharsAndLength(JSString *str, size_t *plength)
+{
+    JS_ASSERT(str->isAtomized());
+    *plength = str->flatLength();
+    return str->flatChars();
+}
+
+extern JS_PUBLIC_API(JSFlatString *)
+JS_FlattenString(JSContext *cx, JSString *str)
+{
+    CHECK_REQUEST(cx);
+    assertSameCompartment(cx, str);
+    return str->getCharsZ(cx) ? (JSFlatString *)str : NULL;
+}
+
+extern JS_PUBLIC_API(const jschar *)
+JS_GetFlatStringChars(JSFlatString *str)
+{
+    return str->chars();
 }
 
 JS_PUBLIC_API(JSBool)
-JS_MatchStringAndAscii(JSString *str, const char *asciiBytes)
+JS_CompareStrings(JSContext *cx, JSString *str1, JSString *str2, int32 *result)
 {
-    return MatchStringAndAscii(str, asciiBytes);
+    return CompareStrings(cx, str1, str2, result);
+}
+
+JS_PUBLIC_API(JSBool)
+JS_StringEqualsAscii(JSContext *cx, JSString *str, const char *asciiBytes, JSBool *match)
+{
+    JSLinearString *linearStr = str->ensureLinear(cx);
+    if (!linearStr)
+        return false;
+    *match = StringEqualsAscii(linearStr, asciiBytes);
+    return true;
+}
+
+JS_PUBLIC_API(JSBool)
+JS_FlatStringEqualsAscii(JSFlatString *str, const char *asciiBytes)
+{
+    return StringEqualsAscii(str, asciiBytes);
 }
 
 JS_PUBLIC_API(size_t)
-JS_PutEscapedString(char *buffer, size_t size, JSString *str, char quote)
+JS_PutEscapedFlatString(char *buffer, size_t size, JSFlatString *str, char quote)
 {
     return PutEscapedString(buffer, size, str, quote);
+}
+
+JS_PUBLIC_API(size_t)
+JS_PutEscapedString(JSContext *cx, char *buffer, size_t size, JSString *str, char quote)
+{
+    JSLinearString *linearStr = str->ensureLinear(cx);
+    if (!linearStr)
+        return size_t(-1);
+    return PutEscapedString(buffer, size, linearStr, quote);
 }
 
 JS_PUBLIC_API(JSBool)
 JS_FileEscapedString(FILE *fp, JSString *str, char quote)
 {
-    return FileEscapedString(fp, str, quote);
+    JSLinearString *linearStr = str->ensureLinear(NULL);
+    return linearStr && FileEscapedString(fp, linearStr, quote);
 }
 
 JS_PUBLIC_API(JSString *)
@@ -5328,7 +5435,7 @@ JS_PUBLIC_API(const jschar *)
 JS_UndependString(JSContext *cx, JSString *str)
 {
     CHECK_REQUEST(cx);
-    return str->undepend(cx);
+    return str->getCharsZ(cx);
 }
 
 JS_PUBLIC_API(JSBool)
@@ -5364,13 +5471,19 @@ JS_DecodeBytes(JSContext *cx, const char *src, size_t srclen, jschar *dst, size_
 JS_PUBLIC_API(char *)
 JS_EncodeString(JSContext *cx, JSString *str)
 {
-    return js_DeflateString(cx, str->chars(), str->length());
+    const jschar *chars = str->getChars(cx);
+    if (!chars)
+        return NULL;
+    return js_DeflateString(cx, chars, str->length());
 }
 
 JS_PUBLIC_API(size_t)
 JS_GetStringEncodingLength(JSContext *cx, JSString *str)
 {
-    return js_GetDeflatedStringLength(cx, str->chars(), str->length());
+    const jschar *chars = str->getChars(cx);
+    if (!chars)
+        return size_t(-1);
+    return js_GetDeflatedStringLength(cx, chars, str->length());
 }
 
 JS_PUBLIC_API(size_t)
@@ -5382,12 +5495,15 @@ JS_EncodeStringToBuffer(JSString *str, char *buffer, size_t length)
      * error.
      */
     size_t writtenLength = length;
-    if (js_DeflateStringToBuffer(NULL, str->chars(), str->length(), buffer, &writtenLength)) {
+    const jschar *chars = str->getChars(NULL);
+    if (!chars)
+        return size_t(-1);
+    if (js_DeflateStringToBuffer(NULL, chars, str->length(), buffer, &writtenLength)) {
         JS_ASSERT(writtenLength <= length);
         return writtenLength;
     }
     JS_ASSERT(writtenLength <= length);
-    size_t necessaryLength = js_GetDeflatedStringLength(NULL, str->chars(), str->length());
+    size_t necessaryLength = js_GetDeflatedStringLength(NULL, chars, str->length());
     if (necessaryLength == size_t(-1))
         return size_t(-1);
     if (writtenLength != length) {

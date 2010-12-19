@@ -292,13 +292,13 @@ class EqualityCompiler : public BaseCompiler
         /* Test if lhs/rhs are atomized. */
         Imm32 atomizedFlags(JSString::FLAT | JSString::ATOMIZED);
         
-        masm.load32(Address(lvr.dataReg(), offsetof(JSString, mLengthAndFlags)), tmp);
+        masm.load32(Address(lvr.dataReg(), JSString::offsetOfLengthAndFlags()), tmp);
         masm.and32(Imm32(JSString::TYPE_FLAGS_MASK), tmp);
         Jump lhsNotAtomized = masm.branch32(Assembler::NotEqual, tmp, atomizedFlags);
         linkToStub(lhsNotAtomized);
 
         if (!rvr.isConstant()) {
-            masm.load32(Address(rvr.dataReg(), offsetof(JSString, mLengthAndFlags)), tmp);
+            masm.load32(Address(rvr.dataReg(), JSString::offsetOfLengthAndFlags()), tmp);
             masm.and32(Imm32(JSString::TYPE_FLAGS_MASK), tmp);
             Jump rhsNotAtomized = masm.branch32(Assembler::NotEqual, tmp, atomizedFlags);
             linkToStub(rhsNotAtomized);
@@ -1095,6 +1095,26 @@ ic::PurgeMICs(JSContext *cx, JSScript *script)
         script->jitNormal->purgeMICs();
     if (script->jitCtor)
         script->jitCtor->purgeMICs();
+}
+
+void
+JITScript::nukeScriptDependentICs()
+{
+    if (!nCallICs)
+        return;
+
+    Repatcher repatcher(this);
+
+    for (uint32 i = 0; i < nCallICs; i++) {
+        ic::CallICInfo &ic = callICs[i];
+        if (!ic.fastGuardedObject)
+            continue;
+        repatcher.repatch(ic.funGuard, NULL);
+        repatcher.relink(ic.funJump, ic.slowPathStart);
+        ic.releasePool(CallICInfo::Pool_ClosureStub);
+        ic.fastGuardedObject = NULL;
+        ic.hasJsFunCheck = false;
+    }
 }
 
 void
