@@ -92,6 +92,7 @@ typedef struct JSTreeContext        JSTreeContext;
 typedef struct JSTryNote            JSTryNote;
 
 /* Friend "Advanced API" typedefs. */
+typedef struct JSLinearString       JSLinearString;
 typedef struct JSAtom               JSAtom;
 typedef struct JSAtomList           JSAtomList;
 typedef struct JSAtomListElement    JSAtomListElement;
@@ -163,8 +164,6 @@ template <class T,
           class HashPolicy = DefaultHasher<T>,
           class AllocPolicy = ContextAllocPolicy>
 class HashSet;
-
-class DeflatedStringCache;
 
 class PropertyCache;
 struct PropertyCacheEntry;
