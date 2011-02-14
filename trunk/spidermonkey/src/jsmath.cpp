@@ -54,6 +54,7 @@
 #include "jsmath.h"
 #include "jsnum.h"
 #include "jslibmath.h"
+#include "jscompartment.h"
 
 using namespace js;
 
@@ -106,10 +107,10 @@ MathCache::MathCache() {
 Class js_MathClass = {
     js_Math_str,
     JSCLASS_HAS_CACHED_PROTO(JSProto_Math),
-    PropertyStub,   /* addProperty */
-    PropertyStub,   /* delProperty */
-    PropertyStub,   /* getProperty */
-    PropertyStub,   /* setProperty */
+    PropertyStub,         /* addProperty */
+    PropertyStub,         /* delProperty */
+    PropertyStub,         /* getProperty */
+    StrictPropertyStub,   /* setProperty */
     EnumerateStub,
     ResolveStub,
     ConvertStub
@@ -148,7 +149,7 @@ math_acos(JSContext *cx, uintN argc, Value *vp)
         return JS_TRUE;
     }
 #endif
-    MathCache *mathCache = JS_THREAD_DATA(cx)->getMathCache(cx);
+    MathCache *mathCache = GetMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
     z = mathCache->lookup(acos, x);
@@ -173,7 +174,7 @@ math_asin(JSContext *cx, uintN argc, Value *vp)
         return JS_TRUE;
     }
 #endif
-    MathCache *mathCache = JS_THREAD_DATA(cx)->getMathCache(cx);
+    MathCache *mathCache = GetMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
     z = mathCache->lookup(asin, x);
@@ -192,7 +193,7 @@ math_atan(JSContext *cx, uintN argc, Value *vp)
     }
     if (!ValueToNumber(cx, vp[2], &x))
         return JS_FALSE;
-    MathCache *mathCache = JS_THREAD_DATA(cx)->getMathCache(cx);
+    MathCache *mathCache = GetMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
     z = mathCache->lookup(atan, x);
@@ -285,7 +286,7 @@ math_cos(JSContext *cx, uintN argc, Value *vp)
     }
     if (!ValueToNumber(cx, vp[2], &x))
         return JS_FALSE;
-    MathCache *mathCache = JS_THREAD_DATA(cx)->getMathCache(cx);
+    MathCache *mathCache = GetMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
     z = mathCache->lookup(cos, x);
@@ -318,7 +319,7 @@ math_exp(JSContext *cx, uintN argc, Value *vp)
     }
     if (!ValueToNumber(cx, vp[2], &x))
         return JS_FALSE;
-    MathCache *mathCache = JS_THREAD_DATA(cx)->getMathCache(cx);
+    MathCache *mathCache = GetMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
     z = mathCache->lookup(math_exp_body, x);
@@ -365,7 +366,7 @@ math_log(JSContext *cx, uintN argc, Value *vp)
         return JS_TRUE;
     }
 #endif
-    MathCache *mathCache = JS_THREAD_DATA(cx)->getMathCache(cx);
+    MathCache *mathCache = GetMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
     z = mathCache->lookup(log, x);
@@ -612,7 +613,7 @@ math_sin(JSContext *cx, uintN argc, Value *vp)
     }
     if (!ValueToNumber(cx, vp[2], &x))
         return JS_FALSE;
-    MathCache *mathCache = JS_THREAD_DATA(cx)->getMathCache(cx);
+    MathCache *mathCache = GetMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
     z = mathCache->lookup(sin, x);
@@ -631,7 +632,7 @@ math_sqrt(JSContext *cx, uintN argc, Value *vp)
     }
     if (!ValueToNumber(cx, vp[2], &x))
         return JS_FALSE;
-    MathCache *mathCache = JS_THREAD_DATA(cx)->getMathCache(cx);
+    MathCache *mathCache = GetMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
     z = mathCache->lookup(sqrt, x);
@@ -650,7 +651,7 @@ math_tan(JSContext *cx, uintN argc, Value *vp)
     }
     if (!ValueToNumber(cx, vp[2], &x))
         return JS_FALSE;
-    MathCache *mathCache = JS_THREAD_DATA(cx)->getMathCache(cx);
+    MathCache *mathCache = GetMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
     z = mathCache->lookup(tan, x);
@@ -872,7 +873,7 @@ js_InitMathClass(JSContext *cx, JSObject *obj)
     if (!Math)
         return NULL;
     if (!JS_DefineProperty(cx, obj, js_Math_str, OBJECT_TO_JSVAL(Math),
-                           JS_PropertyStub, JS_PropertyStub, 0)) {
+                           JS_PropertyStub, JS_StrictPropertyStub, 0)) {
         return NULL;
     }
 
