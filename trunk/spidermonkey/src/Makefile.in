@@ -194,6 +194,7 @@ INSTALLED_HEADERS = \
 		jsclist.h \
 		jsclone.h \
 		jscntxt.h \
+		jscntxtinlines.h \
 		jscompat.h \
 		jsdate.h \
 		jsdbgapi.h \
@@ -211,6 +212,7 @@ INSTALLED_HEADERS = \
 		jsinterp.h \
 		jsinttypes.h \
 		jsiter.h \
+		jskeyword.tbl \
 		jslock.h \
 		jslong.h \
 		jsmath.h \
@@ -240,6 +242,7 @@ INSTALLED_HEADERS = \
 		jsstaticcheck.h \
 		jsstdint.h \
 		jsstr.h \
+		jsstrinlines.h \
 		jstracer.h \
 		jshotloop.h \
 		jstypedarray.h \
