@@ -211,6 +211,7 @@ RegExp::handleYarrError(JSContext *cx, int error)
       COMPILE_EMSG(CharacterClassRangeSingleChar, JSMSG_BAD_CLASS_RANGE);
       COMPILE_EMSG(EscapeUnterminated, JSMSG_TRAILING_SLASH);
       COMPILE_EMSG(QuantifierTooLarge, JSMSG_BAD_QUANTIFIER);
+      COMPILE_EMSG(HitRecursionLimit, JSMSG_REGEXP_TOO_COMPLEX);
 #undef COMPILE_EMSG
       default:
         JS_NOT_REACHED("Precondition violation: unknown Yarr error code.");
@@ -224,6 +225,7 @@ RegExp::handlePCREError(JSContext *cx, int error)
     JS_ReportErrorFlagsAndNumberUC(cx, JSREPORT_ERROR, js_GetErrorMessage, NULL, msg_); \
     return
     switch (error) {
+      case -2: REPORT(JSMSG_REGEXP_TOO_COMPLEX);
       case 0: JS_NOT_REACHED("Precondition violation: an error must have occurred.");
       case 1: REPORT(JSMSG_TRAILING_SLASH);
       case 2: REPORT(JSMSG_TRAILING_SLASH);
@@ -638,6 +640,7 @@ EscapeNakedForwardSlashes(JSContext *cx, JSString *unescaped)
     const jschar *oldChars = unescaped->getChars(cx);
     if (!oldChars)
         return NULL;
+    JS::Anchor<JSString *> anchor(unescaped);
 
     js::Vector<jschar, 128> newChars(cx);
     for (const jschar *it = oldChars; it < oldChars + oldLen; ++it) {
@@ -645,13 +648,14 @@ EscapeNakedForwardSlashes(JSContext *cx, JSString *unescaped)
             if (!newChars.length()) {
                 if (!newChars.reserve(oldLen + 1))
                     return NULL;
-                newChars.append(oldChars, size_t(it - oldChars));
+                JS_ALWAYS_TRUE(newChars.append(oldChars, size_t(it - oldChars)));
             }
-            newChars.append('\\');
+            if (!newChars.append('\\'))
+                return NULL;
         }
 
-        if (newChars.length())
-            newChars.append(*it);
+        if (!newChars.empty() && !newChars.append(*it))
+            return NULL;
     }
 
     if (newChars.length()) {
@@ -819,10 +823,15 @@ CompileRegExpAndSwap(JSContext *cx, JSObject *obj, uintN argc, Value *argv, Valu
         return true;
     }
 
-    /* Coerce to string and compile. */
-    JSString *sourceStr = js_ValueToString(cx, sourceValue);
-    if (!sourceStr)
-        return false;
+    JSString *sourceStr;
+    if (sourceValue.isUndefined()) {
+        sourceStr = cx->runtime->emptyString;
+    } else {
+        /* Coerce to string and compile. */
+        sourceStr = js_ValueToString(cx, sourceValue);
+        if (!sourceStr)
+            return false;
+    }  
 
     uintN flags = 0;
     if (argc > 1 && !argv[1].isUndefined()) {

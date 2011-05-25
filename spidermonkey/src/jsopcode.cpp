@@ -58,7 +58,6 @@
 #include "jsatom.h"
 #include "jscntxt.h"
 #include "jsversion.h"
-#include "jsdbgapi.h"
 #include "jsemit.h"
 #include "jsfun.h"
 #include "jsiter.h"
@@ -5489,8 +5488,8 @@ ReconstructPCStack(JSContext *cx, JSScript *script, jsbytecode *target,
         return ReconstructImacroPCStack(cx, script, imacstart, target, pcstack);
 #endif
 
-    LOCAL_ASSERT(script->main <= target && target < script->code + script->length);
-    jsbytecode *pc = script->main;
+    LOCAL_ASSERT(script->code <= target && target < script->code + script->length);
+    jsbytecode *pc = script->code;
     uintN pcdepth = 0;
     ptrdiff_t oplen;
     for (; pc < target; pc += oplen) {

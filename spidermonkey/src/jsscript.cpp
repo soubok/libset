@@ -294,7 +294,7 @@ Bindings::trace(JSTracer *trc)
         shape->trace(trc);
 }
 
-} // namespace js
+} /* namespace js */
 
 #if JS_HAS_XDR
 
@@ -1617,15 +1617,11 @@ DestroyScript(JSContext *cx, JSScript *script)
 
     /* FIXME: bug 506341; would like to do this only if regenerating shapes. */
     if (!cx->runtime->gcRunning) {
-        JSStackFrame *fp = js_GetTopStackFrame(cx);
-
-        if (!(fp && fp->isEvalFrame())) {
-            JS_PROPERTY_CACHE(cx).purgeForScript(script);
+        JS_PROPERTY_CACHE(cx).purgeForScript(cx, script);
 
 #ifdef CHECK_SCRIPT_OWNER
-            JS_ASSERT(script->owner == cx->thread);
+        JS_ASSERT(script->owner == cx->thread);
 #endif
-        }
     }
 
 #ifdef JS_TRACER
@@ -1709,7 +1705,7 @@ js_TraceScript(JSTracer *trc, JSScript *script)
     script->bindings.trace(trc);
 }
 
-JSBool
+JSObject *
 js_NewScriptObject(JSContext *cx, JSScript *script)
 {
     AutoScriptRooter root(cx, script);
@@ -1718,7 +1714,7 @@ js_NewScriptObject(JSContext *cx, JSScript *script)
 
     JSObject *obj = NewNonFunction<WithProto::Class>(cx, &js_ScriptClass, NULL, NULL);
     if (!obj)
-        return JS_FALSE;
+        return NULL;
     obj->setPrivate(script);
     script->u.object = obj;
 
@@ -1732,7 +1728,7 @@ js_NewScriptObject(JSContext *cx, JSScript *script)
     script->owner = NULL;
 #endif
 
-    return JS_TRUE;
+    return obj;
 }
 
 typedef struct GSNCacheEntry {
@@ -1977,7 +1973,7 @@ js_CloneScript(JSContext *cx, JSScript *script)
     // we don't want gecko to transcribe our principals for us
     DisablePrincipalsTranscoding disable(cx);
 
-    if (!JS_XDRScript(w, &script)) {
+    if (!js_XDRScript(w, &script, NULL)) {
         JS_XDRDestroy(w);
         return NULL;
     }
@@ -2001,7 +1997,6 @@ js_CloneScript(JSContext *cx, JSScript *script)
     JS_XDRMemSetData(r, p, nbytes);
     JS_XDRMemSetData(w, NULL, 0);
 
-    // We can't use the public API because it makes a script object.
     if (!js_XDRScript(r, &script, NULL))
         return NULL;
 

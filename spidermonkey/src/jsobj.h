@@ -518,6 +518,7 @@ struct JSObject : js::gc::Cell {
     void protoShapeChange(JSContext *cx);
     void shadowingShapeChange(JSContext *cx, const js::Shape &shape);
     bool globalObjectOwnShapeChange(JSContext *cx);
+    void watchpointOwnShapeChange(JSContext *cx) { generateOwnShape(cx); }
 
     void extensibleShapeChange(JSContext *cx) {
         /* This will do for now. */
@@ -580,7 +581,7 @@ struct JSObject : js::gc::Cell {
      * Defined in jsobjinlines.h, but not declared inline per standard style in
      * order to avoid gcc warnings.
      */
-    bool methodReadBarrier(JSContext *cx, const js::Shape &shape, js::Value *vp);
+    const js::Shape *methodReadBarrier(JSContext *cx, const js::Shape &shape, js::Value *vp);
 
     /*
      * Write barrier to check for a change of method value. Defined inline in
@@ -1053,6 +1054,12 @@ struct JSObject : js::gc::Cell {
     inline void setNativeIterator(js::NativeIterator *);
 
     /*
+     * Script-related getters.
+     */
+
+    inline JSScript *getScript() const;
+
+    /*
      * XML-related getters and setters.
      */
 
@@ -1295,6 +1302,7 @@ struct JSObject : js::gc::Cell {
     inline bool isClonedBlock() const;
     inline bool isCall() const;
     inline bool isRegExp() const;
+    inline bool isScript() const;
     inline bool isXML() const;
     inline bool isXMLId() const;
     inline bool isNamespace() const;
@@ -1660,16 +1668,19 @@ js_LookupPropertyWithFlags(JSContext *cx, JSObject *obj, jsid id, uintN flags,
                            JSObject **objp, JSProperty **propp);
 
 
+extern JS_FRIEND_DATA(js::Class) js_CallClass;
+extern JS_FRIEND_DATA(js::Class) js_DeclEnvClass;
+
+namespace js {
+
 /*
  * We cache name lookup results only for the global object or for native
  * non-global objects without prototype or with prototype that never mutates,
  * see bug 462734 and bug 487039.
  */
-inline bool
-js_IsCacheableNonGlobalScope(JSObject *obj)
+static inline bool
+IsCacheableNonGlobalScope(JSObject *obj)
 {
-    extern JS_FRIEND_DATA(js::Class) js_CallClass;
-    extern JS_FRIEND_DATA(js::Class) js_DeclEnvClass;
     JS_ASSERT(obj->getParent());
 
     js::Class *clasp = obj->getClass();
@@ -1679,6 +1690,8 @@ js_IsCacheableNonGlobalScope(JSObject *obj)
 
     JS_ASSERT_IF(cacheable, !obj->getOps()->lookupProperty);
     return cacheable;
+}
+
 }
 
 /*
