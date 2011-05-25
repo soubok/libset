@@ -194,7 +194,6 @@ INSTALLED_HEADERS = \
 		jsclist.h \
 		jsclone.h \
 		jscntxt.h \
-		jscntxtinlines.h \
 		jscompat.h \
 		jsdate.h \
 		jsdbgapi.h \
@@ -212,7 +211,6 @@ INSTALLED_HEADERS = \
 		jsinterp.h \
 		jsinttypes.h \
 		jsiter.h \
-		jskeyword.tbl \
 		jslock.h \
 		jslong.h \
 		jsmath.h \
@@ -242,7 +240,6 @@ INSTALLED_HEADERS = \
 		jsstaticcheck.h \
 		jsstdint.h \
 		jsstr.h \
-		jsstrinlines.h \
 		jstracer.h \
 		jshotloop.h \
 		jstypedarray.h \
@@ -258,6 +255,9 @@ INSTALLED_HEADERS = \
 		jsval.h \
 		jsvalue.h \
 		prmjtime.h \
+		jsstrinlines.h \
+		jscntxtinlines.h \
+		jskeyword.tbl \
 		$(NULL)
 
 ifdef ENABLE_TRACEJIT
@@ -586,13 +586,14 @@ endif
 
 ifdef ENABLE_TRACEJIT
 ifndef WINCE
+JITFLAGS = ,m,j,mj,mjp,am,amj,amjp,amd
 check::
 	$(wildcard $(RUN_TEST_PROGRAM)) $(PYTHON) -u $(srcdir)/jit-test/jit_test.py \
-	        --no-slow --no-progress --tinderbox --jitflags=m,j,mj,mjp,mjd $(DIST)/bin/js$(BIN_SUFFIX)
+	        --no-slow --no-progress --tinderbox --jitflags=$(JITFLAGS) $(DIST)/bin/js$(BIN_SUFFIX)
 
 check-valgrind::
 	$(wildcard $(RUN_TEST_PROGRAM)) $(PYTHON) -u $(srcdir)/jit-test/jit_test.py \
-	        --valgrind --no-slow --no-progress --tinderbox --jitflags=m,j,mj,mjp,mjd $(DIST)/bin/js$(BIN_SUFFIX)
+	        --valgrind --no-slow --no-progress --tinderbox --jitflags=$(JITFLAGS) $(DIST)/bin/js$(BIN_SUFFIX)
 endif
 endif
 

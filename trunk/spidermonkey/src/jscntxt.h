@@ -461,6 +461,7 @@ class InvokeFrameGuard
     InvokeFrameGuard() : cx_(NULL) {}
     ~InvokeFrameGuard() { if (pushed()) pop(); }
     bool pushed() const { return cx_ != NULL; }
+    JSContext *pushedFrameContext() const { JS_ASSERT(pushed()); return cx_; }
     void pop();
     JSStackFrame *fp() const { return regs_.fp; }
 };
@@ -599,7 +600,7 @@ class StackSpace
                              InvokeFrameGuard *fg);
     void popInvokeFrameSlow(const CallArgs &args);
 
-    bool getSegmentAndFrame(JSContext *cx, uintN vplen, uintN nfixed,
+    bool getSegmentAndFrame(JSContext *cx, uintN vplen, uintN nslots,
                             FrameGuard *fg) const;
     void pushSegmentAndFrame(JSContext *cx, JSFrameRegs *regs, FrameGuard *fg);
     void popSegmentAndFrame(JSContext *cx);
@@ -728,7 +729,7 @@ class StackSpace
     inline void popInlineFrame(JSContext *cx, JSStackFrame *prev, js::Value *newsp);
 
     /* These functions are called inside SendToGenerator. */
-    bool getGeneratorFrame(JSContext *cx, uintN vplen, uintN nfixed,
+    bool getGeneratorFrame(JSContext *cx, uintN vplen, uintN nslots,
                            GeneratorFrameGuard *fg);
     void pushGeneratorFrame(JSContext *cx, JSFrameRegs *regs, GeneratorFrameGuard *fg);
 
@@ -1047,6 +1048,7 @@ struct JSRuntime {
     size_t              gcLastBytes;
     size_t              gcMaxBytes;
     size_t              gcMaxMallocBytes;
+    size_t              gcChunksWaitingToExpire;
     uint32              gcEmptyArenaPoolLifespan;
     uint32              gcNumber;
     js::GCMarker        *gcMarkingTracer;
@@ -1057,7 +1059,7 @@ struct JSRuntime {
 
     /*
      * Compartment that triggered GC. If more than one Compatment need GC,
-     * gcTriggerCompartment is reset to NULL and a global GC is performed. 
+     * gcTriggerCompartment is reset to NULL and a global GC is performed.
      */
     JSCompartment       *gcTriggerCompartment;
 
@@ -1866,7 +1868,7 @@ struct JSContext
     /*
      * Return:
      * - The override version, if there is an override version.
-     * - The newest scripted frame's version, if there is such a frame. 
+     * - The newest scripted frame's version, if there is such a frame.
      * - The default verion.
      *
      * Note: if this ever shows up in a profile, just add caching!
