@@ -99,16 +99,6 @@ ifdef XPI_NAME
 DEFINES += -DXPI_NAME=$(XPI_NAME)
 endif
 
-# MAKE_JARS_TARGET is a staging area for make-jars.pl.  When packaging in
-# the jar format, make-jars leaves behind a directory structure that's not
-# needed in $(FINAL_TARGET).  For both, flat, and symlink, the directory
-# structure contains the chrome, so leave it in $(FINAL_TARGET).
-ifeq (jar,$(MOZ_CHROME_FILE_FORMAT))
-MAKE_JARS_TARGET = $(if $(XPI_NAME),$(FINAL_TARGET).stage,$(DIST)/chrome-stage)
-else
-MAKE_JARS_TARGET = $(FINAL_TARGET)
-endif
-
 # The VERSION_NUMBER is suffixed onto the end of the DLLs we ship.
 VERSION_NUMBER		= 50
 
@@ -129,9 +119,6 @@ LD		:= qcc -Vgcc_ntox86 -nostdlib
 else
 LD		:= $(CC)
 endif
-endif
-ifeq ($(OS_ARCH),BeOS)
-BEOS_ADDON_WORKAROUND	= 1
 endif
 
 #
@@ -160,7 +147,7 @@ MOZ_UNICHARUTIL_LIBS = $(LIBXUL_DIST)/lib/$(LIB_PREFIX)unicharutil_s.$(LIB_SUFFI
 MOZ_WIDGET_SUPPORT_LIBS    = $(DIST)/lib/$(LIB_PREFIX)widgetsupport_s.$(LIB_SUFFIX)
 
 ifdef MOZ_MEMORY
-ifneq (,$(filter-out WINNT WINCE,$(OS_ARCH)))
+ifneq ($(OS_ARCH),WINNT)
 JEMALLOC_LIBS = $(MKSHLIB_FORCE_ALL) $(call EXPAND_MOZLIBNAME,jemalloc) $(MKSHLIB_UNFORCE_ALL)
 # If we are linking jemalloc into a program, we want the jemalloc symbols
 # to be exported
@@ -172,6 +159,9 @@ endif
 
 CC := $(CC_WRAPPER) $(CC)
 CXX := $(CXX_WRAPPER) $(CXX)
+MKDIR ?= mkdir
+SLEEP ?= sleep
+TOUCH ?= touch
 
 # determine debug-related options
 _DEBUG_CFLAGS :=
@@ -255,41 +245,12 @@ endif # WINNT && !GNU_CC
 
 #
 # Build using PIC by default
-# Do not use PIC if not building a shared lib (see exceptions below)
 #
-
-ifndef BUILD_STATIC_LIBS
 _ENABLE_PIC=1
-endif
-ifneq (,$(FORCE_SHARED_LIB)$(FORCE_USE_PIC))
-_ENABLE_PIC=1
-endif
-
-# In Firefox, all components are linked into either libxul or the static
-# meta-component, and should be compiled with PIC.
-ifdef MOZ_META_COMPONENT
-_ENABLE_PIC=1
-endif
-
-# If module is going to be merged into the nsStaticModule, 
-# make sure that the entry points are translated and 
-# the module is built static.
-
-ifdef IS_COMPONENT
-ifdef EXPORT_LIBRARY
-ifneq (,$(BUILD_STATIC_LIBS))
-ifdef MODULE_NAME
-DEFINES += -DXPCOM_TRANSLATE_NSGM_ENTRY_POINT=1
-FORCE_STATIC_LIB=1
-endif
-endif
-endif
-endif
 
 # Determine if module being compiled is destined 
 # to be merged into libxul
 
-ifdef MOZ_ENABLE_LIBXUL
 ifdef LIBXUL_LIBRARY
 ifdef IS_COMPONENT
 ifdef MODULE_NAME
@@ -299,9 +260,7 @@ $(error Component makefile does not specify MODULE_NAME.)
 endif
 endif
 FORCE_STATIC_LIB=1
-_ENABLE_PIC=1
 SHORT_LIBNAME=
-endif
 endif
 
 # If we are building this component into an extension/xulapp, it cannot be
@@ -309,24 +268,10 @@ endif
 # build option.
 
 ifdef XPI_NAME
-_ENABLE_PIC=1
 ifdef IS_COMPONENT
 EXPORT_LIBRARY=
 FORCE_STATIC_LIB=
 FORCE_SHARED_LIB=1
-endif
-endif
-
-#
-# Disable PIC if necessary
-#
-
-ifndef _ENABLE_PIC
-DSO_CFLAGS=
-ifeq ($(OS_ARCH)_$(HAVE_GCC3_ABI),Darwin_1)
-DSO_PIC_CFLAGS=-mdynamic-no-pic
-else
-DSO_PIC_CFLAGS=
 endif
 endif
 
@@ -342,15 +287,6 @@ STATIC_LIBRARY_NAME=$(LIBRARY_NAME)
 endif
 endif
 
-ifeq (WINNT,$(OS_ARCH))
-MOZ_FAKELIBS = 1
-endif
-
-# This comes from configure
-ifdef MOZ_PROFILE_GUIDED_OPTIMIZE_DISABLE
-NO_PROFILE_GUIDED_OPTIMIZE = 1
-endif
-
 # No sense in profiling tools
 ifdef INTERNAL_TOOLS
 NO_PROFILE_GUIDED_OPTIMIZE = 1
@@ -359,6 +295,11 @@ endif
 # Don't build SIMPLE_PROGRAMS with PGO, since they don't need it anyway,
 # and we don't have the same build logic to re-link them in the second pass.
 ifdef SIMPLE_PROGRAMS
+NO_PROFILE_GUIDED_OPTIMIZE = 1
+endif
+
+# No sense in profiling unit tests
+ifdef CPP_UNIT_TESTS
 NO_PROFILE_GUIDED_OPTIMIZE = 1
 endif
 
@@ -391,7 +332,6 @@ endif
 
 # Force XPCOM/widget/gfx methods to be _declspec(dllexport) when we're
 # building libxul libraries
-ifdef MOZ_ENABLE_LIBXUL
 ifdef LIBXUL_LIBRARY
 DEFINES += \
 		-D_IMPL_NS_COM \
@@ -408,23 +348,8 @@ ifndef JS_SHARED_LIBRARY
 DEFINES += -DSTATIC_EXPORTABLE_JS_API
 endif
 endif
-endif
 
-# Force _all_ exported methods to be |_declspec(dllexport)| when we're
-# building them into the executable.
-
-ifeq (,$(filter-out WINNT WINCE OS2, $(OS_ARCH)))
-ifdef BUILD_STATIC_LIBS
-DEFINES += \
-        -D_IMPL_NS_GFX \
-        -D_IMPL_NS_MSG_BASE \
-        -D_IMPL_NS_WIDGET \
-        $(NULL)
-endif
-endif
-
-# Flags passed to make-jars.pl
-
+# Flags passed to JarMaker.py
 MAKE_JARS_FLAGS = \
 	-t $(topsrcdir) \
 	-f $(MOZ_CHROME_FILE_FORMAT) \
@@ -457,17 +382,16 @@ MY_RULES	:= $(DEPTH)/config/myrules.mk
 #
 # Default command macros; can be overridden in <arch>.mk.
 #
-CCC		= $(CXX)
-NFSPWD		= $(CONFIG_TOOLS)/nfspwd
-PURIFY		= purify $(PURIFYOPTIONS)
-QUANTIFY	= quantify $(QUANTIFYOPTIONS)
+CCC = $(CXX)
+NFSPWD = $(CONFIG_TOOLS)/nfspwd
+PURIFY = purify $(PURIFYOPTIONS)
+QUANTIFY = quantify $(QUANTIFYOPTIONS)
 ifdef CROSS_COMPILE
-XPIDL_COMPILE 	= $(CYGWIN_WRAPPER) $(LIBXUL_DIST)/host/bin/host_xpidl$(HOST_BIN_SUFFIX)
-XPIDL_LINK	= $(CYGWIN_WRAPPER) $(LIBXUL_DIST)/host/bin/host_xpt_link$(HOST_BIN_SUFFIX)
+XPIDL_COMPILE = $(LIBXUL_DIST)/host/bin/host_xpidl$(HOST_BIN_SUFFIX)
 else
-XPIDL_COMPILE 	= $(CYGWIN_WRAPPER) $(LIBXUL_DIST)/bin/xpidl$(BIN_SUFFIX)
-XPIDL_LINK	= $(CYGWIN_WRAPPER) $(LIBXUL_DIST)/bin/xpt_link$(BIN_SUFFIX)
+XPIDL_COMPILE = $(LIBXUL_DIST)/bin/xpidl$(BIN_SUFFIX)
 endif
+XPIDL_LINK = $(PYTHON) $(LIBXUL_DIST)/sdk/bin/xpt.py link
 
 # Java macros
 JAVA_GEN_DIR  = _javagen
@@ -498,8 +422,13 @@ ifdef MODULE_OPTIMIZE_FLAGS
 CFLAGS		+= $(MODULE_OPTIMIZE_FLAGS)
 CXXFLAGS	+= $(MODULE_OPTIMIZE_FLAGS)
 else
+ifneq (,$(if $(MOZ_PROFILE_GENERATE)$(MOZ_PROFILE_USE),$(MOZ_PGO_OPTIMIZE_FLAGS)))
+CFLAGS		+= $(MOZ_PGO_OPTIMIZE_FLAGS)
+CXXFLAGS	+= $(MOZ_PGO_OPTIMIZE_FLAGS)
+else
 CFLAGS		+= $(MOZ_OPTIMIZE_FLAGS)
 CXXFLAGS	+= $(MOZ_OPTIMIZE_FLAGS)
+endif # neq (,$(MOZ_PROFILE_GENERATE)$(MOZ_PROFILE_USE))
 endif # MODULE_OPTIMIZE_FLAGS
 else
 CFLAGS		+= $(MOZ_OPTIMIZE_FLAGS)
@@ -606,11 +535,9 @@ endif
 # we link statically or dynamic?  Assuming dynamic for now.
 
 ifneq (WINNT_,$(OS_ARCH)_$(GNU_CC))
-ifneq (,$(filter-out WINCE,$(OS_ARCH)))
 LIBS_DIR	= -L$(DIST)/bin -L$(DIST)/lib
 ifdef LIBXUL_SDK
 LIBS_DIR	+= -L$(LIBXUL_SDK)/bin -L$(LIBXUL_SDK)/lib
-endif
 endif
 endif
 
@@ -628,10 +555,6 @@ SDK_BIN_DIR = $(DIST)/sdk/bin
 DEPENDENCIES	= .md
 
 MOZ_COMPONENT_LIBS=$(XPCOM_LIBS) $(MOZ_COMPONENT_NSPR_LIBS)
-
-ifeq (xpconnect, $(findstring xpconnect, $(BUILD_MODULES)))
-DEFINES +=  -DXPCONNECT_STANDALONE
-endif
 
 ifeq ($(OS_ARCH),OS2)
 ELF_DYNSTR_GC	= echo
@@ -683,11 +606,11 @@ endif # OS_ARCH=Darwin
 
 
 ifdef MOZ_NATIVE_MAKEDEPEND
-MKDEPEND_DIR	=
-MKDEPEND	= $(CYGWIN_WRAPPER) $(MOZ_NATIVE_MAKEDEPEND)
+MKDEPEND_DIR =
+MKDEPEND = $(MOZ_NATIVE_MAKEDEPEND)
 else
-MKDEPEND_DIR	= $(CONFIG_TOOLS)/mkdepend
-MKDEPEND	= $(CYGWIN_WRAPPER) $(MKDEPEND_DIR)/mkdepend$(BIN_SUFFIX)
+MKDEPEND_DIR = $(CONFIG_TOOLS)/mkdepend
+MKDEPEND = $(MKDEPEND_DIR)/mkdepend$(BIN_SUFFIX)
 endif
 
 # Set link flags according to whether we want a console.
@@ -741,7 +664,7 @@ DEFINES		+= -DOSARCH=$(OS_ARCH)
 
 ######################################################################
 
-GARBAGE		+= $(DEPENDENCIES) $(MKDEPENDENCIES) $(MKDEPENDENCIES).bak core $(wildcard core.[0-9]*) $(wildcard *.err) $(wildcard *.pure) $(wildcard *_pure_*.o) Templates.DB $(FAKE_LIBRARY)
+GARBAGE		+= $(DEPENDENCIES) $(MKDEPENDENCIES) $(MKDEPENDENCIES).bak core $(wildcard core.[0-9]*) $(wildcard *.err) $(wildcard *.pure) $(wildcard *_pure_*.o) Templates.DB
 
 ifeq ($(OS_ARCH),Darwin)
 ifndef NSDISTMODE
@@ -751,12 +674,12 @@ PWD := $(CURDIR)
 endif
 
 ifdef NSINSTALL_BIN
-NSINSTALL	= $(CYGWIN_WRAPPER) $(NSINSTALL_BIN)
+NSINSTALL = $(NSINSTALL_BIN)
 else
 ifeq (OS2,$(CROSS_COMPILE)$(OS_ARCH))
-NSINSTALL	= $(MOZ_TOOLS_DIR)/nsinstall
+NSINSTALL = $(MOZ_TOOLS_DIR)/nsinstall
 else
-NSINSTALL	= $(CONFIG_TOOLS)/nsinstall$(HOST_BIN_SUFFIX)
+NSINSTALL = $(CONFIG_TOOLS)/nsinstall$(HOST_BIN_SUFFIX)
 endif # OS2
 endif # NSINSTALL_BIN
 
@@ -784,12 +707,6 @@ endif # WINNT/OS2
 
 # Use nsinstall in copy mode to install files on the system
 SYSINSTALL	= $(NSINSTALL) -t
-
-ifeq ($(OS_ARCH),WINNT)
-ifneq (,$(CYGDRIVE_MOUNT))
-export CYGDRIVE_MOUNT
-endif
-endif
 
 #
 # Localization build automation
@@ -822,9 +739,16 @@ MAKE_JARS_FLAGS += -c $(topsrcdir)/$(relativesrcdir)/en-US
 endif
 endif
 
-ifdef WINCE
-RUN_TEST_PROGRAM = $(PYTHON) $(topsrcdir)/build/mobile/devicemanager-run-test.py
+ifdef LOCALE_MERGEDIR
+MERGE_FILE = $(firstword \
+  $(wildcard $(LOCALE_MERGEDIR)/$(subst /locales,,$(relativesrcdir))/$(1)) \
+  $(wildcard $(LOCALE_SRCDIR)/$(1)) \
+  $(srcdir)/en-US/$(1) )
 else
+MERGE_FILE = $(LOCALE_SRCDIR)/$(1)
+endif
+MERGE_FILES = $(foreach f,$(1),$(call MERGE_FILE,$(f)))
+
 ifeq (OS2,$(OS_ARCH))
 RUN_TEST_PROGRAM = $(topsrcdir)/build/os2/test_os2.cmd "$(DIST)"
 else
@@ -832,7 +756,6 @@ ifneq (WINNT,$(OS_ARCH))
 RUN_TEST_PROGRAM = $(DIST)/bin/run-mozilla.sh
 endif # ! WINNT
 endif # ! OS2
-endif # ! WINCE
 
 #
 # Java macros
@@ -851,3 +774,18 @@ STATIC_DIRS += $(foreach tier,$(TIERS),$(tier_$(tier)_staticdirs))
 endif
 
 OPTIMIZE_JARS_CMD = $(PYTHON) $(call core_abspath,$(topsrcdir)/config/optimizejars.py)
+
+CREATE_PRECOMPLETE_CMD = $(PYTHON) $(call core_abspath,$(topsrcdir)/config/createprecomplete.py)
+
+EXPAND_LIBS = $(PYTHON) -I$(DEPTH)/config $(topsrcdir)/config/expandlibs.py
+EXPAND_LIBS_EXEC = $(PYTHON) $(topsrcdir)/config/pythonpath.py -I$(DEPTH)/config $(topsrcdir)/config/expandlibs_exec.py
+EXPAND_LIBS_GEN = $(PYTHON) $(topsrcdir)/config/pythonpath.py -I$(DEPTH)/config $(topsrcdir)/config/expandlibs_gen.py
+EXPAND_AR = $(EXPAND_LIBS_EXEC) --extract -- $(AR)
+EXPAND_CC = $(EXPAND_LIBS_EXEC) --uselist -- $(CC)
+EXPAND_CCC = $(EXPAND_LIBS_EXEC) --uselist -- $(CCC)
+EXPAND_LD = $(EXPAND_LIBS_EXEC) --uselist -- $(LD)
+EXPAND_MKSHLIB = $(EXPAND_LIBS_EXEC) --uselist -- $(MKSHLIB)
+
+ifdef STDCXX_COMPAT
+CHECK_STDCXX = objdump -p $(1) | grep -e 'GLIBCXX_3\.4\.\(9\|[1-9][0-9]\)' > /dev/null && echo "TEST-UNEXPECTED-FAIL | | We don't want these libstdc++ symbols to be used:" && objdump -T $(1) | grep -e 'GLIBCXX_3\.4\.\(9\|[1-9][0-9]\)' && exit 1 || exit 0
+endif

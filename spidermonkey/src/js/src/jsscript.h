@@ -173,9 +173,10 @@ class Bindings {
     uint16 nargs;
     uint16 nvars;
     uint16 nupvars;
+    bool hasExtensibleParents;
 
   public:
-    inline Bindings(JSContext *cx);
+    inline Bindings(JSContext *cx, EmptyShape *emptyCallShape);
 
     /*
      * Transfers ownership of bindings data from bindings into this fresh
@@ -203,7 +204,7 @@ class Bindings {
     bool hasLocalNames() const { return countLocalNames() > 0; }
 
     /* Returns the shape lineage generated for these bindings. */
-    inline const js::Shape *lastShape() const;
+    inline js::Shape *lastShape() const;
 
     enum {
         /*
@@ -296,6 +297,54 @@ class Bindings {
      * the original bindings to be safely shared.
      */
     void makeImmutable();
+
+    /*
+     * Sometimes call objects and run-time block objects need unique shapes, but
+     * sometimes they don't.
+     *
+     * Property cache entries only record the shapes of the first and last
+     * objects along the search path, so if the search traverses more than those
+     * two objects, then those first and last shapes must determine the shapes
+     * of everything else along the path. The js_PurgeScopeChain stuff takes
+     * care of making this work, but that suffices only because we require that
+     * start points with the same shape have the same successor object in the
+     * search path --- a cache hit means the starting shapes were equal, which
+     * means the seach path tail (everything but the first object in the path)
+     * was shared, which in turn means the effects of a purge will be seen by
+     * all affected starting search points.
+     *
+     * For call and run-time block objects, the "successor object" is the scope
+     * chain parent. Unlike prototype objects (of which there are usually few),
+     * scope chain parents are created frequently (possibly on every call), so
+     * following the shape-implies-parent rule blindly would lead one to give
+     * every call and block its own shape.
+     *
+     * In many cases, however, it's not actually necessary to give call and
+     * block objects their own shapes, and we can do better. If the code will
+     * always be used with the same global object, and none of the enclosing
+     * call objects could have bindings added to them at runtime (by direct eval
+     * calls or function statements), then we can use a fixed set of shapes for
+     * those objects. You could think of the shapes in the functions' bindings
+     * and compile-time blocks as uniquely identifying the global object(s) at
+     * the end of the scope chain.
+     *
+     * (In fact, some JSScripts we do use against multiple global objects (see
+     * bug 618497), and using the fixed shapes isn't sound there.)
+     * 
+     * In deciding whether a call or block has any extensible parents, we
+     * actually only need to consider enclosing calls; blocks are never
+     * extensible, and the other sorts of objects that appear in the scope
+     * chains ('with' blocks, say) are not CacheableNonGlobalScopes.
+     *
+     * If the hasExtensibleParents flag is set, then Call objects created for
+     * the function this Bindings describes need unique shapes. If the flag is
+     * clear, then we can use lastBinding's shape.
+     *
+     * For blocks, we set the the OWN_SHAPE flag on the compiler-generated
+     * blocksto indicate that their clones need unique shapes.
+     */
+    void setExtensibleParents() { hasExtensibleParents = true; }
+    bool extensibleParents() const { return hasExtensibleParents; }
 
     /*
      * These methods provide direct access to the shape path normally
@@ -600,7 +649,7 @@ StackDepth(JSScript *script)
         if ((pc_) < (script_)->code ||                                        \
             (script_)->code + (script_)->length <= (pc_)) {                   \
             JS_ASSERT((size_t)(index) < js_common_atom_count);                \
-            (atom) = COMMON_ATOMS_START(&cx->runtime->atomState)[index];      \
+            (atom) = cx->runtime->atomState.commonAtomsStart()[index];        \
         } else {                                                              \
             (atom) = script_->getAtom(index);                                 \
         }                                                                     \
@@ -626,15 +675,6 @@ js_InitRuntimeScriptState(JSRuntime *rt);
  */
 extern void
 js_FreeRuntimeScriptState(JSRuntime *rt);
-
-extern const char *
-js_SaveScriptFilename(JSContext *cx, const char *filename);
-
-extern const char *
-js_SaveScriptFilenameRT(JSRuntime *rt, const char *filename, uint32 flags);
-
-extern uint32
-js_GetScriptFilenameFlags(const char *filename);
 
 extern void
 js_MarkScriptFilename(const char *filename);
@@ -698,7 +738,7 @@ js_GetSrcNoteCached(JSContext *cx, JSScript *script, jsbytecode *pc);
  * fp->imacpc may be non-null, indicating an active imacro.
  */
 extern uintN
-js_FramePCToLineNumber(JSContext *cx, JSStackFrame *fp);
+js_FramePCToLineNumber(JSContext *cx, js::StackFrame *fp);
 
 extern uintN
 js_PCToLineNumber(JSContext *cx, JSScript *script, jsbytecode *pc);
@@ -708,6 +748,27 @@ js_LineNumberToPC(JSScript *script, uintN lineno);
 
 extern JS_FRIEND_API(uintN)
 js_GetScriptLineExtent(JSScript *script);
+
+namespace js {
+
+/*
+ * This function returns the file and line number of the script currently
+ * executing on cx. If there is no current script executing on cx (e.g., a
+ * native called directly through JSAPI (e.g., by setTimeout)), NULL and 0 are
+ * returned as the file and line. Additionally, this function avoids the full
+ * linear scan to compute line number when the caller guarnatees that the
+ * script compilation occurs at a JSOP_EVAL.
+ */
+
+enum LineOption {
+    CALLED_FROM_JSOP_EVAL,
+    NOT_CALLED_FROM_JSOP_EVAL
+};
+
+inline const char *
+CurrentScriptFileAndLine(JSContext *cx, uintN *linenop, LineOption = NOT_CALLED_FROM_JSOP_EVAL);
+
+}
 
 static JS_INLINE JSOp
 js_GetOpcode(JSContext *cx, JSScript *script, jsbytecode *pc)
@@ -722,17 +783,12 @@ extern JSScript *
 js_CloneScript(JSContext *cx, JSScript *script);
 
 /*
- * If magic is non-null, js_XDRScript succeeds on magic number mismatch but
- * returns false in *magic; it reflects a match via a true *magic out param.
- * If magic is null, js_XDRScript returns false on bad magic number errors,
- * which it reports.
- *
  * NB: after a successful JSXDR_DECODE, js_XDRScript callers must do any
  * required subsequent set-up of owning function or script object and then call
  * js_CallNewScriptHook.
  */
 extern JSBool
-js_XDRScript(JSXDRState *xdr, JSScript **scriptp, JSBool *hasMagic);
+js_XDRScript(JSXDRState *xdr, JSScript **scriptp);
 
 inline bool
 JSObject::isScript() const

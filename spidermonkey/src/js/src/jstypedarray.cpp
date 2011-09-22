@@ -52,6 +52,7 @@
 #include "jscntxt.h"
 #include "jsversion.h"
 #include "jsgc.h"
+#include "jsgcmark.h"
 #include "jsinterp.h"
 #include "jslock.h"
 #include "jsnum.h"
@@ -123,7 +124,7 @@ ArrayBuffer::class_finalize(JSContext *cx, JSObject *obj)
     ArrayBuffer *abuf = ArrayBuffer::fromJSObject(obj);
     if (abuf) {
         abuf->freeStorage(cx);
-        cx->destroy<ArrayBuffer>(abuf);
+        cx->delete_(abuf);
     }
 }
 
@@ -161,12 +162,12 @@ ArrayBuffer::create(JSContext *cx, int32 nbytes)
         return NULL;
     }
 
-    ArrayBuffer *abuf = cx->create<ArrayBuffer>();
+    ArrayBuffer *abuf = cx->new_<ArrayBuffer>();
     if (!abuf)
         return NULL;
 
     if (!abuf->allocateStorage(cx, nbytes)) {
-        cx->destroy<ArrayBuffer>(abuf);
+        Foreground::delete_(abuf);
         return NULL;
     }
 
@@ -180,7 +181,7 @@ ArrayBuffer::allocateStorage(JSContext *cx, uint32 nbytes)
     JS_ASSERT(data == 0);
 
     if (nbytes) {
-        data = cx->calloc(nbytes);
+        data = cx->calloc_(nbytes);
         if (!data)
             return false;
     }
@@ -193,7 +194,7 @@ void
 ArrayBuffer::freeStorage(JSContext *cx)
 {
     if (data) {
-        cx->free(data);
+        cx->free_(data);
 #ifdef DEBUG
         // the destructor asserts that data is 0 in debug builds
         data = NULL;
@@ -437,7 +438,7 @@ struct uint8_clamped {
         return *this;
     }
 
-    inline uint8_clamped& operator= (int32 x) { 
+    inline uint8_clamped& operator= (int32 x) {
         val = (x >= 0)
               ? ((x < 255)
                  ? uint8(x)
@@ -446,7 +447,7 @@ struct uint8_clamped {
         return *this;
     }
 
-    inline uint8_clamped& operator= (const jsdouble x) { 
+    inline uint8_clamped& operator= (const jsdouble x) {
         val = uint8(js_TypedArray_uint8_clamp_double(x));
         return *this;
     }
@@ -541,7 +542,7 @@ class TypedArrayTemplate
             }
 
             vp->setUndefined();
-            if (js_LookupPropertyWithFlags(cx, proto, id, cx->resolveFlags, &obj2, &prop) < 0)
+            if (!LookupPropertyWithFlags(cx, proto, id, cx->resolveFlags, &obj2, &prop))
                 return false;
 
             if (prop) {
@@ -681,13 +682,13 @@ class TypedArrayTemplate
           case JSENUMERATE_INIT_ALL:
             statep->setBoolean(true);
             if (idp)
-                *idp = INT_TO_JSID(tarray->length + 1);
+                *idp = ::INT_TO_JSID(tarray->length + 1);
             break;
 
           case JSENUMERATE_INIT:
             statep->setInt32(0);
             if (idp)
-                *idp = INT_TO_JSID(tarray->length);
+                *idp = ::INT_TO_JSID(tarray->length);
             break;
 
           case JSENUMERATE_NEXT:
@@ -697,7 +698,7 @@ class TypedArrayTemplate
             } else {
                 uint32 index = statep->toInt32();
                 if (index < uint32(tarray->length)) {
-                    *idp = INT_TO_JSID(index);
+                    *idp = ::INT_TO_JSID(index);
                     statep->setInt32(index + 1);
                 } else {
                     JS_ASSERT(index == tarray->length);
@@ -727,7 +728,7 @@ class TypedArrayTemplate
         if (!obj)
             return NULL;
 
-        ThisTypeArray *tarray = cx->create<ThisTypeArray>(bufobj, byteOffset, len);
+        ThisTypeArray *tarray = cx->new_<ThisTypeArray>(bufobj, byteOffset, len);
         if (!tarray)
             return NULL;
 
@@ -832,7 +833,7 @@ class TypedArrayTemplate
     {
         ThisTypeArray *tarray = ThisTypeArray::fromJSObject(obj);
         if (tarray)
-            cx->destroy<ThisTypeArray>(tarray);
+            cx->delete_(tarray);
     }
 
     /* subarray(start[, end]) */
@@ -843,14 +844,9 @@ class TypedArrayTemplate
         if (!obj)
             return false;
 
-        if (!InstanceOf(cx, obj, ThisTypeArray::fastClass(), vp + 2))
-            return false;
-
         if (obj->getClass() != fastClass()) {
             // someone tried to apply this subarray() to the wrong class
-            JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
-                                 JSMSG_INCOMPATIBLE_METHOD,
-                                 fastClass()->name, "subarray", obj->getClass()->name);
+            ReportIncompatibleMethod(cx, vp, fastClass());
             return false;
         }
 
@@ -905,14 +901,9 @@ class TypedArrayTemplate
         if (!obj)
             return false;
 
-        if (!InstanceOf(cx, obj, ThisTypeArray::fastClass(), vp + 2))
-            return false;
-
         if (obj->getClass() != fastClass()) {
             // someone tried to apply this set() to the wrong class
-            JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
-                                 JSMSG_INCOMPATIBLE_METHOD,
-                                 fastClass()->name, "set", obj->getClass()->name);
+            ReportIncompatibleMethod(cx, vp, fastClass());
             return false;
         }
 
@@ -1105,7 +1096,8 @@ class TypedArrayTemplate
         uint32 length = end - begin;
 
         JS_ASSERT(begin < UINT32_MAX / sizeof(NativeType));
-        uint32 byteOffset = begin * sizeof(NativeType);
+        JS_ASSERT(UINT32_MAX - begin * sizeof(NativeType) >= tarray->byteOffset);
+        uint32 byteOffset = tarray->byteOffset + begin * sizeof(NativeType);
 
         return createTypedArray(cx, bufobj, byteOffset, length);
     }
@@ -1139,7 +1131,7 @@ class TypedArrayTemplate
 
         return NativeType(int32(0));
     }
-    
+
     static bool
     copyFrom(JSContext *cx, JSObject *thisTypedArrayObj,
              JSObject *ar, jsuint len, jsuint offset = 0)
@@ -1163,7 +1155,7 @@ class TypedArrayTemplate
             Value v;
 
             for (uintN i = 0; i < len; ++i) {
-                if (!ar->getProperty(cx, INT_TO_JSID(i), &v))
+                if (!ar->getProperty(cx, ::INT_TO_JSID(i), &v))
                     return false;
                 *dest++ = nativeFromValue(cx, v);
             }
@@ -1263,7 +1255,7 @@ class TypedArrayTemplate
 
         // We have to make a copy of the source array here, since
         // there's overlap, and we have to convert types.
-        void *srcbuf = cx->malloc(tarray->byteLength);
+        void *srcbuf = cx->malloc_(tarray->byteLength);
         if (!srcbuf)
             return false;
         memcpy(srcbuf, tarray->data, tarray->byteLength);
@@ -1323,7 +1315,7 @@ class TypedArrayTemplate
             break;
         }
 
-        js_free(srcbuf);
+        UnwantedForeground::free_(srcbuf);
         return true;
     }
 
@@ -1334,7 +1326,7 @@ class TypedArrayTemplate
         if (size != 0 && count >= INT32_MAX / size) {
             JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL,
                                  JSMSG_NEED_DIET, "size and count");
-            return false;
+            return NULL;
         }
 
         int32 bytelen = size * count;
@@ -1422,7 +1414,9 @@ TypedArrayTemplate<double>::copyIndexToValue(JSContext *cx, uint32 index, Value 
 
 Class ArrayBuffer::jsclass = {
     "ArrayBuffer",
-    JSCLASS_HAS_PRIVATE | JSCLASS_HAS_CACHED_PROTO(JSProto_ArrayBuffer),
+    JSCLASS_HAS_PRIVATE |
+    JSCLASS_CONCURRENT_FINALIZER |
+    JSCLASS_HAS_CACHED_PROTO(JSProto_ArrayBuffer),
     PropertyStub,         /* addProperty */
     PropertyStub,         /* delProperty */
     PropertyStub,         /* getProperty */
@@ -1503,7 +1497,7 @@ template<> JSFunctionSpec _typedArray::jsfuncs[] = {                           \
     NULL,           /* construct   */                                          \
     NULL,           /* xdrObject   */                                          \
     NULL,           /* hasInstance */                                          \
-    NULL,           /* mark        */                                          \
+    _typedArray::obj_trace,                                                    \
     JS_NULL_CLASS_EXT,                                                         \
     {                                                                          \
         _typedArray::obj_lookupProperty,                                       \
@@ -1515,7 +1509,6 @@ template<> JSFunctionSpec _typedArray::jsfuncs[] = {                           \
         _typedArray::obj_deleteProperty,                                       \
         _typedArray::obj_enumerate,                                            \
         _typedArray::obj_typeOf,                                               \
-        _typedArray::obj_trace,                                                \
         NULL,       /* thisObject      */                                      \
         NULL,       /* clear           */                                      \
     }                                                                          \
@@ -1668,7 +1661,7 @@ TypedArrayConstruct(JSContext *cx, jsint atype, uintN argc, Value *argv)
 
       default:
         JS_NOT_REACHED("shouldn't have gotten here");
-        return false;
+        return NULL;
     }
 }
 
@@ -1715,40 +1708,4 @@ js_CreateTypedArrayWithBuffer(JSContext *cx, jsint atype, JSObject *bufArg,
 
     AutoArrayRooter tvr(cx, JS_ARRAY_LENGTH(vals), vals);
     return TypedArrayConstruct(cx, atype, argc, &vals[0]);
-}
-
-JS_FRIEND_API(JSBool)
-js_ReparentTypedArrayToScope(JSContext *cx, JSObject *obj, JSObject *scope)
-{
-    JS_ASSERT(obj);
-
-    scope = JS_GetGlobalForObject(cx, scope);
-    if (!scope)
-        return JS_FALSE;
-
-    if (!js_IsTypedArray(obj))
-        return JS_FALSE;
-
-    TypedArray *typedArray = TypedArray::fromJSObject(obj);
-
-    JSObject *buffer = typedArray->bufferJS;
-    JS_ASSERT(js_IsArrayBuffer(buffer));
-
-    JSObject *proto;
-    JSProtoKey key =
-        JSCLASS_CACHED_PROTO_KEY(&TypedArray::slowClasses[typedArray->type]);
-    if (!js_GetClassPrototype(cx, scope, key, &proto))
-        return JS_FALSE;
-
-    obj->setProto(proto);
-    obj->setParent(scope);
-
-    key = JSCLASS_CACHED_PROTO_KEY(&ArrayBuffer::jsclass);
-    if (!js_GetClassPrototype(cx, scope, key, &proto))
-        return JS_FALSE;
-
-    buffer->setProto(proto);
-    buffer->setParent(scope);
-
-    return JS_TRUE;
 }

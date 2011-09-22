@@ -307,9 +307,6 @@
 
 #ifdef _MSC_VER
 # include "jscpucfg.h"  /* We can't auto-detect MSVC configuration */
-# if _MSC_VER < 1400
-#  define NJ_NO_VARIADIC_MACROS
-# endif
 #else
 # include "jsautocfg.h" /* Use auto-detected configuration */
 #endif
@@ -323,11 +320,21 @@
 #  define JS_64BIT
 # endif
 #elif defined(__GNUC__)
-# ifdef __x86_64__
+/* Additional GCC defines are when running on Solaris, AIX, and HPUX */
+# if defined(__x86_64__) || defined(__sparcv9) || \
+        defined(__64BIT__) || defined(__LP64__)
 #  define JS_64BIT
 # endif
-#elif defined(__SUNPRO_C) || defined(__SUNPRO_CC)
-# ifdef __x86_64
+#elif defined(__SUNPRO_C) || defined(__SUNPRO_CC) /* Sun Studio C/C++ */
+# if defined(__x86_64) || defined(__sparcv9)
+#  define JS_64BIT
+# endif
+#elif defined(__xlc__) || defined(__xlC__)        /* IBM XL C/C++ */
+# if defined(__64BIT__)
+#  define JS_64BIT
+# endif
+#elif defined(__HP_cc) || defined(__HP_aCC)       /* HP-UX cc/aCC */
+# if defined(__LP64__)
 #  define JS_64BIT
 # endif
 #else

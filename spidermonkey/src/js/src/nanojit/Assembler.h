@@ -231,6 +231,23 @@ namespace nanojit
         LabelState *get(LIns *);
     };
 
+    /**
+     * Some architectures (i386, X64) can emit two branches that need patching
+     * in some situations. This is returned by asm_branch() implementations
+     * with 0, 1 or 2 of these fields set to a non-NULL value. (If only 1 is set, 
+     * it must be patch1, not patch2.)
+     */
+    struct Branches 
+    {
+        NIns* const branch1;
+        NIns* const branch2;
+        inline explicit Branches(NIns* b1 = NULL, NIns* b2 = NULL) 
+            : branch1(b1)
+            , branch2(b2)
+        {
+        }
+    };
+
     /** map tracking the register allocation state at each bailout point
      *  (represented by SideExit*) in a trace fragment. */
     typedef HashMap<SideExit*, RegAlloc*> RegAllocMap;
@@ -284,7 +301,7 @@ namespace nanojit
             void* vtuneHandle;
             #endif
 
-            Assembler(CodeAlloc& codeAlloc, Allocator& dataAlloc, Allocator& alloc, AvmCore* core, LogControl* logc, const Config& config);
+            Assembler(CodeAlloc& codeAlloc, Allocator& dataAlloc, Allocator& alloc, LogControl* logc, const Config& config);
 
             void        compile(Fragment *frag, Allocator& alloc, bool optimize
                                 verbose_only(, LInsPrinter*));
@@ -298,9 +315,6 @@ namespace nanojit
             void        releaseRegisters();
             void        patch(GuardRecord *lr);
             void        patch(SideExit *exit);
-#ifdef NANOJIT_IA32
-            void        patch(SideExit *exit, SwitchInfo* si);
-#endif
             AssmError   error()               { return _err; }
             void        setError(AssmError e) { _err = e; }
             void        cleanupAfterError();
@@ -484,26 +498,24 @@ namespace nanojit
             void        asm_nongp_copy(Register r, Register s);
             void        asm_call(LIns*);
             Register    asm_binop_rhs_reg(LIns* ins);
-            NIns*       asm_branch(bool branchOnFalse, LIns* cond, NIns* targ);
+            Branches    asm_branch(bool branchOnFalse, LIns* cond, NIns* targ);
             NIns*       asm_branch_ov(LOpcode op, NIns* targ);
-            void        asm_switch(LIns* ins, NIns* target);
             void        asm_jtbl(LIns* ins, NIns** table);
             void        asm_insert_random_nop();
-            void        emitJumpTable(SwitchInfo* si, NIns* target);
             void        assignSavedRegs();
             void        reserveSavedRegs();
             void        assignParamRegs();
             void        handleLoopCarriedExprs(InsList& pending_lives);
 
             // platform specific implementation (see NativeXXX.cpp file)
-            void        nInit(AvmCore *);
+            void        nInit();
             void        nBeginAssembly();
             Register    nRegisterAllocFromSet(RegisterMask set);
             void        nRegisterResetAll(RegAlloc& a);
             void        nPatchBranch(NIns* branch, NIns* location);
             void        nFragExit(LIns* guard);
 
-            static RegisterMask nHints[LIR_sentinel+1];
+            RegisterMask nHints[LIR_sentinel+1];
             RegisterMask nHint(LIns* ins);
 
             // A special entry for hints[];  if an opcode has this value, we call

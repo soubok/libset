@@ -1,5 +1,5 @@
 dnl -*- Mode: Autoconf; tab-width: 4; indent-tabs-mode: nil; -*-
-dnl vi: set tabstop=4 shiftwidth=4 expandtab:
+dnl vi: set tabstop=4 shiftwidth=4 expandtab syntax=m4:
 dnl ***** BEGIN LICENSE BLOCK *****
 dnl Version: MPL 1.1/GPL 2.0/LGPL 2.1
 dnl
@@ -177,7 +177,7 @@ dnl Default to MSVC for win32 and gcc-4.2 for darwin
 dnl ==============================================================
 if test -z "$CROSS_COMPILE"; then
 case "$target" in
-*-cygwin*|*-mingw*|*-msvc*|*-mks*)
+*-mingw*)
     if test -z "$CC"; then CC=cl; fi
     if test -z "$CXX"; then CXX=cl; fi
     if test -z "$CPP"; then CPP="cl -E -nologo"; fi
@@ -568,17 +568,9 @@ fi
 
 dnl Special win32 checks
 dnl ========================================================
-case "$target" in
-*-wince|*-winmo)
-    WINVER=500
-    WINSDK_TARGETVER=502
-    ;;
-*)
-    WINVER=502
-    dnl Target the Windows 7 SDK by default
-    WINSDK_TARGETVER=601
-    ;;
-esac
+WINVER=502
+dnl Target the Windows 7 SDK by default
+WINSDK_TARGETVER=601
 
 MOZ_ARG_WITH_STRING(windows-version,
 [  --with-windows-version=WINSDK_TARGETVER
@@ -600,7 +592,7 @@ case "$WINSDK_TARGETVER" in
 esac
 
 case "$target" in
-*-cygwin*|*-mingw*|*-msvc*|*-mks*|*-wince|*-winmo)
+*-mingw*)
     if test "$GCC" != "yes"; then
         # Check to see if we are really running in a msvc environemnt
         _WIN32_MSVC=1
@@ -673,10 +665,6 @@ case "$target" in
         _MOZ_RTTI_FLAGS_OFF='-GR-'
         _MOZ_EXCEPTIONS_FLAGS_ON='-EHsc'
         _MOZ_EXCEPTIONS_FLAGS_OFF=''
-
-        if test -n "$WIN32_REDIST_DIR"; then
-            WIN32_REDIST_DIR=`cd "$WIN32_REDIST_DIR" && pwd`
-        fi
 
         dnl Ensure that mt.exe is 'Microsoft (R) Manifest Tool',
         dnl not something else like "magnetic tape manipulation utility".
@@ -898,24 +886,17 @@ if test -n "$_WIN32_MSVC"; then
     # some facts here.
 
     # Common to all MSVC environments:
+
     # Windows lacks <stdint.h>, but has __int8, and so on.
     AC_DEFINE(JS_HAVE___INTN)
     AC_DEFINE(HAVE_LOCALECONV)
+    AC_DEFINE(HAVE_SYSTEMTIMETOFILETIME)
+    AC_DEFINE(HAVE_GETSYSTEMTIMEASFILETIME)
 
-    case "$target" in
-    *-wince|*-winmo)
-        AC_DEFINE(HAVE_SYSTEMTIMETOFILETIME)
-        AC_DEFINE(JS_CRTDEFS_H_HAS_INTPTR_T)
-        ;;
-    *)
-        AC_DEFINE(HAVE_SYSTEMTIMETOFILETIME)
-        AC_DEFINE(HAVE_GETSYSTEMTIMEASFILETIME)
-        # Windows <stddef.h> defines intptr_t and uintptr_t.
-        # VS2005: http://msdn.microsoft.com/en-us/library/323b6b3k(VS.80).aspx
-        # VS2008: http://msdn.microsoft.com/en-us/library/323b6b3k.aspx
-        AC_DEFINE(JS_STDDEF_H_HAS_INTPTR_T)
-        ;;
-    esac
+    # Windows <stddef.h> defines intptr_t and uintptr_t.
+    # VS2005: http://msdn.microsoft.com/en-us/library/323b6b3k(VS.80).aspx
+    # VS2008: http://msdn.microsoft.com/en-us/library/323b6b3k.aspx
+    AC_DEFINE(JS_STDDEF_H_HAS_INTPTR_T)
 fi
 
 fi # COMPILE_ENVIRONMENT
@@ -993,11 +974,6 @@ AC_SUBST(NSINSTALL_BIN)
 
 MOZ_PATH_PROG(DOXYGEN, doxygen, :)
 MOZ_PATH_PROG(AUTOCONF, autoconf, :)
-MOZ_PATH_PROG(UNZIP, unzip, :)
-MOZ_PATH_PROGS(ZIP, zip)
-if test -z "$ZIP" -o "$ZIP" = ":"; then
-    AC_MSG_ERROR([zip not found in \$PATH])
-fi
 MOZ_PATH_PROG(SYSTEM_MAKEDEPEND, makedepend)
 MOZ_PATH_PROG(XARGS, xargs)
 if test -z "$XARGS" -o "$XARGS" = ":"; then
@@ -1168,7 +1144,7 @@ if test -n "$MAKE"; then
 fi
 
 case "$host_os" in
-cygwin*|mingw*|mks*|msvc*)
+mingw*)
     MOZ_PATH_PROGS(GMAKE, $GMAKE $NOT_PYMAKE make gmake, :)
     ;;
 *)
@@ -1206,7 +1182,6 @@ ASM_SUFFIX=s
 IMPORT_LIB_SUFFIX=
 TARGET_MD_ARCH=unix
 DIRENT_INO=d_ino
-CYGWIN_WRAPPER=
 WIN_TOP_SRC=
 MOZ_USER_DIR=".mozilla"
 
@@ -1229,8 +1204,6 @@ if test -n "$CROSS_COMPILE"; then
         gnu*)         OS_ARCH=GNU ;;
         solaris*)     OS_ARCH=SunOS OS_RELEASE=5 ;;
         mingw*)       OS_ARCH=WINNT ;;
-        wince*)       OS_ARCH=WINCE ;;
-        winmo*)       OS_ARCH=WINCE ;;
         darwin*)      OS_ARCH=Darwin OS_TARGET=Darwin ;;
     esac
     case "${target}" in
@@ -1270,7 +1243,7 @@ HOST_OS_ARCH=`echo $host_os | sed -e 's|/|_|g'`
 #
 
 case "$HOST_OS_ARCH" in
-cygwin*|mingw*|mks*|msvc*)
+mingw*)
     HOST_OS_ARCH=WINNT
     ;;
 darwin*)
@@ -1321,9 +1294,6 @@ UNIX_SYSTEM_V)
     ;;
 OSF1)
     ;;
-*OpenVMS*)
-    HOST_OS_ARCH=OpenVMS
-    ;;
 OS_2)
     HOST_OS_ARCH=OS2
     ;;
@@ -1363,13 +1333,8 @@ Windows_NT)
     fi
     OS_RELEASE="${OS_RELEASE}.${OS_MINOR_RELEASE}"
     ;;
-CYGWIN32_NT|CYGWIN_NT*|MINGW*_NT*)
+MINGW*_NT*)
 #
-# If uname -s returns "CYGWIN_NT-4.0", we assume that we are using
-# the uname.exe in the Cygwin tools.
-# Prior to the Beta 20 release, Cygwin was called GNU-Win32.
-# If uname -s returns "CYGWIN32/NT", we assume that we are using
-# the uname.exe in the GNU-Win32 tools.
 # If uname -s returns MINGW32_NT-5.1, we assume that we are using
 # the uname.exe in the MSYS tools.
 #
@@ -1422,11 +1387,6 @@ OSF1)
         ;;
     esac
     ;;
-*OpenVMS*)
-    OS_ARCH=OpenVMS
-    OS_RELEASE=`uname -v`
-    OS_TEST=`uname -p`
-    ;;
 OS_2)
     OS_ARCH=OS2
     OS_TARGET=OS2
@@ -1451,19 +1411,6 @@ SINIX-N | SINIX-Y | SINIX-Z |ReliantUNIX-M)
 UnixWare)
     OS_ARCH=UNIXWARE
     OS_RELEASE=`uname -v`
-    ;;
-WINCE)
-    OS_ARCH=WINCE
-    case "${target_os}" in
-    *winmo)
-        OS_TARGET=WINMO
-        WINCE_WINDOWS_MOBILE=1
-        AC_DEFINE(WINCE_WINDOWS_MOBILE)
-        ;;
-    *)
-        OS_TARGET=WINCE
-        ;;
-    esac
     ;;
 Darwin)
     case "${target_cpu}" in
@@ -1828,13 +1775,7 @@ dnl ========================================================
 dnl System overrides of the defaults for host
 dnl ========================================================
 case "$host" in
-*-beos*)
-    HOST_CFLAGS="$HOST_CFLAGS -DXP_BEOS -DBeOS -DBEOS -D_POSIX_SOURCE -DNO_X11"
-    HOST_NSPR_MDCPUCFG='\"md/_beos.cfg\"'
-    HOST_OPTIMIZE_FLAGS="${HOST_OPTIMIZE_FLAGS=-O3}"
-    ;;
-
-*cygwin*|*mingw*|*mks*|*msvc*|*wince|*winmo)
+*mingw*)
     # we need Python 2.5 on Windows
     PYTHON_VERSION=2.5
     if test -n "$_WIN32_MSVC"; then
@@ -1843,31 +1784,15 @@ case "$host" in
         HOST_CFLAGS="$HOST_CFLAGS -TC -nologo -Fd\$(HOST_PDBFILE)"
         HOST_RANLIB='echo ranlib'
     else
-        HOST_CFLAGS="$HOST_CFLAGS -mno-cygwin"
+        HOST_CFLAGS="$HOST_CFLAGS -mwindows"
     fi
-    HOST_CFLAGS="$HOST_CFLAGS -DXP_WIN32 -DXP_WIN -DWIN32 -D_WIN32 -DNO_X11"
+    HOST_CFLAGS="$HOST_CFLAGS -DXP_WIN32 -DXP_WIN -DWIN32 -D_WIN32 -DNO_X11 -D_CRT_SECURE_NO_WARNINGS"
     HOST_NSPR_MDCPUCFG='\"md/_winnt.cfg\"'
     HOST_OPTIMIZE_FLAGS="${HOST_OPTIMIZE_FLAGS=-O2}"
     HOST_BIN_SUFFIX=.exe
     case "$host" in
     *mingw*)
-    dnl MinGW/MSYS does not need CYGWIN_WRAPPER
         PERL="/bin/sh ${_topsrcdir}/build/msys-perl-wrapper"
-        ;;
-    *)
-        CYGWIN_WRAPPER="${srcdir}/build/cygwin-wrapper"
-        if test "`echo ${srcdir} | grep -c ^/ 2>/dev/null`" = 0; then
-            _pwd=`pwd`
-            CYGWIN_WRAPPER="${_pwd}/${srcdir}/build/cygwin-wrapper"
-        fi
-        if test "`${PERL} -v | grep -c cygwin  2>/dev/null`" = 0; then
-            AS_PERL=1
-            PERL="${CYGWIN_WRAPPER} $PERL"
-        fi
-
-        if test "`${PYTHON} -c 'import sys; print sys.platform;'`" != "cygwin"; then
-            PYTHON="${CYGWIN_WRAPPER} $PYTHON"
-        fi
         ;;
     esac
 
@@ -1921,6 +1846,8 @@ if test "$_python_res" != 0; then
     AC_MSG_ERROR([Python $PYTHON_VERSION or higher (but not Python 3.x) is required.])
 fi
 AC_MSG_RESULT([yes])
+
+MOZ_DOING_LTO(lto_is_enabled)
 
 dnl ========================================================
 dnl System overrides of the defaults for target
@@ -1983,24 +1910,6 @@ case "$target" in
     AC_DEFINE(NSCAP_DISABLE_DEBUG_PTR_TYPES)
     ;;
 
-*-beos*)
-    no_x=yes
-    MKSHLIB='$(CXX) $(CXXFLAGS) $(DSO_LDOPTS) -Wl,-h,$@ -o $@'
-    _PLATFORM_DEFAULT_TOOLKIT="cairo-beos"
-    DSO_LDOPTS='-nostart'
-    TK_LIBS='-lbe -lroot'
-    LIBS="$LIBS -lbe"
-    if test "$COMPILE_ENVIRONMENT"; then
-        AC_CHECK_LIB(bind,main,LIBS="$LIBS -lbind")
-        AC_CHECK_LIB(zeta,main,LIBS="$LIBS -lzeta")
-    fi
-    _WARNINGS_CFLAGS="${_WARNINGS_CFLAGS} -Wno-multichar"
-    _WARNINGS_CXXFLAGS="${_WARNINGS_CXXFLAGS} -Wno-multichar"
-    _MOZ_USE_RTTI=1
-    USE_DEPENDENT_LIBS=
-    MOZ_USER_DIR="Mozilla"
-    ;;
-
 *-bsdi*)
     dnl -pedantic doesn't play well with BSDI's _very_ modified gcc (shlicc2)
     _PEDANTIC=
@@ -2044,9 +1953,11 @@ case "$target" in
     # builds.
     MOZ_DEBUG_LDFLAGS="$MOZ_DEBUG_LDFLAGS -framework ExceptionHandling"
 
+    if test "x$lto_is_enabled" = "xyes"; then
+        echo "Skipping -dead_strip because lto is enabled."
     dnl DTrace and -dead_strip don't interact well. See bug 403132.
     dnl ===================================================================
-    if test "x$enable_dtrace" = "xyes"; then
+    elif test "x$enable_dtrace" = "xyes"; then
         echo "Skipping -dead_strip because DTrace is enabled. See bug 403132."
     else
         dnl check for the presence of the -dead_strip linker flag
@@ -2191,10 +2102,12 @@ ia64*-hpux*)
         esac
         # If we're building with --enable-profiling, we need a frame pointer.
         if test -z "$MOZ_PROFILING"; then
-            MOZ_OPTIMIZE_FLAGS="-Os -freorder-blocks -fomit-frame-pointer $MOZ_OPTIMIZE_SIZE_TWEAK"
+            MOZ_FRAMEPTR_FLAGS="-fomit-frame-pointer"
         else
-            MOZ_OPTIMIZE_FLAGS="-Os -freorder-blocks -fno-omit-frame-pointer $MOZ_OPTIMIZE_SIZE_TWEAK"
+            MOZ_FRAMEPTR_FLAGS="-fno-omit-frame-pointer"
         fi
+        MOZ_PGO_OPTIMIZE_FLAGS="-O3 $MOZ_FRAMEPTR_FLAGS"
+        MOZ_OPTIMIZE_FLAGS="-Os -freorder-blocks $MOZ_OPTIMIZE_SIZE_TWEAK $MOZ_FRAMEPTR_FLAGS"
         MOZ_DEBUG_FLAGS="-g"
     fi
 
@@ -2210,101 +2123,6 @@ ia64*-hpux*)
     ;;
     esac
     ;;
-
-*-wince*|*-winmo*)
-    TARGET_COMPILER_ABI=msvc
-    MOZ_TOOLS_DIR=`echo $MOZ_TOOLS`
-    AR_LIST="$AR -list"
-    AR_EXTRACT="$AR -extract"
-    AR_DELETE="$AR d"
-    AR_FLAGS='-OUT:"$@"'
-    AS="$AS_BIN"
-
-    DSO_CFLAGS=
-    DSO_PIC_CFLAGS=
-    DLL_SUFFIX=.dll
-    BIN_SUFFIX='.exe'
-    if test -z "$RC"; then 
-        RC=rc.exe  
-    fi
-    # certain versions of cygwin's makedepend barf on the 
-    # #include <string> vs -I./dist/include/string issue so don't use it
-    SYSTEM_MAKEDEPEND=
-
-    HOST_CC=cl
-    HOST_CXX=cl
-    HOST_LD=link
-    HOST_AR='lib -OUT:$@'
-    HOST_RANLIB='echo ranlib'
-    HOST_CFLAGS="$HOST_CFLAGS -D_X86_"
-        
-        
-    WARNINGS_AS_ERRORS='-WX'
-    MOZ_OPTIMIZE_FLAGS='-Ox'
-    AR_FLAGS='-NOLOGO -OUT:"$@"'
-    ASM_SUFFIX=asm
-    CFLAGS="$CFLAGS -W3 -Gy -Fd\$(COMPILE_PDBFILE)"
-    CXXFLAGS="$CXXFLAGS -W3 -Gy -Fd\$(COMPILE_PDBFILE)"
-    DLL_PREFIX=
-    DOXYGEN=:
-    DSO_LDOPTS=-SUBSYSTEM:WINDOWSCE
-    DYNAMIC_XPCOM_LIBS='$(LIBXUL_DIST)/lib/xpcom.lib $(LIBXUL_DIST)/lib/xpcom_core.lib $(LIBXUL_DIST)/lib/mozalloc.lib'
-    GARBAGE=
-    IMPORT_LIB_SUFFIX=lib
-    dnl Need to force-link against mozalloc because it's used in the shunt
-    LIBS="$LIBS \$(LIBXUL_DIST)/lib/mozalloc.lib"
-    LIBXUL_LIBS='$(LIBXUL_DIST)/lib/xpcom.lib $(LIBXUL_DIST)/lib/xul.lib $(LIBXUL_DIST)/lib/mozalloc.lib'
-    LIB_PREFIX=
-    LIB_SUFFIX=lib 
-    MKCSHLIB='$(LD) -NOLOGO -DLL -OUT:$@ $(DSO_LDOPTS)'
-    MKSHLIB='$(LD) -NOLOGO -DLL -OUT:$@ $(DSO_LDOPTS)'
-    MKSHLIB_FORCE_ALL=
-    MKSHLIB_UNFORCE_ALL=
-    MOZ_COMPONENT_NSPR_LIBS='$(NSPR_LIBS)'
-    MOZ_COMPONENT_NSPR_LIBS='$(NSPR_LIBS)'
-    MOZ_DEBUG_FLAGS='-Zi'
-    MOZ_DEBUG_LDFLAGS='-DEBUG -DEBUGTYPE:CV'
-    MOZ_FIX_LINK_PATHS=
-    MOZ_JS_LIBS='$(libdir)/mozjs.lib'
-    OBJ_SUFFIX=obj
-    RANLIB='echo not_ranlib'
-    STRIP='echo not_strip'
-    TARGET_NSPR_MDCPUCFG='\"md/_wince.cfg\"'
-    UNZIP=unzip
-    XARGS=xargs
-    XPCOM_FROZEN_LDOPTS='$(LIBXUL_DIST)/lib/xpcom.lib $(LIBXUL_DIST)/lib/mozalloc.lib'
-    ZIP=zip
-
-    AC_DEFINE(HAVE_SNPRINTF)
-    AC_DEFINE(_WINDOWS)
-    AC_DEFINE(WIN32)
-    AC_DEFINE(XP_WIN)
-    AC_DEFINE(XP_WIN32)
-    AC_DEFINE(HW_THREADS)
-    AC_DEFINE(STDC_HEADERS)
-    AC_DEFINE(NEW_H, <new>)
-    AC_DEFINE(WIN32_LEAN_AND_MEAN)
-    AC_DEFINE(HAVE_LOCALTIME_R)
-
-    TARGET_MD_ARCH=win32
-    _PLATFORM_DEFAULT_TOOLKIT='cairo-windows'
-    BIN_SUFFIX='.exe'
-    MOZ_USER_DIR="Mozilla"
-
-    dnl Default to Windows Mobile components enabled
-    WINCE_WINDOWS_MOBILE=1
-
-    MOZ_ARG_DISABLE_BOOL(windows-mobile-components,
-    [  --disable-windows-mobile-components
-                          Disable Windows Mobile specific components from
-                          CE build],
-    WINCE_WINDOWS_MOBILE=,
-    WINCE_WINDOWS_MOBILE=1)
- 
-    if test "$WINCE_WINDOWS_MOBILE"; then
-        AC_DEFINE(WINCE_WINDOWS_MOBILE)
-    fi
-;;
 
 *-symbian*)
 
@@ -2334,7 +2152,7 @@ ia64*-hpux*)
     RANLIB='echo no ranlib '
 ;;
 
-*-mingw*|*-cygwin*|*-msvc*|*-mks*)
+*-mingw*)
     DSO_CFLAGS=
     DSO_PIC_CFLAGS=
     DLL_SUFFIX=.dll
@@ -2343,9 +2161,9 @@ ia64*-hpux*)
     # #include <string> vs -I./dist/include/string issue so don't use it
     SYSTEM_MAKEDEPEND=
     if test -n "$GNU_CC"; then
-        CC="$CC -mno-cygwin"
-        CXX="$CXX -mno-cygwin"
-        CPP="$CPP -mno-cygwin"
+        CC="$CC -mwindows"
+        CXX="$CXX -mwindows"
+        CPP="$CPP -mwindows"
         CFLAGS="$CFLAGS -mms-bitfields"
         CXXFLAGS="$CXXFLAGS -mms-bitfields"
         DSO_LDOPTS='-shared'
@@ -2371,14 +2189,13 @@ ia64*-hpux*)
         if test "$AS_BIN"; then
             AS="$(basename "$AS_BIN")"
         fi
-        AR='lib -NOLOGO -OUT:"$@"'
-        AR_FLAGS=
+        AR='lib'
+        AR_FLAGS='-NOLOGO -OUT:"$@"'
+        AR_EXTRACT=
         RANLIB='echo not_ranlib'
         STRIP='echo not_strip'
         PKG_SKIP_STRIP=1
         XARGS=xargs
-        ZIP=zip
-        UNZIP=unzip
         DOXYGEN=:
         GARBAGE='$(OBJDIR)/vc20.pdb $(OBJDIR)/vc40.pdb'
         ASM_SUFFIX=asm
@@ -2455,42 +2272,31 @@ ia64*-hpux*)
     no_x=yes
     AC_DEFINE(NO_X11)
 
-    dnl MinGW/MSYS doesn't provide or need cygpath
     case "$host" in
     *-mingw*)
-	CYGPATH_W=echo
-	CYGPATH_S=cat
-	MOZ_BUILD_ROOT=`cd $MOZ_BUILD_ROOT && pwd -W`
-	;;
-    *-cygwin*|*-msvc*|*-mks*)
-	CYGPATH_W="cygpath -a -w"
-	CYGPATH_S="sed -e s|\\\\|/|g"
-	MOZ_BUILD_ROOT=`$CYGPATH_W $MOZ_BUILD_ROOT | $CYGPATH_S`
-	;;
+        MOZ_BUILD_ROOT=`cd $MOZ_BUILD_ROOT && pwd -W`
+        ;;
     esac
+
     case "$host" in
-    *-mingw*|*-cygwin*|*-msvc*|*-mks*)
-
-    if test -z "$MOZ_TOOLS"; then
-        AC_MSG_ERROR([MOZ_TOOLS is not set])
-    fi
-
-    MOZ_TOOLS_DIR=`cd $MOZ_TOOLS && pwd -W`
-    if test "$?" != "0" -o -z "$MOZ_TOOLS_DIR"; then
-        AC_MSG_ERROR([cd \$MOZ_TOOLS failed. MOZ_TOOLS ==? $MOZ_TOOLS])
-    fi
-    MOZ_TOOLS_BIN_DIR="$(cd "$MOZ_TOOLS_DIR/bin" && pwd)"
-    if test `echo ${PATH}: | grep -ic "$MOZ_TOOLS_BINDIR:"` = 0; then
-        AC_MSG_ERROR([\$MOZ_TOOLS\\bin must be in your path.])
-    fi
-    MOZ_TOOLS_DIR=`$CYGPATH_W $MOZ_TOOLS_DIR | $CYGPATH_S`
-    ;;
+    *-mingw*)
+        if test -z "$MOZ_TOOLS"; then
+            AC_MSG_ERROR([MOZ_TOOLS is not set])
+        fi
+        MOZ_TOOLS_DIR=`cd $MOZ_TOOLS && pwd -W`
+        if test "$?" != "0" -o -z "$MOZ_TOOLS_DIR"; then
+            AC_MSG_ERROR([cd \$MOZ_TOOLS failed. MOZ_TOOLS ==? $MOZ_TOOLS])
+        fi
+        MOZ_TOOLS_BIN_DIR="$(cd "$MOZ_TOOLS_DIR/bin" && pwd)"
+        if test `echo ${PATH}: | grep -ic "$MOZ_TOOLS_BINDIR:"` = 0; then
+            AC_MSG_ERROR([\$MOZ_TOOLS\\bin must be in your path.])
+        fi
+        ;;
     esac 
-
 
     case "$host_os" in
     cygwin*|msvc*|mks*)
-        AC_MSG_WARN([Using a cygwin build environment is unsupported. Configure cannot check for the presence of necessary headers. Please upgrade to MozillaBuild; see https://developer.mozilla.org/en/Windows_Build_Prerequisites.])
+        AC_MSG_ERROR([Using a Cygwin build environment is unsupported. Configure cannot check for presence of necessary headers. Please upgrade to MozillaBuild; see https://developer.mozilla.org/en/Windows_Build_Prerequisites.])
         ;;
     esac
 
@@ -2511,12 +2317,6 @@ ia64*-hpux*)
 
     	AC_CHECK_HEADERS(mmintrin.h)
     	AC_DEFINE(_X86_)
-	;;
-    alpha-*)
-    	AC_DEFINE(_ALPHA_)
-	;;
-    mips-*)
-    	AC_DEFINE(_MIPS_)
 	;;
     x86_64-*)
         AC_DEFINE(_AMD64_)
@@ -2590,25 +2390,6 @@ ia64*-hpux*)
 	DSO_LDOPTS="-R$LIBRUNPATH $DSO_LDOPTS"
     fi
     ;;
-
-*-openvms*) 
-    AC_DEFINE(NO_PW_GECOS)
-    AC_DEFINE(NO_UDSOCK)
-    AC_DEFINE(POLL_WITH_XCONNECTIONNUMBER)
-    USE_PTHREADS=1
-    MKSHLIB_FORCE_ALL='-all'
-    MKSHLIB_UNFORCE_ALL='-none'
-    AS='as'
-    AS_DASH_C_FLAG='-Wc/names=as_is'
-    AR_FLAGS='c $@'
-    DSO_LDOPTS='-shared -auto_symvec'
-    DSO_PIC_CFLAGS=
-    MOZ_DEBUG_LDFLAGS='-g'
-    COMPAQ_CXX=1
-    CC_VERSION=`$CC -V 2>&1 | awk '/ C / { print $3 }'`
-    CXX_VERSION=`$CXX -V 2>&1 | awk '/ C\+\+ / { print $3 }'`
-    ;;
-
 
 *-os2*)
     MKSHLIB='$(CXX) $(CXXFLAGS) $(DSO_PIC_CFLAGS) $(DSO_LDOPTS) -o $@'
@@ -2752,7 +2533,6 @@ alpha*-*-osf*)
                        ,
                        [LDFLAGS=$_SAVE_LDFLAGS])
        fi
-       WARNINGS_AS_ERRORS='-Werror'
        MOZ_OPTIMIZE_FLAGS="-xO4"
        MKSHLIB='$(CXX) $(CXXFLAGS) $(DSO_PIC_FLAGS) $(DSO_LDOPTS) -h $@ -o $@'
        MKCSHLIB='$(CC) $(CFLAGS) $(DSO_PIC_FLAGS) $(DSO_LDOPTS) -h $@ -o $@'
@@ -2802,6 +2582,7 @@ alpha*-*-osf*)
        MKSHLIB_UNFORCE_ALL='-Wl,-z -Wl,defaultextract'
        ASFLAGS="$ASFLAGS -fPIC"
        DSO_LDOPTS='-shared'
+       WARNINGS_AS_ERRORS='-Werror'
        _WARNINGS_CFLAGS=''
        _WARNINGS_CXXFLAGS=''
        if test "$OS_RELEASE" = "5.3"; then
@@ -2877,10 +2658,7 @@ case "$target" in
 *-aix4.3*|*-aix5*)
     NO_LD_ARCHIVE_FLAGS=
     ;;
-*-openvms*)
-    NO_LD_ARCHIVE_FLAGS=
-    ;;
-*-msvc*|*-mks*|*-mingw*|*-cygwin*|*-wince|*-winmo)
+*-mingw*)
     if test -z "$GNU_CC"; then
         NO_LD_ARCHIVE_FLAGS=
     fi
@@ -2912,7 +2690,7 @@ case "$target" in
     *-darwin*)
         MOZ_COMPONENTS_VERSION_SCRIPT_LDFLAGS='-Wl,-exported_symbols_list -Wl,$(BUILD_TOOLS)/gnu-ld-scripts/components-export-list'
         ;;
-    *-cygwin*|*-mingw*|*-mks*|*-msvc|*-wince|*-winmo)
+    *-mingw*)
         if test -n "$GNU_CC"; then
            MOZ_COMPONENTS_VERSION_SCRIPT_LDFLAGS='-Wl,--version-script,$(BUILD_TOOLS)/gnu-ld-scripts/components-version-script'
         fi
@@ -2959,7 +2737,12 @@ arm*-*)
 sparc*-*)
     ENABLE_TRACEJIT=1
     NANOJIT_ARCH=Sparc
+    ENABLE_METHODJIT=1
+    ENABLE_MONOIC=1
+    ENABLE_POLYIC=1
+    ENABLE_POLYIC_TYPED_ARRAY=1
     AC_DEFINE(JS_CPU_SPARC)
+    AC_DEFINE(JS_NUNBOX32)
     ;;
 esac
 
@@ -3041,10 +2824,13 @@ case "$target" in
 *-freebsd*|*-kfreebsd*)
     AC_DEFINE(AVMPLUS_UNIX)
     ;;
+*-openbsd*)
+    AC_DEFINE(AVMPLUS_UNIX)
+    ;;
 *-gnu*)
     AC_DEFINE(AVMPLUS_UNIX)
     ;;
-*-cygwin*|*-mingw*|*-mks*|*-msvc*|*-wince|*-winmo)
+*-mingw*)
     AC_DEFINE(AVMPLUS_WIN32)
     ;;
 *-os2*)
@@ -3477,7 +3263,16 @@ case $target in
 esac
 
 dnl Performance measurement headers.
-AC_CHECK_HEADER(linux/perf_event.h, HAVE_LINUX_PERF_EVENT_H=1)
+AC_CHECK_HEADER(linux/perf_event.h,
+    [AC_CACHE_CHECK(for perf_event_open system call,ac_cv_perf_event_open,
+        [AC_TRY_COMPILE([#include <sys/syscall.h>],[return sizeof(__NR_perf_event_open);],
+        ac_cv_perf_event_open=yes,
+        ac_cv_perf_event_open=no)])])
+if test "$ac_cv_perf_event_open" = "yes"; then
+    HAVE_LINUX_PERF_EVENT_H=1
+else
+    HAVE_LINUX_PERF_EVENT_H=
+fi
 AC_SUBST(HAVE_LINUX_PERF_EVENT_H)
 
 dnl Checks for libraries.
@@ -3491,15 +3286,13 @@ case $target in
 esac
 
 dnl We don't want to link with libdl even if it's present on OS X, since
-dnl it's not used and not part of the default installation.
-dnl The same goes for BeOS. OS/2 has dlfcn in libc.
+dnl it's not used and not part of the default installation. OS/2 has dlfcn
+dnl in libc.
 dnl We don't want to link against libm or libpthread on Darwin since
 dnl they both are just symlinks to libSystem and explicitly linking
 dnl against libSystem causes issues when debugging (see bug 299601).
 case $target in
 *-darwin*)
-    ;;
-*-beos*)
     ;;
 *-os2*)
     ;;
@@ -3535,32 +3328,35 @@ case $target in
     AC_CHECK_LIB(socket, socket)
 esac
 
-AC_MSG_CHECKING(for ARM SIMD support in compiler)
-AC_TRY_COMPILE([],
-               [asm("uqadd8 r1, r1, r2");],
-               result="yes", result="no")
-AC_MSG_RESULT("$result")
-if test "$result" = "yes"; then
-    AC_DEFINE(HAVE_ARM_SIMD)
-    HAVE_ARM_SIMD=1
-fi
-AC_SUBST(HAVE_ARM_SIMD)
+if test "$CPU_ARCH" = "arm"; then
+  AC_MSG_CHECKING(for ARM SIMD support in compiler)
+  AC_TRY_COMPILE([],
+                 [asm("uqadd8 r1, r1, r2");],
+                 result="yes", result="no")
+  AC_MSG_RESULT("$result")
+  if test "$result" = "yes"; then
+      AC_DEFINE(HAVE_ARM_SIMD)
+      HAVE_ARM_SIMD=1
+  fi
 
-AC_MSG_CHECKING(for ARM NEON support in compiler)
-_SAVE_CFLAGS="$CFLAGS"
-if test "$GNU_CC"; then
-  # gcc needs -mfpu=neon to recognize NEON instructions
-  CFLAGS="$CFLAGS -mfpu=neon -mfloat-abi=softfp"
+  AC_MSG_CHECKING(for ARM NEON support in compiler)
+  _SAVE_CFLAGS="$CFLAGS"
+  if test "$GNU_CC"; then
+    # gcc needs -mfpu=neon to recognize NEON instructions
+    CFLAGS="$CFLAGS -mfpu=neon -mfloat-abi=softfp"
+  fi
+  AC_TRY_COMPILE([],
+                 [asm("vadd.i8 d0, d0, d0");],
+                 result="yes", result="no")
+  AC_MSG_RESULT("$result")
+  if test "$result" = "yes"; then
+      AC_DEFINE(HAVE_ARM_NEON)
+      HAVE_ARM_NEON=1
+  fi
+  CFLAGS="$_SAVE_CFLAGS"
 fi
-AC_TRY_COMPILE([],
-               [asm("vadd.i8 d0, d0, d0");],
-               result="yes", result="no")
-AC_MSG_RESULT("$result")
-if test "$result" = "yes"; then
-    AC_DEFINE(HAVE_ARM_NEON)
-    HAVE_ARM_NEON=1
-fi
-CFLAGS="$_SAVE_CFLAGS"
+
+AC_SUBST(HAVE_ARM_SIMD)
 AC_SUBST(HAVE_ARM_NEON)
 
 dnl ========================================================
@@ -3859,7 +3655,7 @@ if test "$ac_cv_func_gnu_get_libc_version" = "yes"; then
 fi
 
 case $target_os in
-    os2*|msvc*|mks*|cygwin*|mingw*|darwin*|wince*|winmo*|beos*)
+    darwin*|mingw*|os2*)
         ;;
     *)
     
@@ -4482,8 +4278,7 @@ if test "$ac_cv_i18n_lc_messages" = yes; then
 fi
 
 AC_HAVE_FUNCS(localeconv)
-
-fi # SKIP_COMPILER_CHECKS
+fi # ! SKIP_COMPILER_CHECKS
 
 TARGET_XPCOM_ABI=
 if test -n "${CPU_ARCH}" -a -n "${TARGET_COMPILER_ABI}"; then
@@ -4599,7 +4394,6 @@ dnl ========================================================
 
 MOZ_ARG_HEADER(Application)
 
-BUILD_STATIC_LIBS=
 ENABLE_TESTS=1
 
 MOZ_THUMB2=
@@ -4825,17 +4619,7 @@ AC_SUBST(MOZ_OPTIMIZE)
 AC_SUBST(MOZ_OPTIMIZE_FLAGS)
 AC_SUBST(MOZ_OPTIMIZE_LDFLAGS)
 AC_SUBST(MOZ_OPTIMIZE_SIZE_TWEAK)
-
-dnl ========================================================
-dnl = (Deprecated) generation of debugger info for specific modules
-dnl ========================================================
-MOZ_ARG_ENABLE_STRING(debugger-info-modules,
-[  --enable-debugger-info-modules
-                          Enable/disable debugger info for specific modules],
-[ if test "$enableval" != "no"; then
-    AC_MSG_WARN([--enable-debugger-info-modules is deprecated, use --enable-debug-symbols instead])
-    MOZ_DEBUG_SYMBOLS=1
-  fi ])
+AC_SUBST(MOZ_PGO_OPTIMIZE_FLAGS)
 
 dnl ========================================================
 dnl = Enable generation of debug symbols
@@ -4852,7 +4636,10 @@ MOZ_ARG_ENABLE_STRING(debug-symbols,
               AC_MSG_ERROR([--enable-debug-symbols flags cannot be used with --enable-debug flags])
           fi
       fi
-  fi ])
+  else
+      MOZ_DEBUG_SYMBOLS=
+  fi ],
+  MOZ_DEBUG_SYMBOLS=1)
 
 if test -n "$MOZ_DEBUG" -o -n "$MOZ_DEBUG_SYMBOLS"; then
     AC_DEFINE(MOZ_DEBUG_SYMBOLS)
@@ -4870,6 +4657,17 @@ MOZ_ARG_DISABLE_BOOL(warnings-as-errors,
 if test "$MOZ_DISABLE_WARNINGS_AS_ERRORS"; then
    WARNINGS_AS_ERRORS=''
 fi
+
+dnl ========================================================
+dnl = Enable treating compile warnings as errors
+dnl ========================================================
+MOZ_ARG_ENABLE_BOOL(sm-fail-on-warnings,
+[  --enable-sm-fail-on-warnings
+                          Enable warnings as errors],
+    FAIL_ON_WARNINGS=1,
+    FAIL_ON_WARNINGS= )
+
+AC_SUBST(FAIL_ON_WARNINGS)
 
 dnl = Enable trace malloc
 dnl ========================================================
@@ -4944,20 +4742,9 @@ if test "$MOZ_MEMORY"; then
   *-solaris*)
     AC_DEFINE(MOZ_MEMORY_SOLARIS)
     ;;
-  *-msvc*|*-mks*|*-cygwin*|*-mingw*)
+  *-mingw*)
     AC_DEFINE(MOZ_MEMORY_WINDOWS)
     # the interesting bits will get passed down in MOZ_MEMORY_LDFLAGS
-    ;;
-  *-*wince)
-    AC_DEFINE(MOZ_MEMORY_WINCE)
-    AC_DEFINE(MOZ_MEMORY_WINDOWS)
-    if test -z "$WINCE_WINDOWS_MOBILE"; then
-      AC_DEFINE(MOZ_MEMORY_WINCE6)
-    fi
-    ;;
-  *-*winmo)
-    AC_DEFINE(MOZ_MEMORY_WINCE)
-    AC_DEFINE(MOZ_MEMORY_WINDOWS)
     ;;
   *-android*)
     AC_DEFINE(MOZ_MEMORY_LINUX)
@@ -5034,6 +4821,17 @@ MOZ_ARG_ENABLE_BOOL(gctimer,
     MOZ_GCTIMER= )
 if test -n "$MOZ_GCTIMER"; then
     AC_DEFINE(MOZ_GCTIMER)
+fi
+
+dnl ========================================================
+dnl = Don't enable GC-TestPilot plumbing
+dnl ========================================================
+JSGC_TESTPILOT=1
+MOZ_ARG_DISABLE_BOOL(gctestpilot,
+[  --disable-gctestpilot    Disable GC TestPilot study hooks],
+    JSGC_TESTPILOT= )
+if test -n "$JSGC_TESTPILOT"; then
+    AC_DEFINE(JSGC_TESTPILOT)
 fi
 
 dnl ========================================================
@@ -5289,19 +5087,10 @@ else
 fi
 
 dnl ========================================================
-dnl Profile guided optimization
+dnl Profile guided optimization (gcc checks)
 dnl ========================================================
 dnl Test for profiling options
 dnl Under gcc 3.4+, use -fprofile-generate/-fprofile-use
-
-dnl Provide a switch to disable PGO even when called via profiledbuild.
-MOZ_ARG_DISABLE_BOOL(profile-guided-optimization,
-[  --disable-profile-guided-optimization
-                          Don't build with PGO even if called via make profiledbuild],
-MOZ_PROFILE_GUIDED_OPTIMIZE_DISABLE=1,
-MOZ_PROFILE_GUIDED_OPTIMIZE_DISABLE=)
-
-AC_SUBST(MOZ_PROFILE_GUIDED_OPTIMIZE_DISABLE)
 
 _SAVE_CFLAGS="$CFLAGS"
 CFLAGS="$CFLAGS -fprofile-generate -fprofile-correction"
@@ -5314,7 +5103,7 @@ AC_MSG_RESULT([$result])
 
 if test $result = "yes"; then
   PROFILE_GEN_LDFLAGS="-fprofile-generate"
-  PROFILE_USE_CFLAGS="-fprofile-use -fprofile-correction -Wcoverage-mismatch -freorder-blocks-and-partition"
+  PROFILE_USE_CFLAGS="-fprofile-use -fprofile-correction -Wcoverage-mismatch"
   PROFILE_USE_LDFLAGS="-fprofile-use"
 fi
 
@@ -5453,8 +5242,7 @@ AC_CACHE_CHECK(for tm_zone tm_gmtoff in struct tm,
 if test "$ac_cv_struct_tm_zone_tm_gmtoff" = "yes" ; then
     AC_DEFINE(HAVE_TM_ZONE_TM_GMTOFF)
 fi
-
-fi # SKIP_COMPILER_CHECKS
+fi # ! SKIP_COMPILER_CHECKS
 
 dnl ========================================================
 dnl C++ rtti
@@ -5502,6 +5290,38 @@ AC_LANG_C
 
 dnl ========================================================
 dnl =
+dnl = Check what kind of list files are supported by the
+dnl = linker
+dnl =
+dnl ========================================================
+
+AC_CACHE_CHECK(what kind of list files are supported by the linker,
+    EXPAND_LIBS_LIST_STYLE,
+    [echo "int main() {return 0;}" > conftest.${ac_ext}
+     if AC_TRY_COMMAND(${CC-cc} -o conftest.${OBJ_SUFFIX} -c $CFLAGS $CPPFLAGS conftest.${ac_ext} 1>&2) && test -s conftest.${OBJ_SUFFIX}; then
+         echo "INPUT(conftest.${OBJ_SUFFIX})" > conftest.list
+         if AC_TRY_COMMAND(${CC-cc} -o conftest${ac_exeext} $LDFLAGS conftest.list $LIBS 1>&2) && test -s conftest${ac_exeext}; then
+             EXPAND_LIBS_LIST_STYLE=linkerscript
+         else
+             echo "conftest.${OBJ_SUFFIX}" > conftest.list
+             if AC_TRY_COMMAND(${CC-cc} -o conftest${ac_exeext} $LDFLAGS @conftest.list $LIBS 1>&2) && test -s conftest${ac_exeext}; then
+                 EXPAND_LIBS_LIST_STYLE=list
+             else
+                 EXPAND_LIBS_LIST_STYLE=none
+             fi
+         fi
+     else
+         dnl We really don't expect to get here, but just in case
+         AC_ERROR([couldn't compile a simple C file])
+     fi
+     rm -rf conftest*])
+
+LIBS_DESC_SUFFIX=desc
+AC_SUBST(LIBS_DESC_SUFFIX)
+AC_SUBST(EXPAND_LIBS_LIST_STYLE)
+
+dnl ========================================================
+dnl =
 dnl = Build depencency options
 dnl =
 dnl ========================================================
@@ -5526,7 +5346,7 @@ MOZ_ARG_DISABLE_BOOL(md,
   [_cpp_md_flag=],
   [_cpp_md_flag=1],
   [dnl Default is to turn on -MD if using GNU-compatible compilers
-   if test "$GNU_CC" -a "$GNU_CXX" -a "$OS_ARCH" != "WINNT" -a "$OS_ARCH" != "WINCE"; then
+   if test "$GNU_CC" -a "$GNU_CXX"; then
      _cpp_md_flag=1
    fi
   dnl Default is to use -xM if using Sun Studio on Solaris
@@ -5535,11 +5355,7 @@ MOZ_ARG_DISABLE_BOOL(md,
    fi])
 if test "$_cpp_md_flag"; then
   COMPILER_DEPEND=1
-  if test "$OS_ARCH" = "OpenVMS"; then
-    _DEPEND_CFLAGS='$(subst =, ,$(filter-out %/.pp,-MM=-MD=-MF=$(MDDEPDIR)/$(basename $(@F)).pp))'
-  else
-    _DEPEND_CFLAGS='$(filter-out %/.pp,-MD -MF $(MDDEPDIR)/$(basename $(@F)).pp)'
-  fi
+  _DEPEND_CFLAGS='$(filter-out %/.pp,-MD -MF $(MDDEPDIR)/$(basename $(@F)).pp)'
   dnl Sun Studio on Solaris use -xM instead of -MD, see config/rules.mk
   if test "$SOLARIS_SUNPRO_CC"; then
     _DEPEND_CFLAGS=
@@ -5578,18 +5394,6 @@ AC_SUBST(CXX_WRAPPER)
 
 
 dnl ========================================================
-dnl =
-dnl = Static Build Options
-dnl =
-dnl ========================================================
-MOZ_ARG_HEADER(Static build options)
-
-MOZ_ARG_ENABLE_BOOL(static,
-[  --enable-static         Enable building of internal static libs],
-    BUILD_STATIC_LIBS=1,
-    BUILD_STATIC_LIBS=)
-
-dnl ========================================================
 dnl = Link js shell to system readline
 dnl ========================================================
 MOZ_ARG_ENABLE_BOOL(readline,
@@ -5602,7 +5406,7 @@ EDITLINE_LIBS=
 JS_DISABLE_SHELL=
 
 case "$target" in
-*-wince*|*-winmo*|*-mingw*|*-cygwin*|*-msvc*|*-mks*)
+*-mingw*)
     NO_EDITLINE=1
     ;;
 *-symbian*)
@@ -5704,11 +5508,9 @@ AC_SUBST(MOZ_SHARK)
 AC_SUBST(MOZ_CALLGRIND)
 AC_SUBST(MOZ_VTUNE)
 AC_SUBST(MOZ_PROFILING)
-AC_SUBST(MOZ_JSLOADER)
 AC_SUBST(MOZ_QUANTIFY)
 AC_SUBST(LIBICONV)
 
-AC_SUBST(BUILD_STATIC_LIBS)
 AC_SUBST(ENABLE_TESTS)
 
 AC_SUBST(ENABLE_STRIP)
@@ -5743,14 +5545,7 @@ dnl win32 options
 AC_SUBST(MOZ_MAPINFO)
 AC_SUBST(MOZ_BROWSE_INFO)
 AC_SUBST(MOZ_TOOLS_DIR)
-AC_SUBST(CYGWIN_WRAPPER)
-AC_SUBST(AS_PERL)
-AC_SUBST(WIN32_REDIST_DIR)
 AC_SUBST(PYTHON)
-
-AC_SUBST(WINCE)
-AC_SUBST(WINCE_SDK_DIR)
-AC_SUBST(WINCE_WINDOWS_MOBILE)
 
 dnl Echo the CFLAGS to remove extra whitespace.
 CFLAGS=`echo \
@@ -5885,7 +5680,7 @@ if test "$MOZ_X11"; then
     [ AC_MSG_ERROR([Could not compile basic X program.]) ])
     CFLAGS="$_SAVE_CFLAGS"
 
-    if test ! -z "$MISSING_X"; then
+    if test -n "$MISSING_X"; then
         AC_MSG_ERROR([ Could not find the following X libraries: $MISSING_X ]);
     fi
 
@@ -5895,15 +5690,11 @@ fi # COMPILE_ENVIRONMENT
 dnl Set various defines and substitutions
 dnl ========================================================
 
-if test "$OS_ARCH" = "BeOS"; then
-  AC_DEFINE(XP_BEOS)
-elif test "$OS_ARCH" = "Darwin"; then
+if test "$OS_ARCH" = "Darwin"; then
   AC_DEFINE(XP_MACOSX)
   AC_DEFINE(XP_UNIX)
   AC_DEFINE(UNIX_ASYNC_DNS)
-elif test "$OS_ARCH" = "OpenVMS"; then
-  AC_DEFINE(XP_UNIX)
-elif test "$OS_ARCH" != "WINNT" -a "$OS_ARCH" != "OS2" -a "$OS_ARCH" != "WINCE"; then
+elif test "$OS_ARCH" != "WINNT" -a "$OS_ARCH" != "OS2"; then
   AC_DEFINE(XP_UNIX)
   AC_DEFINE(UNIX_ASYNC_DNS)
 fi
@@ -5935,28 +5726,12 @@ dnl ========================================================
 AC_HAVE_FUNCS(setlocale)
 AC_HAVE_FUNCS(localeconv)
 
-dnl ========================================================
-dnl Use cygwin wrapper for win32 builds, except MSYS/MinGW
-dnl ========================================================
 case "$host_os" in
 mingw*)
     WIN_TOP_SRC=`cd $srcdir; pwd -W`
     ;;
-cygwin*|msvc*|mks*)
-    HOST_CC="\$(CYGWIN_WRAPPER) $HOST_CC"
-    HOST_CXX="\$(CYGWIN_WRAPPER) $HOST_CXX"
-    CC="\$(CYGWIN_WRAPPER) $CC"
-    CXX="\$(CYGWIN_WRAPPER) $CXX"
-    CPP="\$(CYGWIN_WRAPPER) $CPP"
-    LD="\$(CYGWIN_WRAPPER) $LD"
-    AS="\$(CYGWIN_WRAPPER) $AS"
-    RC="\$(CYGWIN_WRAPPER) $RC"
-    CYGDRIVE_MOUNT=`mount -p | awk '{ if (/^\//) { print $1; exit } }'`
-    WIN_TOP_SRC=`cygpath -a -w $srcdir | sed -e 's|\\\\|/|g'`
-    ;;
 esac
 
-AC_SUBST(CYGDRIVE_MOUNT)
 AC_SUBST(WIN_TOP_SRC)
 
 AC_SUBST(MOZILLA_VERSION)
@@ -6026,6 +5801,7 @@ MAKEFILES="
   tests/Makefile
   config/Makefile
   config/autoconf.mk
+  config/expandlibs_config.py
   config/mkdepend/Makefile
 "
 
@@ -6044,13 +5820,7 @@ dnl If it fails, nothing is set and config.status will run as usual.
 dnl
 dnl This does not change the $MAKEFILES variable.
 dnl
-dnl OpenVMS gets a line overflow on the long eval command, so use a temp file.
-dnl
-if test -z "${AS_PERL}"; then
 echo $MAKEFILES | ${PERL} $srcdir/build/autoconf/acoutput-fast.pl > conftest.sh
-else
-echo $MAKEFILES | ${PERL} $srcdir/build/autoconf/acoutput-fast.pl -nowrap --cygwin-srcdir=$srcdir > conftest.sh
-fi
 . ./conftest.sh
 rm conftest.sh
 
@@ -6085,9 +5855,6 @@ if test "$JS_HAS_CTYPES"; then
   fi
   if test "$CROSS_COMPILE"; then
     case "$target" in
-    *-mingw*)
-      ac_configure_args="$ac_configure_args --build=$build --host=${target_cpu}-${target_os} HOST_CC=\"$HOST_CC\" CC=\"$CC\""
-      ;;
     *-android*)
       CFLAGS="$ANDROID_CFLAGS"
       CPPFLAGS="$ANDROID_CPPFLAGS"

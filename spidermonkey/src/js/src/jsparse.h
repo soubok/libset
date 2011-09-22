@@ -305,7 +305,7 @@ namespace js {
 
 struct GlobalScope {
     GlobalScope(JSContext *cx, JSObject *globalObj, JSCodeGenerator *cg)
-      : globalObj(globalObj), cg(cg), defs(ContextAllocPolicy(cx))
+      : globalObj(globalObj), cg(cg), defs(cx)
     { }
 
     struct GlobalDef {
@@ -334,7 +334,7 @@ struct GlobalScope {
      * A definition may either specify an existing global property, or a new
      * one that must be added after compilation succeeds.
      */
-    Vector<GlobalDef, 16, ContextAllocPolicy> defs;
+    Vector<GlobalDef, 16> defs;
     JSAtomList      names;
 };
 
@@ -601,7 +601,7 @@ public:
      */
     bool isEscapeFreeStringLiteral() const {
         JS_ASSERT(pn_type == js::TOK_STRING && !pn_parens);
-        JSString *str = ATOM_TO_STRING(pn_atom);
+        JSString *str = pn_atom;
 
         /*
          * If the string's length in the source code is its length as a value,
@@ -974,6 +974,8 @@ struct JSFunctionBox : public JSObjectBox
                         level:JSFB_LEVEL_BITS;
     uint32              tcflags;
 
+    JSFunction *function() const { return (JSFunction *) object; }
+
     bool joinable() const;
 
     /*
@@ -981,6 +983,12 @@ struct JSFunctionBox : public JSObjectBox
      * filter-expression, or a function that uses direct eval.
      */
     bool inAnyDynamicScope() const;
+
+    /* 
+     * Must this function's descendants be marked as having an extensible
+     * ancestor?
+     */
+    bool scopeIsExtensible() const;
 
     /*
      * Unbrand an object being initialized or constructed if any method cannot
@@ -1008,11 +1016,11 @@ struct JSFunctionBoxQueue {
 
     bool init(uint32 count) {
         lengthMask = JS_BITMASK(JS_CeilingLog2(count));
-        vector = js_array_new<JSFunctionBox*>(length());
+        vector = js::OffTheBooks::array_new<JSFunctionBox*>(length());
         return !!vector;
     }
 
-    ~JSFunctionBoxQueue() { js_array_delete(vector); }
+    ~JSFunctionBoxQueue() { js::UnwantedForeground::array_delete(vector); }
 
     void push(JSFunctionBox *funbox) {
         if (!funbox->queued) {
@@ -1040,23 +1048,24 @@ namespace js {
 
 struct Parser : private js::AutoGCRooter
 {
-    JSContext           * const context; /* FIXME Bug 551291: use AutoGCRooter::context? */
+    JSContext           *const context; /* FIXME Bug 551291: use AutoGCRooter::context? */
     JSAtomListElement   *aleFreeList;
     void                *tempFreeList[NUM_TEMP_FREELISTS];
     TokenStream         tokenStream;
     void                *tempPoolMark;  /* initial JSContext.tempPool mark */
     JSPrincipals        *principals;    /* principals associated with source */
-    JSStackFrame *const callerFrame;    /* scripted caller frame for eval and dbgapi */
-    JSObject     *const callerVarObj;   /* callerFrame's varObj */
+    StackFrame          *const callerFrame;  /* scripted caller frame for eval and dbgapi */
+    JSObject            *const callerVarObj; /* callerFrame's varObj */
     JSParseNode         *nodeList;      /* list of recyclable parse-node structs */
     uint32              functionCount;  /* number of functions in current unit */
     JSObjectBox         *traceListHead; /* list of parsed object for GC tracing */
     JSTreeContext       *tc;            /* innermost tree context (stack-allocated) */
+    js::EmptyShape      *emptyCallShape;/* empty shape for Call objects */
 
     /* Root atoms and objects allocated for the parsed tree. */
     js::AutoKeepAtoms   keepAtoms;
 
-    Parser(JSContext *cx, JSPrincipals *prin = NULL, JSStackFrame *cfp = NULL);
+    Parser(JSContext *cx, JSPrincipals *prin = NULL, StackFrame *cfp = NULL);
     ~Parser();
 
     friend void js::AutoGCRooter::trace(JSTracer *trc);
@@ -1110,6 +1119,7 @@ struct Parser : private js::AutoGCRooter
     bool analyzeFunctions(JSTreeContext *tc);
     void cleanFunctionList(JSFunctionBox **funbox);
     bool markFunArgs(JSFunctionBox *funbox);
+    void markExtensibleScopeDescendants(JSFunctionBox *funbox, bool hasExtensibleParent);
     void setFunctionKinds(JSFunctionBox *funbox, uint32 *tcflags);
 
     void trace(JSTracer *trc);
@@ -1127,6 +1137,14 @@ private:
      * object, pointed to by this->tc.
      *
      * Each returns a parse node tree or null on error.
+     *
+     * Parsers whose name has a '1' suffix leave the TokenStream state
+     * pointing to the token one past the end of the parsed fragment.  For a
+     * number of the parsers this is convenient and avoids a lot of
+     * unnecessary ungetting and regetting of tokens.
+     *
+     * Some parsers have two versions:  an always-inlined version (with an 'i'
+     * suffix) and a never-inlined version (with an 'n' suffix).
      */
     JSParseNode *functionStmt();
     JSParseNode *functionExpr();
@@ -1143,17 +1161,26 @@ private:
     JSParseNode *variables(bool inLetHead);
     JSParseNode *expr();
     JSParseNode *assignExpr();
-    JSParseNode *condExpr();
-    JSParseNode *orExpr();
-    JSParseNode *andExpr();
-    JSParseNode *bitOrExpr();
-    JSParseNode *bitXorExpr();
-    JSParseNode *bitAndExpr();
-    JSParseNode *eqExpr();
-    JSParseNode *relExpr();
-    JSParseNode *shiftExpr();
-    JSParseNode *addExpr();
-    JSParseNode *mulExpr();
+    JSParseNode *condExpr1();
+    JSParseNode *orExpr1();
+    JSParseNode *andExpr1i();
+    JSParseNode *andExpr1n();
+    JSParseNode *bitOrExpr1i();
+    JSParseNode *bitOrExpr1n();
+    JSParseNode *bitXorExpr1i();
+    JSParseNode *bitXorExpr1n();
+    JSParseNode *bitAndExpr1i();
+    JSParseNode *bitAndExpr1n();
+    JSParseNode *eqExpr1i();
+    JSParseNode *eqExpr1n();
+    JSParseNode *relExpr1i();
+    JSParseNode *relExpr1n();
+    JSParseNode *shiftExpr1i();
+    JSParseNode *shiftExpr1n();
+    JSParseNode *addExpr1i();
+    JSParseNode *addExpr1n();
+    JSParseNode *mulExpr1i();
+    JSParseNode *mulExpr1n();
     JSParseNode *unaryExpr();
     JSParseNode *memberExpr(JSBool allowCallSyntax);
     JSParseNode *primaryExpr(js::TokenKind tt, JSBool afterDot);
@@ -1211,7 +1238,7 @@ struct Compiler
     Parser parser;
     GlobalScope *globalScope;
 
-    Compiler(JSContext *cx, JSPrincipals *prin = NULL, JSStackFrame *cfp = NULL);
+    Compiler(JSContext *cx, JSPrincipals *prin = NULL, StackFrame *cfp = NULL);
 
     /*
      * Initialize a compiler. Parameters are passed on to init parser.
@@ -1228,7 +1255,7 @@ struct Compiler
                         const char *filename, uintN lineno, JSVersion version);
 
     static JSScript *
-    compileScript(JSContext *cx, JSObject *scopeChain, JSStackFrame *callerFrame,
+    compileScript(JSContext *cx, JSObject *scopeChain, StackFrame *callerFrame,
                   JSPrincipals *principals, uint32 tcflags,
                   const jschar *chars, size_t length,
                   const char *filename, uintN lineno, JSVersion version,

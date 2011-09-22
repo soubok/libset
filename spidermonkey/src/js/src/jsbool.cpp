@@ -56,6 +56,7 @@
 
 #include "jsinterpinlines.h"
 #include "jsobjinlines.h"
+#include "jsstrinlines.h"
 
 using namespace js;
 
@@ -100,7 +101,7 @@ bool_toString(JSContext *cx, uintN argc, Value *vp)
         return false;
 
     JSAtom *atom = cx->runtime->atomState.booleanAtoms[b ? 1 : 0];
-    JSString *str = ATOM_TO_STRING(atom);
+    JSString *str = atom;
     if (!str)
         return JS_FALSE;
     vp->setString(str);
@@ -124,7 +125,6 @@ static JSFunctionSpec boolean_methods[] = {
 #endif
     JS_FN(js_toString_str,  bool_toString,  0, 0),
     JS_FN(js_valueOf_str,   bool_valueOf,   0, 0),
-    JS_FN(js_toJSON_str,    bool_valueOf,   0, 0),
     JS_FS_END
 };
 
@@ -162,7 +162,7 @@ js_InitBooleanClass(JSContext *cx, JSObject *obj)
 JSString *
 js_BooleanToString(JSContext *cx, JSBool b)
 {
-    return ATOM_TO_STRING(cx->runtime->atomState.booleanAtoms[b ? 1 : 0]);
+    return cx->runtime->atomState.booleanAtoms[b ? 1 : 0];
 }
 
 /* This function implements E-262-3 section 9.8, toString. */
