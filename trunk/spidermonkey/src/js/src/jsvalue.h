@@ -89,24 +89,19 @@
 
 /* To avoid a circular dependency, pull in the necessary pieces of jsnum.h. */
 
-#include <math.h>
-#if defined(XP_WIN) || defined(XP_OS2)
-#include <float.h>
-#endif
-#ifdef SOLARIS
-#include <ieeefp.h>
-#endif
+#define JSDOUBLE_SIGNBIT (((uint64) 1) << 63)
+#define JSDOUBLE_EXPMASK (((uint64) 0x7ff) << 52)
+#define JSDOUBLE_MANTMASK ((((uint64) 1) << 52) - 1)
 
-static inline int
+static JS_ALWAYS_INLINE JSBool
 JSDOUBLE_IS_NEGZERO(jsdouble d)
 {
-#ifdef WIN32
-    return (d == 0 && (_fpclass(d) & _FPCLASS_NZ));
-#elif defined(SOLARIS)
-    return (d == 0 && copysign(1, d) < 0);
-#else
-    return (d == 0 && signbit(d));
-#endif
+    union {
+        jsdouble d;
+        uint64 bits;
+    } x;
+    x.d = d;
+    return x.bits == JSDOUBLE_SIGNBIT;
 }
 
 static inline bool
@@ -254,7 +249,7 @@ static JS_ALWAYS_INLINE JSBool
 JSVAL_SAME_TYPE_IMPL(jsval_layout lhs, jsval_layout rhs)
 {
     uint64 lbits = lhs.asBits, rbits = rhs.asBits;
-    return (lbits <= JSVAL_TAG_MAX_DOUBLE && rbits <= JSVAL_TAG_MAX_DOUBLE) ||
+    return (lbits <= JSVAL_SHIFTED_TAG_MAX_DOUBLE && rbits <= JSVAL_SHIFTED_TAG_MAX_DOUBLE) ||
            (((lbits ^ rbits) & 0xFFFF800000000000LL) == 0);
 }
 
@@ -376,8 +371,18 @@ class Value
     }
 
     JS_ALWAYS_INLINE
+    void setString(const JS::Anchor<JSString *> &str) {
+        setString(str.get());
+    }
+
+    JS_ALWAYS_INLINE
     void setObject(JSObject &obj) {
         data = OBJECT_TO_JSVAL_IMPL(&obj);
+    }
+
+    JS_ALWAYS_INLINE
+    void setObject(const JS::Anchor<JSObject *> &obj) {
+        setObject(*obj.get());
     }
 
     JS_ALWAYS_INLINE
@@ -924,8 +929,6 @@ typedef JSBool
 (* AttributesOp)(JSContext *cx, JSObject *obj, jsid id, uintN *attrsp);
 typedef JSType
 (* TypeOfOp)(JSContext *cx, JSObject *obj);
-typedef void
-(* TraceOp)(JSTracer *trc, JSObject *obj);
 typedef JSObject *
 (* ObjectOp)(JSContext *cx, JSObject *obj);
 typedef void
@@ -988,8 +991,7 @@ static const JSFinalizeOp     FinalizeStub       = JS_FinalizeStub;
     Native              construct;                                            \
     JSXDRObjectOp       xdrObject;                                            \
     HasInstanceOp       hasInstance;                                          \
-    JSMarkOp            mark
-
+    JSTraceOp           trace
 
 /*
  * The helper struct to measure the size of JS_CLASS_MEMBERS to know how much
@@ -1019,7 +1021,6 @@ struct ObjectOps {
     js::DeleteIdOp          deleteProperty;
     js::NewEnumerateOp      enumerate;
     js::TypeOfOp            typeOf;
-    js::TraceOp             trace;
     js::FixOp               fix;
     js::ObjectOp            thisObject;
     js::FinalizeOp          clear;
@@ -1058,7 +1059,7 @@ JS_STATIC_ASSERT(offsetof(JSClass, call) == offsetof(Class, call));
 JS_STATIC_ASSERT(offsetof(JSClass, construct) == offsetof(Class, construct));
 JS_STATIC_ASSERT(offsetof(JSClass, xdrObject) == offsetof(Class, xdrObject));
 JS_STATIC_ASSERT(offsetof(JSClass, hasInstance) == offsetof(Class, hasInstance));
-JS_STATIC_ASSERT(offsetof(JSClass, mark) == offsetof(Class, mark));
+JS_STATIC_ASSERT(offsetof(JSClass, trace) == offsetof(Class, trace));
 JS_STATIC_ASSERT(sizeof(JSClass) == sizeof(Class));
 
 struct PropertyDescriptor {

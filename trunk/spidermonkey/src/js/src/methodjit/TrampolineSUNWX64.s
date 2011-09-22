@@ -37,8 +37,8 @@
 
 .text
 
-/ JSBool JaegerTrampoline(JSContext *cx, JSStackFrame *fp, void *code,
-/                        JSFrameRegs *regs, uintptr_t inlineCallCount)
+/ JSBool JaegerTrampoline(JSContext *cx, StackFrame *fp, void *code,
+/                         FrameRegs *regs, uintptr_t inlineCallCount)
 .global JaegerTrampoline
 .type   JaegerTrampoline, @function
 JaegerTrampoline:
@@ -129,17 +129,3 @@ JaegerThrowpoline:
     ret
 .size   JaegerThrowpoline, . - JaegerThrowpoline
 
-.global InjectJaegerReturn
-.type   InjectJaegerReturn, @function
-InjectJaegerReturn:
-    movq 0x30(%rbx), %rcx        /* load fp->rval_ into typeReg */
-    movq 0x28(%rbx), %rax        /* fp->ncode_ */
-
-    /* Reimplementation of PunboxAssembler::loadValueAsComponents() */
-    movq %r14, %rdx              /* payloadReg = payloadMaskReg */
-    andq %rcx, %rdx
-    xorq %rdx, %rcx
-
-    movq 0x38(%rsp), %rbx        /* f.fp */
-    jmp *%rax                    /* return. */
-.size   InjectJaegerReturn, . - InjectJaegerReturn

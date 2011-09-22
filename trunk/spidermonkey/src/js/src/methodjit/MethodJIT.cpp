@@ -62,20 +62,20 @@ js::mjit::CompilerAllocPolicy::CompilerAllocPolicy(JSContext *cx, Compiler &comp
 {
 }
 void
-JSStackFrame::methodjitStaticAsserts()
+StackFrame::methodjitStaticAsserts()
 {
         /* Static assert for x86 trampolines in MethodJIT.cpp. */
 #if defined(JS_CPU_X86)
-        JS_STATIC_ASSERT(offsetof(JSStackFrame, rval_)     == 0x18);
-        JS_STATIC_ASSERT(offsetof(JSStackFrame, rval_) + 4 == 0x1C);
-        JS_STATIC_ASSERT(offsetof(JSStackFrame, ncode_)    == 0x14);
+        JS_STATIC_ASSERT(offsetof(StackFrame, rval_)     == 0x18);
+        JS_STATIC_ASSERT(offsetof(StackFrame, rval_) + 4 == 0x1C);
+        JS_STATIC_ASSERT(offsetof(StackFrame, ncode_)    == 0x14);
         /* ARM uses decimal literals. */
-        JS_STATIC_ASSERT(offsetof(JSStackFrame, rval_)     == 24);
-        JS_STATIC_ASSERT(offsetof(JSStackFrame, rval_) + 4 == 28);
-        JS_STATIC_ASSERT(offsetof(JSStackFrame, ncode_)    == 20);
+        JS_STATIC_ASSERT(offsetof(StackFrame, rval_)     == 24);
+        JS_STATIC_ASSERT(offsetof(StackFrame, rval_) + 4 == 28);
+        JS_STATIC_ASSERT(offsetof(StackFrame, ncode_)    == 20);
 #elif defined(JS_CPU_X64)
-        JS_STATIC_ASSERT(offsetof(JSStackFrame, rval_)     == 0x30);
-        JS_STATIC_ASSERT(offsetof(JSStackFrame, ncode_)    == 0x28);
+        JS_STATIC_ASSERT(offsetof(StackFrame, rval_)     == 0x30);
+        JS_STATIC_ASSERT(offsetof(StackFrame, ncode_)    == 0x28);
 #endif
 }
 
@@ -105,11 +105,6 @@ JSStackFrame::methodjitStaticAsserts()
  *    at. Because the jit-code ABI conditions are satisfied, we can just jump to
  *    that point.
  *
- * InjectJaegerReturn - Implements the tail of InlineReturn. This is needed for
- *    tracer integration, where a "return" opcode might not be a safe-point,
- *    and thus the return path must be injected by hijacking the stub return
- *    address.
- *
  *  - Used by RunTracer()
  */
 
@@ -124,7 +119,7 @@ extern "C" void JS_FASTCALL
 PushActiveVMFrame(VMFrame &f)
 {
     f.entryfp->script()->compartment->jaegerCompartment->pushActiveFrame(&f);
-    f.regs.fp->setNativeReturnAddress(JS_FUNC_TO_DATA_PTR(void*, JaegerTrampolineReturn));
+    f.regs.fp()->setNativeReturnAddress(JS_FUNC_TO_DATA_PTR(void*, JaegerTrampolineReturn));
 }
 
 extern "C" void JS_FASTCALL
@@ -136,7 +131,8 @@ PopActiveVMFrame(VMFrame &f)
 extern "C" void JS_FASTCALL
 SetVMFrameRegs(VMFrame &f)
 {
-    f.cx->setCurrentRegs(&f.regs);
+    /* Restored on exit from EnterMethodJIT. */
+    f.cx->stack.repointRegs(&f.regs);
 }
 
 #if defined(__APPLE__) || (defined(XP_WIN) && !defined(JS_CPU_X64)) || defined(XP_OS2)
@@ -145,7 +141,7 @@ SetVMFrameRegs(VMFrame &f)
 # define SYMBOL_STRING(name) #name
 #endif
 
-JS_STATIC_ASSERT(offsetof(JSFrameRegs, sp) == 0);
+JS_STATIC_ASSERT(offsetof(FrameRegs, sp) == 0);
 
 #if defined(__linux__) && defined(JS_CPU_X64)
 # define SYMBOL_STRING_RELOC(name) #name "@plt"
@@ -167,7 +163,7 @@ JS_STATIC_ASSERT(offsetof(JSFrameRegs, sp) == 0);
 # define HIDE_SYMBOL(name)
 #endif
 
-#if defined(__GNUC__)
+#if defined(__GNUC__) && !defined(_WIN64)
 
 /* If this assert fails, you need to realign VMFrame to 16 bytes. */
 #ifdef JS_CPU_ARM
@@ -184,12 +180,12 @@ JS_STATIC_ASSERT(sizeof(VMFrame) % 16 == 0);
  *    *** DANGER ***
  */
 JS_STATIC_ASSERT(offsetof(VMFrame, savedRBX) == 0x58);
-JS_STATIC_ASSERT(offsetof(VMFrame, regs.fp) == 0x38);
+JS_STATIC_ASSERT(VMFrame::offsetOfFp == 0x38);
 
 JS_STATIC_ASSERT(JSVAL_TAG_MASK == 0xFFFF800000000000LL);
 JS_STATIC_ASSERT(JSVAL_PAYLOAD_MASK == 0x00007FFFFFFFFFFFLL);
 
-asm volatile (
+asm (
 ".text\n"
 ".globl " SYMBOL_STRING(JaegerTrampoline) "\n"
 SYMBOL_STRING(JaegerTrampoline) ":"       "\n"
@@ -236,7 +232,7 @@ SYMBOL_STRING(JaegerTrampoline) ":"       "\n"
     "jmp *0(%rsp)"                      "\n"
 );
 
-asm volatile (
+asm (
 ".text\n"
 ".globl " SYMBOL_STRING(JaegerTrampolineReturn) "\n"
 SYMBOL_STRING(JaegerTrampolineReturn) ":"       "\n"
@@ -256,7 +252,7 @@ SYMBOL_STRING(JaegerTrampolineReturn) ":"       "\n"
     "ret"                                "\n"
 );
 
-asm volatile (
+asm (
 ".text\n"
 ".globl " SYMBOL_STRING(JaegerThrowpoline)  "\n"
 SYMBOL_STRING(JaegerThrowpoline) ":"        "\n"
@@ -279,24 +275,6 @@ SYMBOL_STRING(JaegerThrowpoline) ":"        "\n"
     "ret"                                   "\n"
 );
 
-JS_STATIC_ASSERT(offsetof(VMFrame, regs.fp) == 0x38);
-
-asm volatile (
-".text\n"
-".globl " SYMBOL_STRING(InjectJaegerReturn)   "\n"
-SYMBOL_STRING(InjectJaegerReturn) ":"         "\n"
-    "movq 0x30(%rbx), %rcx"                 "\n" /* load fp->rval_ into typeReg */
-    "movq 0x28(%rbx), %rax"                 "\n" /* fp->ncode_ */
-
-    /* Reimplementation of PunboxAssembler::loadValueAsComponents() */
-    "movq %r14, %rdx"                       "\n" /* payloadReg = payloadMaskReg */
-    "andq %rcx, %rdx"                       "\n"
-    "xorq %rdx, %rcx"                       "\n"
-
-    "movq 0x38(%rsp), %rbx"                 "\n" /* f.fp */
-    "jmp *%rax"                             "\n" /* return. */
-);
-
 # elif defined(JS_CPU_X86)
 
 /*
@@ -307,9 +285,9 @@ SYMBOL_STRING(InjectJaegerReturn) ":"         "\n"
  *    *** DANGER ***
  */
 JS_STATIC_ASSERT(offsetof(VMFrame, savedEBX) == 0x2c);
-JS_STATIC_ASSERT(offsetof(VMFrame, regs.fp) == 0x1C);
+JS_STATIC_ASSERT((VMFrame::offsetOfFp) == 0x1C);
 
-asm volatile (
+asm (
 ".text\n"
 ".globl " SYMBOL_STRING(JaegerTrampoline) "\n"
 SYMBOL_STRING(JaegerTrampoline) ":"       "\n"
@@ -339,7 +317,7 @@ SYMBOL_STRING(JaegerTrampoline) ":"       "\n"
     "jmp *16(%ebp)"                      "\n"
 );
 
-asm volatile (
+asm (
 ".text\n"
 ".globl " SYMBOL_STRING(JaegerTrampolineReturn) "\n"
 SYMBOL_STRING(JaegerTrampolineReturn) ":" "\n"
@@ -357,7 +335,7 @@ SYMBOL_STRING(JaegerTrampolineReturn) ":" "\n"
     "ret"                                "\n"
 );
 
-asm volatile (
+asm (
 ".text\n"
 ".globl " SYMBOL_STRING(JaegerThrowpoline)  "\n"
 SYMBOL_STRING(JaegerThrowpoline) ":"        "\n"
@@ -386,19 +364,6 @@ SYMBOL_STRING(JaegerThrowpoline) ":"        "\n"
     "ret"                                "\n"
 );
 
-JS_STATIC_ASSERT(offsetof(VMFrame, regs.fp) == 0x1C);
-
-asm volatile (
-".text\n"
-".globl " SYMBOL_STRING(InjectJaegerReturn)   "\n"
-SYMBOL_STRING(InjectJaegerReturn) ":"         "\n"
-    "movl 0x18(%ebx), %edx"                 "\n" /* fp->rval_ data */
-    "movl 0x1C(%ebx), %ecx"                 "\n" /* fp->rval_ type */
-    "movl 0x14(%ebx), %eax"                 "\n" /* fp->ncode_ */
-    "movl 0x1C(%esp), %ebx"                 "\n" /* f.fp */
-    "jmp *%eax"                             "\n"
-);
-
 # elif defined(JS_CPU_ARM)
 
 JS_STATIC_ASSERT(sizeof(VMFrame) == 80);
@@ -406,7 +371,7 @@ JS_STATIC_ASSERT(offsetof(VMFrame, savedLR) ==          (4*19));
 JS_STATIC_ASSERT(offsetof(VMFrame, entryfp) ==          (4*10));
 JS_STATIC_ASSERT(offsetof(VMFrame, stackLimit) ==       (4*9));
 JS_STATIC_ASSERT(offsetof(VMFrame, cx) ==               (4*8));
-JS_STATIC_ASSERT(offsetof(VMFrame, regs.fp) ==          (4*7));
+JS_STATIC_ASSERT(VMFrame::offsetOfFp ==                 (4*7));
 JS_STATIC_ASSERT(offsetof(VMFrame, unused) ==           (4*4));
 JS_STATIC_ASSERT(offsetof(VMFrame, previous) ==         (4*3));
 
@@ -423,20 +388,7 @@ JS_STATIC_ASSERT(JSReturnReg_Type == JSC::ARMRegisters::r2);
 #define FUNCTION_HEADER_EXTRA
 #endif
 
-asm volatile (
-".text\n"
-FUNCTION_HEADER_EXTRA
-".globl " SYMBOL_STRING(InjectJaegerReturn) "\n"
-SYMBOL_STRING(InjectJaegerReturn) ":"       "\n"
-    /* Restore frame regs. */
-    "ldr lr, [r11, #20]"                    "\n" /* fp->ncode */
-    "ldr r1, [r11, #24]"                    "\n" /* fp->rval data */
-    "ldr r2, [r11, #28]"                    "\n" /* fp->rval type */
-    "ldr r11, [sp, #28]"                    "\n" /* load f.fp */
-    "bx  lr"                                "\n"
-);
-
-asm volatile (
+asm (
 ".text\n"
 FUNCTION_HEADER_EXTRA
 ".globl " SYMBOL_STRING(JaegerTrampoline)   "\n"
@@ -495,7 +447,7 @@ SYMBOL_STRING(JaegerTrampoline) ":"         "\n"
 "   bx     r4"                                  "\n"
 );
 
-asm volatile (
+asm (
 ".text\n"
 FUNCTION_HEADER_EXTRA
 ".globl " SYMBOL_STRING(JaegerTrampolineReturn)   "\n"
@@ -515,7 +467,7 @@ SYMBOL_STRING(JaegerTrampolineReturn) ":"         "\n"
 "   pop     {r4-r11,pc}"                    "\n"
 );
 
-asm volatile (
+asm (
 ".text\n"
 FUNCTION_HEADER_EXTRA
 ".globl " SYMBOL_STRING(JaegerThrowpoline)  "\n"
@@ -540,7 +492,7 @@ SYMBOL_STRING(JaegerThrowpoline) ":"        "\n"
 "   pop     {r4-r11,pc}"                    "\n"
 );
 
-asm volatile (
+asm (
 ".text\n"
 FUNCTION_HEADER_EXTRA
 ".globl " SYMBOL_STRING(JaegerStubVeneer)   "\n"
@@ -555,12 +507,11 @@ SYMBOL_STRING(JaegerStubVeneer) ":"         "\n"
 "   pop     {ip,pc}"                        "\n"
 );
 
+# elif defined(JS_CPU_SPARC)
 # else
 #  error "Unsupported CPU!"
 # endif
-#elif defined(_MSC_VER)
-
-#if defined(JS_CPU_X86)
+#elif defined(_MSC_VER) && defined(JS_CPU_X86)
 
 /*
  *    *** DANGER ***
@@ -570,22 +521,11 @@ SYMBOL_STRING(JaegerStubVeneer) ":"         "\n"
  *    *** DANGER ***
  */
 JS_STATIC_ASSERT(offsetof(VMFrame, savedEBX) == 0x2c);
-JS_STATIC_ASSERT(offsetof(VMFrame, regs.fp) == 0x1C);
+JS_STATIC_ASSERT(VMFrame::offsetOfFp == 0x1C);
 
 extern "C" {
 
-    __declspec(naked) void InjectJaegerReturn()
-    {
-        __asm {
-            mov edx, [ebx + 0x18];
-            mov ecx, [ebx + 0x1C];
-            mov eax, [ebx + 0x14];
-            mov ebx, [esp + 0x1C];
-            jmp eax;
-        }
-    }
-
-    __declspec(naked) JSBool JaegerTrampoline(JSContext *cx, JSStackFrame *fp, void *code,
+    __declspec(naked) JSBool JaegerTrampoline(JSContext *cx, StackFrame *fp, void *code,
                                               Value *stackLimit)
     {
         __asm {
@@ -666,7 +606,9 @@ extern "C" {
     }
 }
 
-#elif defined(JS_CPU_X64)
+// Windows x64 uses assembler version since compiler doesn't support
+// inline assembler
+#elif defined(_WIN64)
 
 /*
  *    *** DANGER ***
@@ -674,28 +616,22 @@ extern "C" {
  *    *** DANGER ***
  */
 JS_STATIC_ASSERT(offsetof(VMFrame, savedRBX) == 0x58);
-JS_STATIC_ASSERT(offsetof(VMFrame, regs.fp) == 0x38);
+JS_STATIC_ASSERT(VMFrame::offsetOfFp == 0x38);
 JS_STATIC_ASSERT(JSVAL_TAG_MASK == 0xFFFF800000000000LL);
 JS_STATIC_ASSERT(JSVAL_PAYLOAD_MASK == 0x00007FFFFFFFFFFFLL);
 
-// Windows x64 uses assembler version since compiler doesn't support
-// inline assembler
-#else
-#  error "Unsupported CPU!"
-#endif
-
-#endif                   /* _MSC_VER */
+#endif                   /* _WIN64 */
 
 bool
 JaegerCompartment::Initialize()
 {
-    execAlloc = JSC::ExecutableAllocator::create();
-    if (!execAlloc)
+    execAlloc_ = js::OffTheBooks::new_<JSC::ExecutableAllocator>();
+    if (!execAlloc_)
         return false;
     
-    TrampolineCompiler tc(execAlloc, &trampolines);
+    TrampolineCompiler tc(execAlloc_, &trampolines);
     if (!tc.compile()) {
-        delete execAlloc;
+        delete execAlloc_;
         return false;
     }
 
@@ -713,7 +649,7 @@ void
 JaegerCompartment::Finish()
 {
     TrampolineCompiler::release(&trampolines);
-    js_delete(execAlloc);
+    Foreground::delete_(execAlloc_);
 #ifdef JS_METHODJIT_PROFILE_STUBS
     FILE *fp = fopen("/tmp/stub-profiling", "wt");
 # define OPDEF(op,val,name,image,length,nuses,ndefs,prec,format) \
@@ -725,10 +661,10 @@ JaegerCompartment::Finish()
 }
 
 extern "C" JSBool
-JaegerTrampoline(JSContext *cx, JSStackFrame *fp, void *code, Value *stackLimit);
+JaegerTrampoline(JSContext *cx, StackFrame *fp, void *code, Value *stackLimit);
 
 JSBool
-mjit::EnterMethodJIT(JSContext *cx, JSStackFrame *fp, void *code, Value *stackLimit)
+mjit::EnterMethodJIT(JSContext *cx, StackFrame *fp, void *code, Value *stackLimit)
 {
 #ifdef JS_METHODJIT_SPEW
     Profiler prof;
@@ -739,21 +675,25 @@ mjit::EnterMethodJIT(JSContext *cx, JSStackFrame *fp, void *code, Value *stackLi
     prof.start();
 #endif
 
-    JS_ASSERT(cx->regs->fp  == fp);
-    JSFrameRegs *oldRegs = cx->regs;
+    JS_ASSERT(cx->fp() == fp);
+    FrameRegs &oldRegs = cx->regs();
 
     JSBool ok;
     {
         AssertCompartmentUnchanged pcc(cx);
-        JSAutoResolveFlags rf(cx, JSRESOLVE_INFER);
+        JSAutoResolveFlags rf(cx, RESOLVE_INFER);
         ok = JaegerTrampoline(cx, fp, code, stackLimit);
     }
 
-    cx->setCurrentRegs(oldRegs);
+    /* Undo repointRegs in SetVMFrameRegs. */
+    cx->stack.repointRegs(&oldRegs);
     JS_ASSERT(fp == cx->fp());
 
     /* The trampoline wrote the return value but did not set the HAS_RVAL flag. */
     fp->markReturnValue();
+
+    /* See comment in mjit::Compiler::emitReturn. */
+    fp->markActivationObjectsAsPut();
 
 #ifdef JS_METHODJIT_SPEW
     prof.stop();
@@ -764,31 +704,21 @@ mjit::EnterMethodJIT(JSContext *cx, JSStackFrame *fp, void *code, Value *stackLi
 }
 
 static inline JSBool
-CheckStackAndEnterMethodJIT(JSContext *cx, JSStackFrame *fp, void *code)
+CheckStackAndEnterMethodJIT(JSContext *cx, StackFrame *fp, void *code)
 {
-    bool ok;
-    Value *stackLimit;
+    JS_CHECK_RECURSION(cx, return false);
 
-    JS_CHECK_RECURSION(cx, goto error;);
-
-    stackLimit = cx->stack().getStackLimit(cx);
+    Value *stackLimit = cx->stack.space().getStackLimit(cx);
     if (!stackLimit)
-        goto error;
+        return false;
 
-    ok = EnterMethodJIT(cx, fp, code, stackLimit);
-    JS_ASSERT_IF(!fp->isYielding() && !(fp->isEvalFrame() && !fp->script()->strictModeCode),
-                 !fp->hasCallObj() && !fp->hasArgsObj());
-    return ok;
-
-  error:
-    js::PutOwnedActivationObjects(cx, fp);
-    return false;
+    return EnterMethodJIT(cx, fp, code, stackLimit);
 }
 
 JSBool
 mjit::JaegerShot(JSContext *cx)
 {
-    JSStackFrame *fp = cx->fp();
+    StackFrame *fp = cx->fp();
     JSScript *script = fp->script();
     JITScript *jit = script->getJIT(fp->isConstructing());
 
@@ -797,7 +727,7 @@ mjit::JaegerShot(JSContext *cx)
         AbortRecording(cx, "attempt to enter method JIT while recording");
 #endif
 
-    JS_ASSERT(cx->regs->pc == script->code);
+    JS_ASSERT(cx->regs().pc == script->code);
 
     return CheckStackAndEnterMethodJIT(cx, cx->fp(), jit->invokeEntry);
 }
@@ -866,7 +796,7 @@ JITScript::monoICSectionsLimit() const
 char *
 JITScript::monoICSectionsLimit() const
 {
-    return nmapSectionsLimit();
+    return nmapSectionLimit();
 }
 #endif  // JS_MONOIC
 
@@ -979,19 +909,31 @@ mjit::ReleaseScriptCode(JSContext *cx, JSScript *script)
     JITScript *jscr;
 
     if ((jscr = script->jitNormal)) {
-        cx->runtime->mjitMemoryUsed -= jscr->scriptDataSize() + jscr->mainCodeSize();
+        cx->runtime->mjitDataSize -= jscr->scriptDataSize();
+#ifdef DEBUG
+        if (jscr->pcProfile) {
+            cx->free_(jscr->pcProfile);
+            jscr->pcProfile = NULL;
+        }
+#endif
 
         jscr->~JITScript();
-        cx->free(jscr);
+        cx->free_(jscr);
         script->jitNormal = NULL;
         script->jitArityCheckNormal = NULL;
     }
 
     if ((jscr = script->jitCtor)) {
-        cx->runtime->mjitMemoryUsed -= jscr->scriptDataSize() + jscr->mainCodeSize();
+        cx->runtime->mjitDataSize -= jscr->scriptDataSize();
+#ifdef DEBUG
+        if (jscr->pcProfile) {
+            cx->free_(jscr->pcProfile);
+            jscr->pcProfile = NULL;
+        }
+#endif
 
         jscr->~JITScript();
-        cx->free(jscr);
+        cx->free_(jscr);
         script->jitCtor = NULL;
         script->jitArityCheckCtor = NULL;
     }
@@ -1086,3 +1028,41 @@ JITScript::nativeToPC(void *returnAddress) const
     return ic.pc;
 }
 
+#ifdef JS_METHODJIT_SPEW
+static void
+DumpProfile(JSContext *cx, JSScript *script, JITScript* jit, bool isCtor)
+{
+    JS_ASSERT(!cx->runtime->gcRunning);
+
+#ifdef DEBUG
+    if (IsJaegerSpewChannelActive(JSpew_PCProf) && jit->pcProfile) {
+        // Display hit counts for every JS code line
+        AutoArenaAllocator(&cx->tempPool);
+        Sprinter sprinter;
+        INIT_SPRINTER(cx, &sprinter, &cx->tempPool, 0);
+        js_Disassemble(cx, script, true, &sprinter, jit->pcProfile);
+        fprintf(stdout, "--- PC PROFILE %s:%d%s ---\n", script->filename, script->lineno,
+                isCtor ? " (constructor)" : "");
+        fprintf(stdout, "%s\n", sprinter.base);
+        fprintf(stdout, "--- END PC PROFILE %s:%d%s ---\n", script->filename, script->lineno,
+                isCtor ? " (constructor)" : "");
+    }
+#endif
+}
+#endif
+
+void
+mjit::DumpAllProfiles(JSContext *cx)
+{
+#ifdef JS_METHODJIT_SPEW
+    for (JSScript *script = (JSScript *) JS_LIST_HEAD(&cx->compartment->scripts);
+         script != (JSScript *) &cx->compartment->scripts;
+         script = (JSScript *) JS_NEXT_LINK((JSCList *)script))
+    {
+        if (script->jitCtor)
+            DumpProfile(cx, script, script->jitCtor, true);
+        if (script->jitNormal)
+            DumpProfile(cx, script, script->jitNormal, false);
+    }
+#endif
+}

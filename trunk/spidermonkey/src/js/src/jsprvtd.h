@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  *
  * ***** BEGIN LICENSE BLOCK *****
  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -88,13 +88,10 @@ typedef struct JSProperty           JSProperty;
 typedef struct JSScript             JSScript;
 typedef struct JSSharpObjectMap     JSSharpObjectMap;
 typedef struct JSThread             JSThread;
-typedef struct JSThreadData         JSThreadData;
 typedef struct JSTreeContext        JSTreeContext;
 typedef struct JSTryNote            JSTryNote;
 
 /* Friend "Advanced API" typedefs. */
-typedef struct JSLinearString       JSLinearString;
-typedef struct JSAtom               JSAtom;
 typedef struct JSAtomList           JSAtomList;
 typedef struct JSAtomListElement    JSAtomListElement;
 typedef struct JSAtomMap            JSAtomMap;
@@ -118,7 +115,17 @@ typedef struct JSXMLArrayCursor     JSXMLArrayCursor;
  * templates.
  */
 #ifdef __cplusplus
+
 extern "C++" {
+
+class JSDependentString;
+class JSExtensibleString;
+class JSExternalString;
+class JSLinearString;
+class JSFixedString;
+class JSStaticAtom;
+class JSRope;
+class JSAtom;
 
 namespace js {
 
@@ -131,12 +138,18 @@ class ExecuteArgsGuard;
 class InvokeFrameGuard;
 class InvokeArgsGuard;
 class InvokeSessionGuard;
+class StringBuffer;
 class TraceRecorder;
 struct TraceMonitor;
-class StackSpace;
+
+class FrameRegs;
+class StackFrame;
 class StackSegment;
+class StackSpace;
+class ContextStack;
 class FrameRegsIter;
-class StringBuffer;
+class CallReceiver;
+class CallArgs;
 
 struct Compiler;
 struct Parser;
@@ -172,10 +185,16 @@ struct PropertyCacheEntry;
 
 struct Shape;
 struct EmptyShape;
+class Bindings;
 
 } /* namespace js */
 
 } /* export "C++" */
+
+#else
+
+typedef struct JSAtom JSAtom;
+
 #endif  /* __cplusplus */
 
 /* "Friend" types used by jscntxt.h and jsdbgapi.h. */

@@ -136,6 +136,10 @@ struct TracerState
  */
 struct TraceNativeStorage
 {
+    /* Max number of stack slots/frame that may need to be restored in LeaveTree. */
+    static const size_t MAX_NATIVE_STACK_SLOTS  = 4096;
+    static const size_t MAX_CALL_STACK_ENTRIES  = 500;
+
     double stack_global_buf[MAX_NATIVE_STACK_SLOTS + GLOBAL_SLOTS_BUFFER_SIZE];
     FrameInfo *callstack_buf[MAX_CALL_STACK_ENTRIES];
 
@@ -259,13 +263,16 @@ struct TraceMonitor {
     /* Fields needed for fragment/guard profiling. */
     nanojit::Seq<nanojit::Fragment*>* branches;
     uint32                  lastFragID;
-    /*
-     * profAlloc has a lifetime which spans exactly from InitJIT to
-     * FinishJIT.
-     */
     VMAllocator*            profAlloc;
     FragStatsMap*           profTab;
+
+    void logFragProfile();
 #endif
+
+    TraceMonitor();
+    ~TraceMonitor();
+
+    bool init(JSRuntime* rt);
 
     bool ontrace() const {
         return !!tracecx;
@@ -281,6 +288,10 @@ struct TraceMonitor {
     void mark(JSTracer *trc);
 
     bool outOfMemory() const;
+
+    JS_FRIEND_API(void) getCodeAllocStats(size_t &total, size_t &frag_size, size_t &free_size) const;
+    JS_FRIEND_API(size_t) getVMAllocatorsMainSize() const;
+    JS_FRIEND_API(size_t) getVMAllocatorsReserveSize() const;
 };
 
 namespace mjit {
@@ -348,18 +359,18 @@ class NativeIterCache {
  * is erroneously included in the measurement; see bug 562553.
  */
 class DtoaCache {
-    double   d;
-    jsint    base;
-    JSString *s;        // if s==NULL, d and base are not valid
+    double        d;
+    jsint         base;
+    JSFixedString *s;      // if s==NULL, d and base are not valid
   public:
     DtoaCache() : s(NULL) {}
     void purge() { s = NULL; }
 
-    JSString *lookup(jsint base, double d) {
+    JSFixedString *lookup(jsint base, double d) {
         return this->s && base == this->base && d == this->d ? this->s : NULL;
     }
 
-    void cache(jsint base, double d, JSString *s) {
+    void cache(jsint base, double d, JSFixedString *s) {
         this->base = base;
         this->d = d;
         this->s = s;
@@ -377,13 +388,11 @@ struct JS_FRIEND_API(JSCompartment) {
     js::gc::ArenaList            arenas[js::gc::FINALIZE_LIMIT];
     js::gc::FreeLists            freeLists;
 
-    size_t                       gcBytes;
-    size_t                       gcTriggerBytes;
+    uint32                       gcBytes;
+    uint32                       gcTriggerBytes;
     size_t                       gcLastBytes;
 
-#ifdef JS_GCMETER
-    js::gc::JSGCArenaStats       compartmentStats[js::gc::FINALIZE_LIMIT];
-#endif
+    bool                         hold;
 
 #ifdef JS_TRACER
     /* Trace-tree JIT recorder/interpreter state. */
@@ -403,6 +412,13 @@ struct JS_FRIEND_API(JSCompartment) {
 
 #ifdef JS_METHODJIT
     js::mjit::JaegerCompartment  *jaegerCompartment;
+    /*
+     * This function is here so that xpconnect/src/xpcjsruntime.cpp doesn't
+     * need to see the declaration of JaegerCompartment, which would require
+     * #including MethodJIT.h into xpconnect/src/xpcjsruntime.cpp, which is
+     * difficult due to reasons explained in bug 483677.
+     */
+    size_t getMjitCodeSize() const;
 #endif
 
     /*
@@ -435,6 +451,18 @@ struct JS_FRIEND_API(JSCompartment) {
 
     EmptyShapeSet                emptyShapes;
 
+    /*
+     * Initial shapes given to RegExp and String objects, encoding the initial
+     * sets of built-in instance properties and the fixed slots where they must
+     * be stored (see JSObject::JSSLOT_(REGEXP|STRING)_*). Later property
+     * additions may cause these shapes to not be used by a RegExp or String
+     * (even along the entire shape parent chain, should the object go into
+     * dictionary mode). But because all the initial properties are
+     * non-configurable, they will always map to fixed slots.
+     */
+    const js::Shape              *initialRegExpShape;
+    const js::Shape              *initialStringShape;
+
     bool                         debugMode;  // true iff debug mode on
     JSCList                      scripts;    // scripts in this compartment
 
@@ -442,7 +470,8 @@ struct JS_FRIEND_API(JSCompartment) {
 
     js::NativeIterCache          nativeIterCache;
 
-    js::ToSourceCache            toSourceCache;
+    typedef js::Maybe<js::ToSourceCache> LazyToSourceCache;
+    LazyToSourceCache            toSourceCache;
 
     JSCompartment(JSRuntime *rt);
     ~JSCompartment();
@@ -450,10 +479,7 @@ struct JS_FRIEND_API(JSCompartment) {
     bool init();
 
     /* Mark cross-compartment wrappers. */
-    void markCrossCompartment(JSTracer *trc);
-
-    /* Mark this compartment's local roots. */
-    void mark(JSTracer *trc);
+    void markCrossCompartmentWrappers(JSTracer *trc);
 
     bool wrap(JSContext *cx, js::Value *vp);
     bool wrap(JSContext *cx, JSString **strp);
@@ -469,9 +495,11 @@ struct JS_FRIEND_API(JSCompartment) {
     void finishArenaLists();
     void finalizeObjectArenaLists(JSContext *cx);
     void finalizeStringArenaLists(JSContext *cx);
+    void finalizeShapeArenaLists(JSContext *cx);
     bool arenaListsAreEmpty();
 
     void setGCLastBytes(size_t lastBytes);
+    void reduceGCTriggerBytes(uint32 amount);
 
     js::DtoaCache dtoaCache;
 
@@ -480,8 +508,6 @@ struct JS_FRIEND_API(JSCompartment) {
 
     js::MathCache *allocMathCache(JSContext *cx);
 
-    bool                         marked;
-    
     typedef js::HashMap<jsbytecode*,
                         size_t,
                         js::DefaultHasher<jsbytecode*>,
@@ -494,9 +520,6 @@ struct JS_FRIEND_API(JSCompartment) {
     js::MathCache *getMathCache(JSContext *cx) {
         return mathCache ? mathCache : allocMathCache(cx);
     }
-
-    bool isMarked() { return marked; }
-    void clearMark() { marked = false; }
 
     size_t backEdgeCount(jsbytecode *pc) const;
     size_t incBackEdgeCount(jsbytecode *pc);
@@ -605,13 +628,22 @@ class PreserveCompartment {
 
 class SwitchToCompartment : public PreserveCompartment {
   public:
-    SwitchToCompartment(JSContext *cx, JSCompartment *newCompartment) : PreserveCompartment(cx) {
+    SwitchToCompartment(JSContext *cx, JSCompartment *newCompartment
+                        JS_GUARD_OBJECT_NOTIFIER_PARAM)
+        : PreserveCompartment(cx)
+    {
+        JS_GUARD_OBJECT_NOTIFIER_INIT;
         cx->compartment = newCompartment;
     }
 
-    SwitchToCompartment(JSContext *cx, JSObject *target) : PreserveCompartment(cx) {
+    SwitchToCompartment(JSContext *cx, JSObject *target JS_GUARD_OBJECT_NOTIFIER_PARAM)
+        : PreserveCompartment(cx)
+    {
+        JS_GUARD_OBJECT_NOTIFIER_INIT;
         cx->compartment = target->getCompartment();
     }
+
+    JS_DECL_USE_GUARD_OBJECT_NOTIFIER
 };
 
 class AssertCompartmentUnchanged {

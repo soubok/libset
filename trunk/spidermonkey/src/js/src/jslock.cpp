@@ -208,6 +208,16 @@ NativeCompareAndSwap(volatile jsword *w, jsword ov, jsword nv)
     return res;
 }
 
+#elif defined(__arm__) && defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4)
+
+JS_STATIC_ASSERT(sizeof(jsword) == sizeof(int));
+
+static JS_ALWAYS_INLINE int
+NativeCompareAndSwap(volatile jsword *w, jsword ov, jsword nv)
+{
+  return __sync_bool_compare_and_swap(w, ov, nv);
+}
+
 #elif defined(USE_ARM_KUSER)
 
 /* See https://bugzilla.mozilla.org/show_bug.cgi?id=429387 for a
@@ -305,7 +315,7 @@ struct JSFatLock {
 };
 
 typedef struct JSFatLockTable {
-    JSFatLock   *free;
+    JSFatLock   *free_;
     JSFatLock   *taken;
 } JSFatLockTable;
 
@@ -364,7 +374,7 @@ js_FinishLock(JSThinLock *tl)
 static JSFatLock *
 NewFatlock()
 {
-    JSFatLock *fl = (JSFatLock *)js_malloc(sizeof(JSFatLock)); /* for now */
+    JSFatLock *fl = (JSFatLock *) OffTheBooks::malloc_(sizeof(JSFatLock)); /* for now */
     if (!fl) return NULL;
     fl->susp = 0;
     fl->next = NULL;
@@ -379,7 +389,7 @@ DestroyFatlock(JSFatLock *fl)
 {
     PR_DestroyLock(fl->slock);
     PR_DestroyCondVar(fl->svar);
-    js_free(fl);
+    UnwantedForeground::free_(fl);
 }
 
 static JSFatLock *
@@ -418,15 +428,15 @@ GetFatlock(void *id)
     JSFatLock *m;
 
     uint32 i = GLOBAL_LOCK_INDEX(id);
-    if (fl_list_table[i].free == NULL) {
+    if (fl_list_table[i].free_ == NULL) {
 #ifdef DEBUG
         if (fl_list_table[i].taken)
             printf("Ran out of fat locks!\n");
 #endif
-        fl_list_table[i].free = ListOfFatlocks(fl_list_chunk_len);
+        fl_list_table[i].free_ = ListOfFatlocks(fl_list_chunk_len);
     }
-    m = fl_list_table[i].free;
-    fl_list_table[i].free = m->next;
+    m = fl_list_table[i].free_;
+    fl_list_table[i].free_ = m->next;
     m->susp = 0;
     m->next = fl_list_table[i].taken;
     m->prevp = &fl_list_table[i].taken;
@@ -450,8 +460,8 @@ PutFatlock(JSFatLock *m, void *id)
 
     /* Insert m in fl_list_table[i].free. */
     i = GLOBAL_LOCK_INDEX(id);
-    m->next = fl_list_table[i].free;
-    fl_list_table[i].free = m;
+    m->next = fl_list_table[i].free_;
+    fl_list_table[i].free_ = m;
 }
 
 #endif /* !NSPR_LOCK */
@@ -473,7 +483,7 @@ js_SetupLocks(int listc, int globc)
     global_locks_log2 = JS_CeilingLog2(globc);
     global_locks_mask = JS_BITMASK(global_locks_log2);
     global_lock_count = JS_BIT(global_locks_log2);
-    global_locks = (PRLock **) js_malloc(global_lock_count * sizeof(PRLock*));
+    global_locks = (PRLock **) OffTheBooks::malloc_(global_lock_count * sizeof(PRLock*));
     if (!global_locks)
         return JS_FALSE;
     for (i = 0; i < global_lock_count; i++) {
@@ -484,14 +494,14 @@ js_SetupLocks(int listc, int globc)
             return JS_FALSE;
         }
     }
-    fl_list_table = (JSFatLockTable *) js_malloc(i * sizeof(JSFatLockTable));
+    fl_list_table = (JSFatLockTable *) OffTheBooks::malloc_(i * sizeof(JSFatLockTable));
     if (!fl_list_table) {
         js_CleanupLocks();
         return JS_FALSE;
     }
     fl_list_table_len = global_lock_count;
     for (i = 0; i < global_lock_count; i++)
-        fl_list_table[i].free = fl_list_table[i].taken = NULL;
+        fl_list_table[i].free_ = fl_list_table[i].taken = NULL;
     fl_list_chunk_len = listc;
 #endif /* !NSPR_LOCK */
     return JS_TRUE;
@@ -506,7 +516,7 @@ js_CleanupLocks()
     if (global_locks) {
         for (i = 0; i < global_lock_count; i++)
             PR_DestroyLock(global_locks[i]);
-        js_free(global_locks);
+        UnwantedForeground::free_(global_locks);
         global_locks = NULL;
         global_lock_count = 1;
         global_locks_log2 = 0;
@@ -514,12 +524,12 @@ js_CleanupLocks()
     }
     if (fl_list_table) {
         for (i = 0; i < fl_list_table_len; i++) {
-            DeleteListOfFatlocks(fl_list_table[i].free);
-            fl_list_table[i].free = NULL;
+            DeleteListOfFatlocks(fl_list_table[i].free_);
+            fl_list_table[i].free_ = NULL;
             DeleteListOfFatlocks(fl_list_table[i].taken);
             fl_list_table[i].taken = NULL;
         }
-        js_free(fl_list_table);
+        UnwantedForeground::free_(fl_list_table);
         fl_list_table = NULL;
         fl_list_table_len = 0;
     }

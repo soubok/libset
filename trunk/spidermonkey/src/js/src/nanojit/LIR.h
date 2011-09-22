@@ -410,19 +410,6 @@ namespace nanojit
         }
     };
 
-    /*
-     * Record for extra data used to compile switches as jump tables.
-     */
-    struct SwitchInfo
-    {
-        NIns**      table;       // Jump table; a jump address is NIns*
-        uint32_t    count;       // Number of table entries
-        // Index value at last execution of the switch. The index value
-        // is the offset into the jump table. Thus it is computed as
-        // (switch expression) - (lowest case value).
-        uint32_t    index;
-    };
-
     // Array holding the 'isCse' field from LIRopcode.tbl.
     extern const int8_t isCses[];       // cannot be uint8_t, some values are negative
 
@@ -534,6 +521,9 @@ namespace nanojit
 
     // Array holding the 'retType' field from LIRopcode.tbl.
     extern const LTy retTypes[];
+
+    // Array holding the size in bytes of each LIns from LIRopcode.tbl.
+    extern const uint8_t insSizes[];
 
     inline RegisterMask rmask(Register r)
     {
@@ -755,7 +745,7 @@ namespace nanojit
             if (isInReg()) {
                 Register r = { sharedFields.regnum };
                 return r;
-            } else { 
+            } else {
                 return deprecated_UnknownReg;
             }
         }
@@ -944,8 +934,7 @@ namespace nanojit
             return isLInsLd();
         }
         bool isGuard() const {
-            return isop(LIR_x) || isop(LIR_xf) || isop(LIR_xt) ||
-                   isop(LIR_xbarrier) || isop(LIR_xtbl) ||
+            return isop(LIR_x) || isop(LIR_xf) || isop(LIR_xt) || isop(LIR_xbarrier) ||
                    isop(LIR_addxovi) || isop(LIR_subxovi) || isop(LIR_mulxovi);
         }
         bool isJov() const {
@@ -996,8 +985,16 @@ namespace nanojit
             return isImmI() || isImmQorD();
         }
 
+        bool isConditionalBranch() const {
+            return isop(LIR_jt) || isop(LIR_jf) || isJov();
+        }
+
+        bool isUnConditionalBranch() const {
+            return isop(LIR_j) || isop(LIR_jtbl);
+        }
+
         bool isBranch() const {
-            return isop(LIR_jt) || isop(LIR_jf) || isop(LIR_j) || isop(LIR_jtbl) || isJov();
+            return isConditionalBranch() || isUnConditionalBranch();
         }
 
         LTy retType() const {
@@ -1040,11 +1037,13 @@ namespace nanojit
             return (void*)immI();
         #endif
         }
+
+        void overwriteWithSkip(LIns* skipTo);
     };
 
     typedef SeqBuilder<LIns*> InsList;
     typedef SeqBuilder<char*> StringList;
-
+    typedef HashMap<LIns*,bool> InsSet;
 
     // 0-operand form.  Used for LIR_start and LIR_label.
     class LInsOp0
@@ -1397,7 +1396,6 @@ namespace nanojit
         case LIR_x:
         case LIR_xt:
         case LIR_xf:
-        case LIR_xtbl:
         case LIR_xbarrier:
             return (GuardRecord*)oprnd2();
 
@@ -1583,6 +1581,9 @@ namespace nanojit
         }
         virtual LIns* insComment(const char* str) {
             return out->insComment(str);
+        }
+        virtual LIns* insSkip(LIns* skipTo) {
+            return out->insSkip(skipTo);
         }
 
         // convenience functions
@@ -1997,7 +1998,7 @@ namespace nanojit
         // be true, else we would have side-exited.  So if we see 'cmp' again
         // we can treat it like a constant.  This table records such
         // comparisons.
-        HashMap <LIns*, bool> knownCmpValues;
+        InsSet knownCmpValues;
 
         // If true, we will not add new instructions to the CSE tables, but we
         // will continue to CSE instructions that match existing table
@@ -2175,6 +2176,7 @@ namespace nanojit
             LIns*   insAlloc(int32_t size);
             LIns*   insJtbl(LIns* index, uint32_t size);
             LIns*   insComment(const char* str);
+            LIns*   insSkip(LIns* skipTo);
     };
 
     class LirFilter
@@ -2217,7 +2219,45 @@ namespace nanojit
 
         // Returns next instruction and advances to the prior instruction.
         // Invariant: never returns a skip.
-        LIns* read();
+        LIns* read()
+        {
+            const uint8_t insReadSizes[] = {
+            // LIR_start is treated specially -- see below.  We intentionally
+            // do not use the global insSizes[] because of this customization.
+        #define OP___(op, number, repKind, retType, isCse) \
+                ((number) == LIR_start ? 0 : sizeof(LIns##repKind)),
+        #include "LIRopcode.tbl"
+        #undef OP___
+                0
+            };
+
+            // Check the invariant: _ins never points to a skip.
+            NanoAssert(_ins && !_ins->isop(LIR_skip));
+
+            // Step back one instruction.  Use a table lookup rather than a switch
+            // to avoid branch mispredictions.  LIR_start is given a special size
+            // of zero so that we don't step back past the start of the block.
+            // (Callers of this function should stop once they see a LIR_start.)
+            LIns* ret = _ins;
+            _ins = (LIns*)(uintptr_t(_ins) - insReadSizes[_ins->opcode()]);
+
+            // Ensure _ins doesn't end up pointing to a skip.
+            while (_ins->isop(LIR_skip)) {
+                NanoAssert(_ins->prevLIns() != _ins);
+                _ins = _ins->prevLIns();
+            }
+
+            return ret;
+        }
+
+        // Returns the instruction that read() will return on the next call.
+        // Invariant: never returns a skip.
+        LIns* peek()
+        {
+            // Check the invariant: _ins never points to a skip.
+            NanoAssert(_ins && !_ins->isop(LIR_skip));
+            return _ins;
+        }
 
         LIns* finalIns() {
             return _finalIns;
@@ -2437,6 +2477,100 @@ namespace nanojit
         void finish();
         LIns* read();
     };
+
+    /**
+      * A reverse filter for LIR that generates a control-flow graph in gml format.
+      * More information on Graph Modelling Language (gml) can be found here:
+      *   http://en.wikipedia.org/wiki/Graph_Modelling_Language
+      * An excellent tool for manipulating the graphs produced by this code
+      * is yED (http://www.yworks.com/en/products_yed_about.html).
+      *
+      * The raw output produced by this class contains connectively (i,e edge)
+      * information (including formatting), and node (i.e. vertex) data, but
+      * does not contain any positional information.
+      * Thus when opening the .gml file, all the nodes will likely appear stacked
+      * on one another.  An auto-layout tool like yEd can then re-position the
+      * nodes for better viewing.  E.g. Tools->Fit Node to Label followed by
+      * Layout->Hierarchical->Interactive produces a relatively convential
+      * looking flow-control graph.
+      *
+      * Usage:
+      *
+      *         LirReader  reader(frag->lastIns);
+      *         CfgLister  cfg(&reader, alloc);
+      *
+      *         for (LIns* ins = cfg.read(); !ins->isop(LIR_start); ins = cfg.read()) {}
+      *
+      *         cfg.printGmlCfg(f, frag->lirbuf->printer, proxiesFor);
+      *         fclose(f);
+      *
+      *  The first and second parameters to printGmlCfg() are an open FILE* and
+      *  a populated LInsPrinter, respectively.  The printer must be able to produce
+      *  a name from either the lirNameMap or a call to formatIns().
+      *
+      *  The 3rd parameter to primtGmlCfg(), proxiesFor can be used to limit
+      *  the number of edges in the graph. If an edge points to a vertex (LIns) in
+      *  this set, then a new node is created, with the same name as the original,
+      *  and the edge will point to that node.
+      *
+      * Algortihm:
+      *
+      *  During the first pass (i.e. CfgLister::read()), we capture edges and vertices
+      *  at an instruction level.  Recall that this is during a backwards pass, so for
+      *  forward branches we won't know whether an instruction we've seen already is
+      *  the target of a branch or not, until we reach the branch.  I.e. we see the
+      *  target instructions first and don't yet know they are targets.
+      *
+      *  On the 2nd pass (i.e. printGmlCfg) we use the list of branch targets from the
+      *  first pass (i.e. _vertices) and group instructions into them.  This is where
+      *  _alt comes into play, it provides a map from any instruction to the first
+      *  instruction of the containing block.
+      */
+    class CfgLister : public LirFilter
+    {
+    public:
+        virtual LIns* read();
+
+        typedef enum _CfgMode
+        {
+              CFG_EBB   // extended basic blocks
+            , CFG_BB    // basic blocks
+            , CFG_INS   // 1 block per instruction
+        }
+        CfgMode;
+
+        CfgLister(LirFilter* in, Allocator& alloc, CfgMode mode=CFG_EBB);
+
+        void printGmlCfg(FILE* f, LInsPrinter* printer, InsSet* makeProxyNodesFor);
+
+    private:
+        void        addEdge(LIns* from, LIns* to);
+        uint32_t    node2id(LIns* i);
+        const char* nodeName(LIns* i, InsBuf& b, LInsPrinter* printer);
+        const char* nodeShape(LIns* i, InsSet* pseudo);
+        uint32_t    edgeCountOf(LIns* i);
+
+        void printEdges(FILE* f, LInsPrinter* printer, InsSet* pseudo);
+        void printNode(FILE* f, InsList* nodeIns, LInsPrinter* printer, InsSet* pseudo);
+
+        void gmlNode(FILE* f, uint32_t id, const char* shape, const char* title);
+        void gmlEdge(FILE* f, uint32_t srcId, uint32_t dstId, const char* style, const char* fill, const char* width, const char* text);
+
+        //alternate form of gmlNode
+        void gmlNodePrefix(FILE* f, uint32_t id, const char* shape);
+        void gmlNodeSuffix(FILE* f);
+        void gmlNodeTextLine(FILE* f, const char* text, int32_t tabCount);
+
+        Allocator&                  _alloc;
+        HashMap<LIns*, LIns*>       _alt;       // allow edge src/dst to be re-mapped to another instruction
+        HashMap<LIns*, InsList*>    _edges;     // from,to list
+        InsSet                      _vertices;  // node list
+        HashMap<LIns*, uint32_t>    _ids;       // ins -> unique id
+        LIns*                       _prior;     // state maintained during read()
+        uint32_t                    _count;     // state maintained during read()
+        CfgMode                     _mode;      // mode selector
+    };
+
 #endif
 
 }

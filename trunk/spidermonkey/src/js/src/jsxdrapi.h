@@ -85,8 +85,7 @@ JS_BEGIN_EXTERN_C
 
 typedef enum JSXDRMode {
     JSXDR_ENCODE,
-    JSXDR_DECODE,
-    JSXDR_FREE
+    JSXDR_DECODE
 } JSXDRMode;
 
 typedef enum JSXDRWhence {
@@ -206,7 +205,7 @@ JS_XDRFindClassById(JSXDRState *xdr, uint32 id);
  * before deserialization of bytecode.  If the saved version does not match
  * the current version, abort deserialization and invalidate the file.
  */
-#define JSXDR_BYTECODE_VERSION      (0xb973c0de - 82)
+#define JSXDR_BYTECODE_VERSION      (0xb973c0de - 87)
 
 /*
  * Library-private functions.

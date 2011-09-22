@@ -771,7 +771,7 @@ mjit::Compiler::jsop_neg()
 #if defined JS_CPU_X86 || defined JS_CPU_X64
         masm.loadDouble(&DoubleNegMask, FPRegisters::Second);
         masm.xorDouble(FPRegisters::Second, fpreg);
-#elif defined JS_CPU_ARM
+#elif defined JS_CPU_ARM || defined JS_CPU_SPARC
         masm.negDouble(fpreg, fpreg);
 #endif
 
@@ -831,7 +831,7 @@ mjit::Compiler::jsop_neg()
 void
 mjit::Compiler::jsop_mod()
 {
-#if defined(JS_CPU_X86)
+#if defined(JS_CPU_X86) || defined(JS_CPU_X64)
     FrameEntry *lhs = frame.peek(-2);
     FrameEntry *rhs = frame.peek(-1);
 
@@ -849,7 +849,7 @@ mjit::Compiler::jsop_mod()
         return;
     }
 
-#if defined(JS_CPU_X86)
+#if defined(JS_CPU_X86) || defined(JS_CPU_X64)
     if (!lhs->isTypeKnown()) {
         Jump j = frame.testInt32(Assembler::NotEqual, lhs);
         stubcc.linkExit(j, Uses(2));
@@ -1298,6 +1298,7 @@ mjit::Compiler::jsop_relational_double(JSOp op, BoolStub stub, jsbytecode *targe
         OOL_STUBCALL(stub);
 
         frame.popn(2);
+        frame.takeReg(Registers::ReturnReg);
         frame.syncAndForgetEverything();
 
         Jump j = masm.branchDouble(dblCond, fpLeft, fpRight);
