@@ -51,39 +51,6 @@
 
 JS_BEGIN_EXTERN_C
 
-#define JS_HAS_JSLIBS_RegisterCustomAllocators
-
-extern JS_PUBLIC_API(void)
-JSLIBS_RegisterCustomAllocators(
-  void* (*)( size_t ),
-  void* (*)( size_t, size_t ),
-  void* (*)( size_t, size_t ),
-  void* (*)( void*, size_t ),
-  size_t (*)( void* ),
-  void (*)( void* )
-);
-
-extern void* (*custom_malloc)( size_t );
-extern void* (*custom_calloc)( size_t, size_t );
-extern void* (*custom_realloc)( void*, size_t );
-extern void (*custom_free)( void* );
-
-JS_END_EXTERN_C
-
-#define malloc custom_malloc
-#define calloc custom_calloc
-#define realloc custom_realloc
-#define free custom_free
-
-JS_BEGIN_EXTERN_C
-
-/*
- * JS_Assert is present even in release builds, for the benefit of applications
- * that build DEBUG and link against a non-DEBUG SpiderMonkey library.
- */
-extern JS_PUBLIC_API(void)
-JS_Assert(const char *s, const char *file, JSIntn ln);
-
 #define JS_CRASH_UNLESS(__cond)                                                 \
     JS_BEGIN_MACRO                                                              \
         if (!(__cond)) {                                                        \
@@ -163,10 +130,6 @@ extern JS_PUBLIC_API(void) JS_Abort(void);
 
 #ifdef DEBUG
 # define JS_BASIC_STATS 1
-#endif
-
-#ifdef DEBUG_brendan
-# define JS_SCOPE_DEPTH_METER 1
 #endif
 
 #ifdef JS_BASIC_STATS
@@ -710,10 +673,5 @@ PodEqual(T *one, T *two, size_t len)
 } /* namespace js */
 
 #endif /* defined(__cplusplus) */
-
-#undef malloc
-#undef calloc
-#undef realloc
-#undef free
 
 #endif /* jsutil_h___ */
