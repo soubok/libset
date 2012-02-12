@@ -40,38 +40,27 @@
 #ifndef jsstrinlines_h___
 #define jsstrinlines_h___
 
+#include "mozilla/Attributes.h"
+
 #include "jsatom.h"
 #include "jsstr.h"
 
 #include "jscntxtinlines.h"
 #include "jsgcinlines.h"
+#include "vm/String-inl.h"
 
 namespace js {
-
-static inline bool
-CheckStringLength(JSContext *cx, size_t length)
-{
-    if (JS_UNLIKELY(length > JSString::MAX_LENGTH)) {
-        if (JS_ON_TRACE(cx)) {
-            /*
-             * If we can't leave the trace, signal OOM condition, otherwise
-             * exit from trace before throwing.
-             */
-            if (!CanLeaveTrace(cx))
-                return NULL;
-
-            LeaveTrace(cx);
-        }
-        js_ReportAllocationOverflow(cx);
-        return false;
-    }
-
-    return true;
-}
 
 /*
  * String builder that eagerly checks for over-allocation past the maximum
  * string length.
+ *
+ * Any operation which would exceed the maximum string length causes an
+ * exception report on the context and results in a failed return value.
+ *
+ * Well-sized extractions (which waste no more than 1/4 of their char
+ * buffer space) are guaranteed for strings built by this interface.
+ * See |extractWellSized|.
  *
  * Note: over-allocation is not checked for when using the infallible
  * |replaceRawBuffer|, so the implementation of |finishString| also must check
@@ -89,6 +78,9 @@ class StringBuffer
     JSContext *context() const { return cb.allocPolicy().context(); }
     jschar *extractWellSized();
 
+    StringBuffer(const StringBuffer &other) MOZ_DELETE;
+    void operator=(const StringBuffer &other) MOZ_DELETE;
+
   public:
     explicit inline StringBuffer(JSContext *cx);
     bool reserve(size_t len);
@@ -97,7 +89,7 @@ class StringBuffer
     bool append(const jschar *chars, size_t len);
     bool append(const jschar *begin, const jschar *end);
     bool append(JSString *str);
-    bool append(JSAtom *atom);
+    bool append(JSLinearString *str);
     bool appendN(const jschar c, size_t n);
     bool appendInflated(const char *cstr, size_t len);
 
@@ -193,19 +185,14 @@ StringBuffer::append(JSString *str)
     JSLinearString *linear = str->ensureLinear(context());
     if (!linear)
         return false;
-    size_t strLen = linear->length();
-    if (!checkLength(cb.length() + strLen))
-        return false;
-    return cb.append(linear->chars(), strLen);
+    return append(linear);
 }
 
 inline bool
-StringBuffer::append(JSAtom *atom)
+StringBuffer::append(JSLinearString *str)
 {
-    size_t strLen = atom->length();
-    if (!checkLength(cb.length() + strLen))
-        return false;
-    return cb.append(atom->chars(), strLen);
+    JS::Anchor<JSString *> anch(str);
+    return cb.append(str->chars(), str->length());
 }
 
 inline bool
@@ -222,11 +209,9 @@ StringBuffer::appendInflated(const char *cstr, size_t cstrlen)
     size_t lengthBefore = length();
     if (!cb.growByUninitialized(cstrlen))
         return false;
-#if DEBUG
-    size_t oldcstrlen = cstrlen;
-    bool ok = 
-#endif
-    InflateStringToBuffer(context(), cstr, cstrlen, begin() + lengthBefore, &cstrlen);
+    DebugOnly<size_t> oldcstrlen = cstrlen;
+    DebugOnly<bool> ok = InflateStringToBuffer(context(), cstr, cstrlen,
+                                               begin() + lengthBefore, &cstrlen);
     JS_ASSERT(ok && oldcstrlen == cstrlen);
     return true;
 }
@@ -242,7 +227,7 @@ StringBuffer::length() const
 inline bool
 StringBuffer::checkLength(size_t length)
 {
-    return CheckStringLength(context(), length);
+    return JSString::validateLength(context(), length);
 }
 
 extern bool
@@ -260,6 +245,9 @@ ValueToStringBuffer(JSContext *cx, const Value &v, StringBuffer &sb)
 class RopeBuilder {
     JSContext *cx;
     JSString *res;
+
+    RopeBuilder(const RopeBuilder &other) MOZ_DELETE;
+    void operator=(const RopeBuilder &other) MOZ_DELETE;
 
   public:
     RopeBuilder(JSContext *cx)
@@ -324,6 +312,39 @@ class StringSegmentRange
         return settle(stack.popCopy());
     }
 };
+
+/*
+ * Return s advanced past any Unicode white space characters.
+ */
+static inline const jschar *
+SkipSpace(const jschar *s, const jschar *end)
+{
+    JS_ASSERT(s <= end);
+
+    while (s < end && unicode::IsSpace(*s))
+        s++;
+
+    return s;
+}
+
+/*
+ * Return less than, equal to, or greater than zero depending on whether
+ * s1 is less than, equal to, or greater than s2.
+ */
+inline bool
+CompareChars(const jschar *s1, size_t l1, const jschar *s2, size_t l2, int32_t *result)
+{
+    size_t n = JS_MIN(l1, l2);
+    for (size_t i = 0; i < n; i++) {
+        if (int32_t cmp = s1[i] - s2[i]) {
+            *result = cmp;
+            return true;
+        }
+    }
+
+    *result = (int32_t)(l1 - l2);
+    return true;
+}
 
 }  /* namespace js */
 

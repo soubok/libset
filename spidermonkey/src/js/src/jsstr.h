@@ -42,12 +42,14 @@
 
 #include <ctype.h>
 #include "jsapi.h"
+#include "jsatom.h"
 #include "jsprvtd.h"
-#include "jshashtable.h"
 #include "jslock.h"
-#include "jsobj.h"
-#include "jsvalue.h"
 #include "jscell.h"
+#include "jsutil.h"
+
+#include "js/HashTable.h"
+#include "vm/Unicode.h"
 
 namespace js {
 
@@ -88,160 +90,6 @@ struct JSSubString {
 extern jschar      js_empty_ucstr[];
 extern JSSubString js_EmptySubString;
 
-/* Unicode character attribute lookup tables. */
-extern const uint8 js_X[];
-extern const uint8 js_Y[];
-extern const uint32 js_A[];
-
-/* Enumerated Unicode general category types. */
-typedef enum JSCharType {
-    JSCT_UNASSIGNED             = 0,
-    JSCT_UPPERCASE_LETTER       = 1,
-    JSCT_LOWERCASE_LETTER       = 2,
-    JSCT_TITLECASE_LETTER       = 3,
-    JSCT_MODIFIER_LETTER        = 4,
-    JSCT_OTHER_LETTER           = 5,
-    JSCT_NON_SPACING_MARK       = 6,
-    JSCT_ENCLOSING_MARK         = 7,
-    JSCT_COMBINING_SPACING_MARK = 8,
-    JSCT_DECIMAL_DIGIT_NUMBER   = 9,
-    JSCT_LETTER_NUMBER          = 10,
-    JSCT_OTHER_NUMBER           = 11,
-    JSCT_SPACE_SEPARATOR        = 12,
-    JSCT_LINE_SEPARATOR         = 13,
-    JSCT_PARAGRAPH_SEPARATOR    = 14,
-    JSCT_CONTROL                = 15,
-    JSCT_FORMAT                 = 16,
-    JSCT_PRIVATE_USE            = 18,
-    JSCT_SURROGATE              = 19,
-    JSCT_DASH_PUNCTUATION       = 20,
-    JSCT_START_PUNCTUATION      = 21,
-    JSCT_END_PUNCTUATION        = 22,
-    JSCT_CONNECTOR_PUNCTUATION  = 23,
-    JSCT_OTHER_PUNCTUATION      = 24,
-    JSCT_MATH_SYMBOL            = 25,
-    JSCT_CURRENCY_SYMBOL        = 26,
-    JSCT_MODIFIER_SYMBOL        = 27,
-    JSCT_OTHER_SYMBOL           = 28
-} JSCharType;
-
-/* Character classifying and mapping macros, based on java.lang.Character. */
-#define JS_CCODE(c)     (js_A[js_Y[(js_X[(uint16)(c)>>6]<<6)|((c)&0x3F)]])
-#define JS_CTYPE(c)     (JS_CCODE(c) & 0x1F)
-
-#define JS_ISALPHA(c)   ((((1 << JSCT_UPPERCASE_LETTER) |                     \
-                           (1 << JSCT_LOWERCASE_LETTER) |                     \
-                           (1 << JSCT_TITLECASE_LETTER) |                     \
-                           (1 << JSCT_MODIFIER_LETTER) |                      \
-                           (1 << JSCT_OTHER_LETTER))                          \
-                          >> JS_CTYPE(c)) & 1)
-
-#define JS_ISALNUM(c)   ((((1 << JSCT_UPPERCASE_LETTER) |                     \
-                           (1 << JSCT_LOWERCASE_LETTER) |                     \
-                           (1 << JSCT_TITLECASE_LETTER) |                     \
-                           (1 << JSCT_MODIFIER_LETTER) |                      \
-                           (1 << JSCT_OTHER_LETTER) |                         \
-                           (1 << JSCT_DECIMAL_DIGIT_NUMBER))                  \
-                          >> JS_CTYPE(c)) & 1)
-
-/* A unicode letter, suitable for use in an identifier. */
-#define JS_ISLETTER(c)   ((((1 << JSCT_UPPERCASE_LETTER) |                    \
-                            (1 << JSCT_LOWERCASE_LETTER) |                    \
-                            (1 << JSCT_TITLECASE_LETTER) |                    \
-                            (1 << JSCT_MODIFIER_LETTER) |                     \
-                            (1 << JSCT_OTHER_LETTER) |                        \
-                            (1 << JSCT_LETTER_NUMBER))                        \
-                           >> JS_CTYPE(c)) & 1)
-
-/*
- * 'IdentifierPart' from ECMA grammar, is Unicode letter or combining mark or
- * digit or connector punctuation.
- */
-#define JS_ISIDPART(c)  ((((1 << JSCT_UPPERCASE_LETTER) |                     \
-                           (1 << JSCT_LOWERCASE_LETTER) |                     \
-                           (1 << JSCT_TITLECASE_LETTER) |                     \
-                           (1 << JSCT_MODIFIER_LETTER) |                      \
-                           (1 << JSCT_OTHER_LETTER) |                         \
-                           (1 << JSCT_LETTER_NUMBER) |                        \
-                           (1 << JSCT_NON_SPACING_MARK) |                     \
-                           (1 << JSCT_COMBINING_SPACING_MARK) |               \
-                           (1 << JSCT_DECIMAL_DIGIT_NUMBER) |                 \
-                           (1 << JSCT_CONNECTOR_PUNCTUATION))                 \
-                          >> JS_CTYPE(c)) & 1)
-
-/* Unicode control-format characters, ignored in input */
-#define JS_ISFORMAT(c) (((1 << JSCT_FORMAT) >> JS_CTYPE(c)) & 1)
-
-extern const bool js_isidstart[];
-extern const bool js_isident[];
-
-static inline bool
-JS_ISIDSTART(int c)
-{
-    unsigned w = c;
-
-    return (w < 128) ? js_isidstart[w] : JS_ISLETTER(c);
-}
-
-static inline bool
-JS_ISIDENT(int c)
-{
-    unsigned w = c;
-
-    return (w < 128) ? js_isident[w] : JS_ISIDPART(c);
-}
-
-#define JS_ISXMLSPACE(c)        ((c) == ' ' || (c) == '\t' || (c) == '\r' ||  \
-                                 (c) == '\n')
-#define JS_ISXMLNSSTART(c)      ((JS_CCODE(c) & 0x00000100) || (c) == '_')
-#define JS_ISXMLNS(c)           ((JS_CCODE(c) & 0x00000080) || (c) == '.' ||  \
-                                 (c) == '-' || (c) == '_')
-#define JS_ISXMLNAMESTART(c)    (JS_ISXMLNSSTART(c) || (c) == ':')
-#define JS_ISXMLNAME(c)         (JS_ISXMLNS(c) || (c) == ':')
-
-#define JS_ISDIGIT(c)   (JS_CTYPE(c) == JSCT_DECIMAL_DIGIT_NUMBER)
-
-const jschar BYTE_ORDER_MARK = 0xFEFF;
-const jschar BYTE_ORDER_MARK2 = 0xFFFE;
-const jschar NO_BREAK_SPACE  = 0x00A0;
-
-extern const bool js_isspace[];
-
-static inline bool
-JS_ISSPACE(int c)
-{
-    unsigned w = c;
-
-    return (w < 128)
-           ? js_isspace[w]
-           : w == NO_BREAK_SPACE || w == BYTE_ORDER_MARK ||
-             (JS_CCODE(w) & 0x00070000) == 0x00040000;
-}
-
-static inline bool
-JS_ISSPACE_OR_BOM(int c)
-{
-    unsigned w = c;
-
-    /* Treat little- and big-endian BOMs as whitespace for compatibility. */
-    return (w < 128)
-           ? js_isspace[w]
-           : w == NO_BREAK_SPACE || w == BYTE_ORDER_MARK || w == BYTE_ORDER_MARK2 ||
-             (JS_CCODE(w) & 0x00070000) == 0x00040000;
-}
-
-#define JS_ISPRINT(c)   ((c) < 128 && isprint(c))
-
-#define JS_ISUPPER(c)   (JS_CTYPE(c) == JSCT_UPPERCASE_LETTER)
-#define JS_ISLOWER(c)   (JS_CTYPE(c) == JSCT_LOWERCASE_LETTER)
-
-#define JS_TOUPPER(c)   ((jschar) ((JS_CCODE(c) & 0x00100000)                 \
-                                   ? (c) - ((int32)JS_CCODE(c) >> 22)         \
-                                   : (c)))
-#define JS_TOLOWER(c)   ((jschar) ((JS_CCODE(c) & 0x00200000)                 \
-                                   ? (c) + ((int32)JS_CCODE(c) >> 22)         \
-                                   : (c)))
-
 /*
  * Shorthands for ASCII (7-bit) decimal and hex conversion.
  * Manually inline isdigit for performance; MSVC doesn't do this for us.
@@ -253,14 +101,6 @@ JS_ISSPACE_OR_BOM(int c)
 #define JS7_ISLET(c)    ((c) < 128 && isalpha(c))
 
 /* Initialize the String class, returning its prototype object. */
-extern js::Class js_StringClass;
-
-inline bool
-JSObject::isString() const
-{
-    return getClass() == &js_StringClass;
-}
-
 extern JSObject *
 js_InitStringClass(JSContext *cx, JSObject *obj);
 
@@ -300,26 +140,26 @@ extern const char *
 js_ValueToPrintable(JSContext *cx, const js::Value &,
                     JSAutoByteString *bytes, bool asSource = false);
 
-/*
- * Convert a value to a string, returning null after reporting an error,
- * otherwise returning a new string reference.
- */
-extern JSString *
-js_ValueToString(JSContext *cx, const js::Value &v);
-
 namespace js {
 
 /*
- * Most code that calls js_ValueToString knows the value is (probably) not a
- * string, so it does not make sense to put this inline fast path into
- * js_ValueToString.
+ * Convert a non-string value to a string, returning null after reporting an
+ * error, otherwise returning a new string reference.
+ */
+extern JSString *
+ToStringSlow(JSContext *cx, const Value &v);
+
+/*
+ * Convert the given value to a string.  This method includes an inline
+ * fast-path for the case where the value is already a string; if the value is
+ * known not to be a string, use ToStringSlow instead.
  */
 static JS_ALWAYS_INLINE JSString *
-ValueToString_TestForStringInline(JSContext *cx, const Value &v)
+ToString(JSContext *cx, const js::Value &v)
 {
     if (v.isString())
         return v.toString();
-    return js_ValueToString(cx, v);
+    return ToStringSlow(cx, v);
 }
 
 /*
@@ -342,24 +182,15 @@ js_ValueToSource(JSContext *cx, const js::Value &v);
 namespace js {
 
 /*
- * Compute a hash function from str. The caller can call this function even if
- * str is not a GC-allocated thing.
- */
-inline uint32
-HashChars(const jschar *chars, size_t length)
-{
-    uint32 h = 0;
-    for (; length; chars++, length--)
-        h = JS_ROTATE_LEFT32(h, 4) ^ *chars;
-    return h;
-}
-
-/*
  * Test if strings are equal. The caller can call the function even if str1
  * or str2 are not GC-allocated things.
  */
 extern bool
-EqualStrings(JSContext *cx, JSString *str1, JSString *str2, JSBool *result);
+EqualStrings(JSContext *cx, JSString *str1, JSString *str2, bool *result);
+
+/* Use the infallible method instead! */
+extern bool
+EqualStrings(JSContext *cx, JSLinearString *str1, JSLinearString *str2, bool *result) MOZ_DELETE;
 
 /* EqualStrings is infallible on linear strings. */
 extern bool
@@ -370,7 +201,7 @@ EqualStrings(JSLinearString *str1, JSLinearString *str2);
  * str1 is less than, equal to, or greater than str2.
  */
 extern bool
-CompareStrings(JSContext *cx, JSString *str1, JSString *str2, int32 *result);
+CompareStrings(JSContext *cx, JSString *str1, JSString *str2, int32_t *result);
 
 /*
  * Return true if the string matches the given sequence of ASCII bytes.
@@ -378,7 +209,7 @@ CompareStrings(JSContext *cx, JSString *str1, JSString *str2, int32 *result);
 extern bool
 StringEqualsAscii(JSLinearString *str, const char *asciiBytes);
 
-} /* namespacejs */
+} /* namespace js */
 
 extern size_t
 js_strlen(const jschar *s);
@@ -389,44 +220,13 @@ js_strchr(const jschar *s, jschar c);
 extern jschar *
 js_strchr_limit(const jschar *s, jschar c, const jschar *limit);
 
-#define js_strncpy(t, s, n)     memcpy((t), (s), (n) * sizeof(jschar))
-
-/*
- * Return s advanced past any Unicode white space characters.
- */
-static inline const jschar *
-js_SkipWhiteSpace(const jschar *s, const jschar *end)
+static JS_ALWAYS_INLINE void
+js_strncpy(jschar *dst, const jschar *src, size_t nelem)
 {
-    JS_ASSERT(s <= end);
-    while (s != end && JS_ISSPACE(*s))
-        s++;
-    return s;
+    return js::PodCopy(dst, src, nelem);
 }
 
 namespace js {
-
-/*
- * On encodings:
- *
- * - Some string functions have an optional FlationCoding argument that allow
- *   the caller to force CESU-8 encoding handling. 
- * - Functions that don't take a FlationCoding base their NormalEncoding
- *   behavior on the js_CStringsAreUTF8 value. NormalEncoding is either raw
- *   (simple zero-extension) or UTF-8 depending on js_CStringsAreUTF8.
- * - Functions that explicitly state their encoding do not use the
- *   js_CStringsAreUTF8 value.
- *
- * CESU-8 (Compatibility Encoding Scheme for UTF-16: 8-bit) is a variant of
- * UTF-8 that allows us to store any wide character string as a narrow
- * character string. For strings containing mostly ascii, it saves space.
- * http://www.unicode.org/reports/tr26/
- */
-
-enum FlationCoding
-{
-    NormalEncoding,
-    CESU8Encoding
-};
 
 /*
  * Inflate bytes to jschars. Return null on error, otherwise return the jschar
@@ -484,16 +284,17 @@ DeflateStringToUTF8Buffer(JSContext *cx, const jschar *chars,
                           size_t charsLength, char *bytes, size_t *length,
                           FlationCoding fc = NormalEncoding);
 
-} /* namespace js */
-
 /*
  * The String.prototype.replace fast-native entry point is exported for joined
  * function optimization in js{interp,tracer}.cpp.
  */
-namespace js {
 extern JSBool
 str_replace(JSContext *cx, uintN argc, js::Value *vp);
-}
+
+extern JSBool
+str_fromCharCode(JSContext *cx, uintN argc, Value *vp);
+
+} /* namespace js */
 
 extern JSBool
 js_str_toString(JSContext *cx, uintN argc, js::Value *vp);
@@ -509,12 +310,12 @@ js_str_charCodeAt(JSContext *cx, uintN argc, js::Value *vp);
  * least 6 bytes long.  Return the number of UTF-8 bytes of data written.
  */
 extern int
-js_OneUcs4ToUtf8Char(uint8 *utf8Buffer, uint32 ucs4Char);
+js_OneUcs4ToUtf8Char(uint8_t *utf8Buffer, uint32_t ucs4Char);
 
 namespace js {
 
 extern size_t
-PutEscapedStringImpl(char *buffer, size_t size, FILE *fp, JSLinearString *str, uint32 quote);
+PutEscapedStringImpl(char *buffer, size_t size, FILE *fp, JSLinearString *str, uint32_t quote);
 
 /*
  * Write str into buffer escaping any non-printable or non-ASCII character
@@ -526,7 +327,7 @@ PutEscapedStringImpl(char *buffer, size_t size, FILE *fp, JSLinearString *str, u
  * be a single or double quote character that will quote the output.
 */
 inline size_t
-PutEscapedString(char *buffer, size_t size, JSLinearString *str, uint32 quote)
+PutEscapedString(char *buffer, size_t size, JSLinearString *str, uint32_t quote)
 {
     size_t n = PutEscapedStringImpl(buffer, size, NULL, str, quote);
 
@@ -541,10 +342,19 @@ PutEscapedString(char *buffer, size_t size, JSLinearString *str, uint32 quote)
  * will quote the output.
 */
 inline bool
-FileEscapedString(FILE *fp, JSLinearString *str, uint32 quote)
+FileEscapedString(FILE *fp, JSLinearString *str, uint32_t quote)
 {
     return PutEscapedStringImpl(NULL, 0, fp, str, quote) != size_t(-1);
 }
+
+JSBool
+str_match(JSContext *cx, uintN argc, Value *vp);
+
+JSBool
+str_search(JSContext *cx, uintN argc, Value *vp);
+
+JSBool
+str_split(JSContext *cx, uintN argc, Value *vp);
 
 } /* namespace js */
 

@@ -40,13 +40,11 @@
 
 #include "jsprvtd.h"
 #include "jspubtd.h"
-#include "jsvalue.h"
-#include "jsvector.h"
+
+#include "js/Vector.h"
 
 #define JSON_MAX_DEPTH  2048
 #define JSON_PARSER_BUFSIZE 1024
-
-extern js::Class js_JSONClass;
 
 extern JSObject *
 js_InitJSONClass(JSContext *cx, JSObject *obj);
@@ -54,14 +52,6 @@ js_InitJSONClass(JSContext *cx, JSObject *obj);
 extern JSBool
 js_Stringify(JSContext *cx, js::Value *vp, JSObject *replacer, js::Value space,
              js::StringBuffer &sb);
-
-/* Aargh, Windows. */
-#ifdef STRICT
-#undef STRICT
-#endif
-#ifdef LEGACY
-#undef LEGACY
-#endif
 
 /*
  * The type of JSON decoding to perform.  Strict decoding is to-the-spec;

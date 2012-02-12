@@ -1,11 +1,15 @@
 #include "tests.h"
 #include "jsatom.h"
 
+#include "vm/String.h"
+
+using namespace mozilla;
+
 BEGIN_TEST(testAtomizedIsNotInterned)
 {
     /* Try to pick a string that won't be interned by other tests in this runtime. */
     static const char someChars[] = "blah blah blah? blah blah blah";
-    JSAtom *atom = js_Atomize(cx, someChars, JS_ARRAY_LENGTH(someChars));
+    JSAtom *atom = js_Atomize(cx, someChars, ArrayLength(someChars));
     CHECK(!JS_StringHasBeenInterned(cx, atom));
     CHECK(JS_InternJSString(cx, atom));
     CHECK(JS_StringHasBeenInterned(cx, atom));
@@ -23,7 +27,7 @@ JSBool
 GCCallback(JSContext *cx, JSGCStatus status)
 {
     if (status == JSGC_MARK_END)
-        sw.strOk = !JS_IsAboutToBeFinalized(cx, sw.str);
+        sw.strOk = !JS_IsAboutToBeFinalized(sw.str);
     return true;
 }
 
