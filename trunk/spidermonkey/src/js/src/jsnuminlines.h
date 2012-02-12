@@ -40,19 +40,22 @@
 #ifndef jsnuminlines_h___
 #define jsnuminlines_h___
 
-#include "jsstr.h"
+#include "vm/Unicode.h"
+
+#include "jsstrinlines.h"
+
 
 namespace js {
 
 template<typename T> struct NumberTraits { };
-template<> struct NumberTraits<int32> {
-  static JS_ALWAYS_INLINE int32 NaN() { return 0; }
-  static JS_ALWAYS_INLINE int32 toSelfType(int32 i) { return i; }
-  static JS_ALWAYS_INLINE int32 toSelfType(jsdouble d) { return js_DoubleToECMAUint32(d); }
+template<> struct NumberTraits<int32_t> {
+  static JS_ALWAYS_INLINE int32_t NaN() { return 0; }
+  static JS_ALWAYS_INLINE int32_t toSelfType(int32_t i) { return i; }
+  static JS_ALWAYS_INLINE int32_t toSelfType(jsdouble d) { return js_DoubleToECMAUint32(d); }
 };
 template<> struct NumberTraits<jsdouble> {
   static JS_ALWAYS_INLINE jsdouble NaN() { return js_NaN; }
-  static JS_ALWAYS_INLINE jsdouble toSelfType(int32 i) { return i; }
+  static JS_ALWAYS_INLINE jsdouble toSelfType(int32_t i) { return i; }
   static JS_ALWAYS_INLINE jsdouble toSelfType(jsdouble d) { return d; }
 };
 
@@ -71,7 +74,7 @@ StringToNumberType(JSContext *cx, JSString *str, T *result)
             *result = NumberTraits<T>::toSelfType(T(c - '0'));
             return true;
         }
-        if (JS_ISSPACE(c)) {
+        if (unicode::IsSpace(c)) {
             *result = NumberTraits<T>::toSelfType(T(0));
             return true;
         }
@@ -79,17 +82,15 @@ StringToNumberType(JSContext *cx, JSString *str, T *result)
         return true;
     }
 
-    const jschar *bp = chars;
     const jschar *end = chars + length;
-    bp = js_SkipWhiteSpace(bp, end);
+    const jschar *bp = SkipSpace(chars, end);
 
     /* ECMA doesn't allow signed hex numbers (bug 273467). */
     if (end - bp >= 2 && bp[0] == '0' && (bp[1] == 'x' || bp[1] == 'X')) {
         /* Looks like a hex number. */
         const jschar *endptr;
         double d;
-        if (!GetPrefixInteger(cx, bp + 2, end, 16, &endptr, &d) ||
-            js_SkipWhiteSpace(endptr, end) != end) {
+        if (!GetPrefixInteger(cx, bp + 2, end, 16, &endptr, &d) || SkipSpace(endptr, end) != end) {
             *result = NumberTraits<T>::NaN();
             return true;
         }
@@ -106,7 +107,7 @@ StringToNumberType(JSContext *cx, JSString *str, T *result)
      */
     const jschar *ep;
     double d;
-    if (!js_strtod(cx, bp, end, &ep, &d) || js_SkipWhiteSpace(ep, end) != end) {
+    if (!js_strtod(cx, bp, end, &ep, &d) || SkipSpace(ep, end) != end) {
         *result = NumberTraits<T>::NaN();
         return true;
     }

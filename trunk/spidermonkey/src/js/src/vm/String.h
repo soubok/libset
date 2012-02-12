@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set ts=4 sw=4 et tw=79 ft=cpp:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -41,22 +41,39 @@
 #ifndef String_h_
 #define String_h_
 
-#include "jscell.h"
+#include "mozilla/Attributes.h"
 
+#include "jsapi.h"
+#include "jscell.h"
+#include "jsfriendapi.h"
+
+class JSString;
 class JSDependentString;
 class JSExtensibleString;
 class JSExternalString;
 class JSLinearString;
 class JSFixedString;
-class JSStaticAtom;
 class JSRope;
 class JSAtom;
+
+namespace js {
+
+class StaticStrings;
+class PropertyName;
+
+/* The buffer length required to contain any unsigned 32-bit integer. */
+static const size_t UINT32_CHAR_BUFFER_LENGTH = sizeof("4294967295") - 1;
+
+} /* namespace js */
 
 /*
  * JavaScript strings
  *
- * Conceptually, a JS string is just an array of chars and a length. To improve
- * performance of common string operations, the following optimizations are
+ * Conceptually, a JS string is just an array of chars and a length. This array
+ * of chars may or may not be null-terminated and, if it is, the null character
+ * is not included in the length.
+ *
+ * To improve performance of common operations, the following optimizations are
  * made which affect the engine's representation of strings:
  *
  *  - The plain vanilla representation is a "flat" string which consists of a
@@ -87,11 +104,6 @@ class JSAtom;
  *    canonicalized to "atoms" (JSAtom) such that there is a single atom with a
  *    given (length,chars).
  *
- *  - To avoid dynamic creation of common short strings (e.g., single-letter
- *    alphanumeric strings, numeric strings up to 999) headers and char arrays
- *    for such strings are allocated in static memory (JSStaticAtom) and used
- *    as atoms.
- *
  *  - To avoid copying all strings created through the JSAPI, an "external"
  *    string (JSExternalString) can be created whose chars are managed by the
  *    JSAPI client.
@@ -110,7 +122,7 @@ class JSAtom;
  *  | \
  *  | JSDependentString         base / -
  *  |
- * JSFlatString (abstract)      chars / not null-terminated
+ * JSFlatString (abstract)      chars / null-terminated
  *  | \
  *  | JSExtensibleString        capacity / no external pointers into char array
  *  |
@@ -128,7 +140,7 @@ class JSAtom;
  *  |       \      |
  *  |       JSShortAtom         - / atomized JSShortString
  *  |
- * JSStaticAtom                 - / header and chars statically allocated
+ * js::PropertyName             - / chars don't contain an index (uint32_t)
  *
  * Classes marked with (abstract) above are not literally C++ Abstract Base
  * Classes (since there are no virtual functions, pure or not, in this
@@ -162,11 +174,10 @@ class JSString : public js::gc::Cell
                     JSLinearString *base;               /* JSDependentString */
                     JSString       *right;              /* JSRope */
                     size_t         capacity;            /* JSFlatString (extensible) */
-                    size_t         externalType;        /* JSExternalString */
+                    const JSStringFinalizer *externalFinalizer;/* JSExternalString */
                 } u2;
                 union {
                     JSString       *parent;             /* JSRope (temporary) */
-                    void           *externalClosure;    /* JSExternalString */
                     size_t         reserved;            /* may use for bug 615290 */
                 } u3;
             } s;
@@ -231,9 +242,6 @@ class JSString : public js::gc::Cell
     static const size_t ATOM_MASK         = JS_BITMASK(3);
     static const size_t ATOM_FLAGS        = 0x0;
 
-    static const size_t STATIC_ATOM_MASK  = JS_BITMASK(4);
-    static const size_t STATIC_ATOM_FLAGS = 0x0;
-
     static const size_t EXTENSIBLE_FLAGS  = JS_BIT(2) | JS_BIT(3);
     static const size_t NON_STATIC_ATOM   = JS_BIT(3);
 
@@ -241,13 +249,21 @@ class JSString : public js::gc::Cell
         return (length << LENGTH_SHIFT) | flags;
     }
 
+    /*
+     * Helper function to validate that a string of a given length is
+     * representable by a JSString. An allocation overflow is reported if false
+     * is returned.
+     */
+    static inline bool validateLength(JSContext *cx, size_t length);
+
     static void staticAsserts() {
         JS_STATIC_ASSERT(JS_BITS_PER_WORD >= 32);
         JS_STATIC_ASSERT(((JSString::MAX_LENGTH << JSString::LENGTH_SHIFT) >>
                            JSString::LENGTH_SHIFT) == JSString::MAX_LENGTH);
         JS_STATIC_ASSERT(sizeof(JSString) ==
-                         offsetof(JSString, d.inlineStorage) +
-                         NUM_INLINE_CHARS * sizeof(jschar));
+                         offsetof(JSString, d.inlineStorage) + NUM_INLINE_CHARS * sizeof(jschar));
+        JS_STATIC_ASSERT(offsetof(JSString, d.u1.chars) ==
+                         offsetof(js::shadow::Atom, chars));
     }
 
     /* Avoid lame compile errors in JSRope::flatten */
@@ -290,7 +306,7 @@ class JSString : public js::gc::Cell
     }
 
     JS_ALWAYS_INLINE
-    JSRope &asRope() {
+    JSRope &asRope() const {
         JS_ASSERT(isRope());
         return *(JSRope *)this;
     }
@@ -301,8 +317,8 @@ class JSString : public js::gc::Cell
     }
 
     JS_ALWAYS_INLINE
-    JSLinearString &asLinear() {
-        JS_ASSERT(isLinear());
+    JSLinearString &asLinear() const {
+        JS_ASSERT(JSString::isLinear());
         return *(JSLinearString *)this;
     }
 
@@ -314,7 +330,7 @@ class JSString : public js::gc::Cell
     }
 
     JS_ALWAYS_INLINE
-    JSDependentString &asDependent() {
+    JSDependentString &asDependent() const {
         JS_ASSERT(isDependent());
         return *(JSDependentString *)this;
     }
@@ -325,7 +341,7 @@ class JSString : public js::gc::Cell
     }
 
     JS_ALWAYS_INLINE
-    JSFlatString &asFlat() {
+    JSFlatString &asFlat() const {
         JS_ASSERT(isFlat());
         return *(JSFlatString *)this;
     }
@@ -347,7 +363,7 @@ class JSString : public js::gc::Cell
     bool isInline() const;
 
     JS_ALWAYS_INLINE
-    JSFixedString &asFixed() {
+    JSFixedString &asFixed() const {
         JS_ASSERT(isFixed());
         return *(JSFixedString *)this;
     }
@@ -355,7 +371,7 @@ class JSString : public js::gc::Cell
     bool isExternal() const;
 
     JS_ALWAYS_INLINE
-    JSExternalString &asExternal() {
+    JSExternalString &asExternal() const {
         JS_ASSERT(isExternal());
         return *(JSExternalString *)this;
     }
@@ -373,18 +389,13 @@ class JSString : public js::gc::Cell
         return *(JSAtom *)this;
     }
 
-    JS_ALWAYS_INLINE
-    bool isStaticAtom() const {
-        return (d.lengthAndFlags & FLAGS_MASK) == STATIC_ATOM_FLAGS;
-    }
-
     /* Only called by the GC for strings with the FINALIZE_STRING kind. */
 
-    inline void finalize(JSContext *cx);
+    inline void finalize(JSContext *cx, bool background);
 
     /* Gets the number of bytes that the chars take on the heap. */
 
-    JS_FRIEND_API(size_t) charsHeapSize();
+    size_t sizeOfExcludingThis(JSMallocSizeOfFun mallocSizeOf);
 
     /* Offsets for direct field from jit code. */
 
@@ -395,10 +406,26 @@ class JSString : public js::gc::Cell
     static size_t offsetOfChars() {
         return offsetof(JSString, d.u1.chars);
     }
+
+    static inline void writeBarrierPre(JSString *str);
+    static inline void writeBarrierPost(JSString *str, void *addr);
+    static inline bool needWriteBarrierPre(JSCompartment *comp);
+    static inline void readBarrier(JSString *str);
+
+    static inline js::ThingRootKind rootKind() { return js::THING_ROOT_STRING; }
+
+#ifdef DEBUG
+    void dump();
+    bool equals(const char *s);
+#endif
 };
 
 class JSRope : public JSString
 {
+    enum UsingBarrier { WithIncrementalBarrier, NoBarrier };
+    template<UsingBarrier b>
+    JSFlatString *flattenInternal(JSContext *cx);
+
     friend class JSString;
     JSFlatString *flatten(JSContext *cx);
 
@@ -425,12 +452,15 @@ class JSLinearString : public JSString
 {
     friend class JSString;
 
-  public:
-    void mark(JSTracer *trc);
+    /* Vacuous and therefore unimplemented. */
+    JSLinearString *ensureLinear(JSContext *cx) MOZ_DELETE;
+    bool isLinear() const MOZ_DELETE;
+    JSLinearString &asLinear() const MOZ_DELETE;
 
+  public:
     JS_ALWAYS_INLINE
     const jschar *chars() const {
-        JS_ASSERT(isLinear());
+        JS_ASSERT(JSString::isLinear());
         return d.u1.chars;
     }
 };
@@ -444,12 +474,16 @@ class JSDependentString : public JSLinearString
 
     void init(JSLinearString *base, const jschar *chars, size_t length);
 
+    /* Vacuous and therefore unimplemented. */
+    bool isDependent() const MOZ_DELETE;
+    JSDependentString &asDependent() const MOZ_DELETE;
+
   public:
     static inline JSDependentString *new_(JSContext *cx, JSLinearString *base,
                                           const jschar *chars, size_t length);
 
     JSLinearString *base() const {
-        JS_ASSERT(isDependent());
+        JS_ASSERT(JSString::isDependent());
         return d.s.u2.base;
     }
 };
@@ -464,12 +498,32 @@ class JSFlatString : public JSLinearString
         d.s.u2.base = base;
     }
 
+    /* Vacuous and therefore unimplemented. */
+    JSFlatString *ensureFlat(JSContext *cx) MOZ_DELETE;
+    bool isFlat() const MOZ_DELETE;
+    JSFlatString &asFlat() const MOZ_DELETE;
+
   public:
     JS_ALWAYS_INLINE
     const jschar *charsZ() const {
-        JS_ASSERT(isFlat());
+        JS_ASSERT(JSString::isFlat());
         return chars();
     }
+
+    /*
+     * Returns true if this string's characters store an unsigned 32-bit
+     * integer value, initializing *indexp to that value if so.  (Thus if
+     * calling isIndex returns true, js::IndexToString(cx, *indexp) will be a
+     * string equal to this string.)
+     */
+    bool isIndex(uint32_t *indexp) const;
+
+    /*
+     * Returns a property name represented by this string, or null on failure.
+     * You must verify that this is not an index per isIndex before calling
+     * this method.
+     */
+    inline js::PropertyName *toPropertyName(JSContext *cx);
 
     /* Only called by the GC for strings with the FINALIZE_STRING kind. */
 
@@ -480,10 +534,14 @@ JS_STATIC_ASSERT(sizeof(JSFlatString) == sizeof(JSString));
 
 class JSExtensibleString : public JSFlatString
 {
+    /* Vacuous and therefore unimplemented. */
+    bool isExtensible() const MOZ_DELETE;
+    JSExtensibleString &asExtensible() const MOZ_DELETE;
+
   public:
     JS_ALWAYS_INLINE
     size_t capacity() const {
-        JS_ASSERT(isExtensible());
+        JS_ASSERT(JSString::isExtensible());
         return d.s.u2.capacity;
     }
 };
@@ -493,6 +551,11 @@ JS_STATIC_ASSERT(sizeof(JSExtensibleString) == sizeof(JSString));
 class JSFixedString : public JSFlatString
 {
     void init(const jschar *chars, size_t length);
+
+    /* Vacuous and therefore unimplemented. */
+    JSFlatString *ensureFixed(JSContext *cx) MOZ_DELETE;
+    bool isFixed() const MOZ_DELETE;
+    JSFixedString &asFixed() const MOZ_DELETE;
 
   public:
     static inline JSFixedString *new_(JSContext *cx, const jschar *chars, size_t length);
@@ -559,120 +622,51 @@ class JSShortString : public JSInlineString
 
     /* Only called by the GC for strings with the FINALIZE_EXTERNAL_STRING kind. */
 
-    JS_ALWAYS_INLINE void finalize(JSContext *cx);
+    JS_ALWAYS_INLINE void finalize(JSContext *cx, bool background);
 };
 
 JS_STATIC_ASSERT(sizeof(JSShortString) == 2 * sizeof(JSString));
 
-/*
- * The externalClosure stored in an external string is a black box to the JS
- * engine; see JS_NewExternalStringWithClosure.
- */
 class JSExternalString : public JSFixedString
 {
-    static void staticAsserts() {
-        JS_STATIC_ASSERT(TYPE_LIMIT == 8);
-    }
+    void init(const jschar *chars, size_t length, const JSStringFinalizer *fin);
 
-    void init(const jschar *chars, size_t length, intN type, void *closure);
+    /* Vacuous and therefore unimplemented. */
+    bool isExternal() const MOZ_DELETE;
+    JSExternalString &asExternal() const MOZ_DELETE;
 
   public:
-    static inline JSExternalString *new_(JSContext *cx, const jschar *chars,
-                                         size_t length, intN type, void *closure);
+    static inline JSExternalString *new_(JSContext *cx, const jschar *chars, size_t length,
+                                         const JSStringFinalizer *fin);
 
-    intN externalType() const {
-        JS_ASSERT(isExternal());
-        JS_ASSERT(d.s.u2.externalType < TYPE_LIMIT);
-        return d.s.u2.externalType;
-    }
-
-    void *externalClosure() const {
-        JS_ASSERT(isExternal());
-        return d.s.u3.externalClosure;
-    }
-
-    static const uintN TYPE_LIMIT = 8;
-    static JSStringFinalizeOp str_finalizers[TYPE_LIMIT];
-
-    static intN changeFinalizer(JSStringFinalizeOp oldop,
-                                JSStringFinalizeOp newop) {
-        for (uintN i = 0; i != JS_ARRAY_LENGTH(str_finalizers); i++) {
-            if (str_finalizers[i] == oldop) {
-                str_finalizers[i] = newop;
-                return intN(i);
-            }
-        }
-        return -1;
+    const JSStringFinalizer *externalFinalizer() const {
+        JS_ASSERT(JSString::isExternal());
+        return d.s.u2.externalFinalizer;
     }
 
     /* Only called by the GC for strings with the FINALIZE_EXTERNAL_STRING kind. */
 
-    void finalize(JSContext *cx);
-    void finalize();
+    inline void finalize(JSContext *cx, bool background);
+    inline void finalize();
 };
 
 JS_STATIC_ASSERT(sizeof(JSExternalString) == sizeof(JSString));
 
 class JSAtom : public JSFixedString
 {
-  public:
-    /* Exposed only for jits. */
-
-    static const size_t UNIT_STATIC_LIMIT   = 256U;
-    static const size_t SMALL_CHAR_LIMIT    = 128U; /* Bigger chars cannot be in a length-2 string. */
-    static const size_t NUM_SMALL_CHARS     = 64U;
-    static const size_t INT_STATIC_LIMIT    = 256U;
-    static const size_t NUM_HUNDRED_STATICS = 156U;
-
-#ifdef __SUNPRO_CC
-# pragma align 8 (__1cGJSAtomPunitStaticTable_, __1cGJSAtomSlength2StaticTable_, __1cGJSAtomShundredStaticTable_)
-#endif
-    static const JSString::Data unitStaticTable[];
-    static const JSString::Data length2StaticTable[];
-    static const JSString::Data hundredStaticTable[];
-    static const JSString::Data *const intStaticTable[];
-
-  private:
-    /* Defined in jsgcinlines.h */
-    static inline bool isUnitString(const void *ptr);
-    static inline bool isLength2String(const void *ptr);
-    static inline bool isHundredString(const void *ptr);
-
-    typedef uint8 SmallChar;
-    static const SmallChar INVALID_SMALL_CHAR = -1;
-
-    static inline bool fitsInSmallChar(jschar c);
-
-    static const jschar fromSmallChar[];
-    static const SmallChar toSmallChar[];
-
-    static void staticAsserts() {
-        JS_STATIC_ASSERT(sizeof(JSString::Data) == sizeof(JSString));
-    }
-
-    static JSStaticAtom &length2Static(jschar c1, jschar c2);
-    static JSStaticAtom &length2Static(uint32 i);
+    /* Vacuous and therefore unimplemented. */
+    bool isAtom() const MOZ_DELETE;
+    JSAtom &asAtom() const MOZ_DELETE;
 
   public:
-    /*
-     * While this query can be used for any pointer to GC thing, given a
-     * JSString 'str', it is more efficient to use 'str->isStaticAtom()'.
-     */
-    static inline bool isStatic(const void *ptr);
-
-    static inline bool hasIntStatic(int32 i);
-    static inline JSStaticAtom &intStatic(jsint i);
-
-    static inline bool hasUnitStatic(jschar c);
-    static JSStaticAtom &unitStatic(jschar c);
-
-    /* May not return atom, returns null on (reported) failure. */
-    static inline JSLinearString *getUnitStringForElement(JSContext *cx, JSString *str, size_t index);
-
-    /* Return null if no static atom exists for the given (chars, length). */
-    static inline JSStaticAtom *lookupStatic(const jschar *chars, size_t length);
+    /* Returns the PropertyName for this.  isIndex() must be false. */
+    inline js::PropertyName *asPropertyName();
 
     inline void finalize(JSRuntime *rt);
+
+#ifdef DEBUG
+    void dump();
+#endif
 };
 
 JS_STATIC_ASSERT(sizeof(JSAtom) == sizeof(JSString));
@@ -697,12 +691,84 @@ class JSShortAtom : public JSShortString /*, JSInlineAtom */
 
 JS_STATIC_ASSERT(sizeof(JSShortAtom) == sizeof(JSShortString));
 
-class JSStaticAtom : public JSAtom
+namespace js {
+
+class StaticStrings
+{
+  private:
+    bool initialized;
+
+    /* Bigger chars cannot be in a length-2 string. */
+    static const size_t SMALL_CHAR_LIMIT    = 128U;
+    static const size_t NUM_SMALL_CHARS     = 64U;
+
+    static const size_t INT_STATIC_LIMIT    = 256U;
+
+    JSAtom *length2StaticTable[NUM_SMALL_CHARS * NUM_SMALL_CHARS];
+    JSAtom *intStaticTable[INT_STATIC_LIMIT];
+
+  public:
+    /* We keep these public for the methodjit. */
+    static const size_t UNIT_STATIC_LIMIT   = 256U;
+    JSAtom *unitStaticTable[UNIT_STATIC_LIMIT];
+
+    StaticStrings() : initialized(false) {}
+
+    bool init(JSContext *cx);
+    void trace(JSTracer *trc);
+
+    static inline bool hasUint(uint32_t u);
+    inline JSAtom *getUint(uint32_t u);
+
+    static inline bool hasInt(int32_t i);
+    inline JSAtom *getInt(jsint i);
+
+    static inline bool hasUnit(jschar c);
+    JSAtom *getUnit(jschar c);
+
+    /* May not return atom, returns null on (reported) failure. */
+    inline JSLinearString *getUnitStringForElement(JSContext *cx, JSString *str, size_t index);
+
+    static bool isStatic(JSAtom *atom);
+
+    /* Return null if no static atom exists for the given (chars, length). */
+    inline JSAtom *lookup(const jschar *chars, size_t length);
+
+  private:
+    typedef uint8_t SmallChar;
+    static const SmallChar INVALID_SMALL_CHAR = -1;
+
+    static inline bool fitsInSmallChar(jschar c);
+
+    static const SmallChar toSmallChar[];
+
+    JSAtom *getLength2(jschar c1, jschar c2);
+    JSAtom *getLength2(uint32_t u);
+};
+
+/*
+ * Represents an atomized string which does not contain an index (that is, an
+ * unsigned 32-bit value).  Thus for any PropertyName propname,
+ * ToString(ToUint32(propname)) never equals propname.
+ *
+ * To more concretely illustrate the utility of PropertyName, consider that it
+ * is used to partition, in a type-safe manner, the ways to refer to a
+ * property, as follows:
+ *
+ *   - uint32_t indexes,
+ *   - PropertyName strings which don't encode uint32_t indexes, and
+ *   - jsspecial special properties (non-ES5 properties like object-valued
+ *     jsids, JSID_EMPTY, JSID_VOID, E4X's default XML namespace, and maybe in
+ *     the future Harmony-proposed private names).
+ */
+class PropertyName : public JSAtom
 {};
 
-JS_STATIC_ASSERT(sizeof(JSStaticAtom) == sizeof(JSString));
+JS_STATIC_ASSERT(sizeof(PropertyName) == sizeof(JSString));
 
-/* Avoid requring vm/String-inl.h just to call getChars. */
+} /* namespace js */
+
+/* Avoid requiring vm/String-inl.h just to call getChars. */
 
 JS_ALWAYS_INLINE const jschar *
 JSString::getChars(JSContext *cx)
@@ -750,6 +816,16 @@ JSString::ensureFixed(JSContext *cx)
         d.lengthAndFlags ^= JS_BIT(3);
     }
     return &asFixed();
+}
+
+inline js::PropertyName *
+JSAtom::asPropertyName()
+{
+#ifdef DEBUG
+    uint32_t dummy;
+    JS_ASSERT(!isIndex(&dummy));
+#endif
+    return static_cast<js::PropertyName *>(this);
 }
 
 #endif

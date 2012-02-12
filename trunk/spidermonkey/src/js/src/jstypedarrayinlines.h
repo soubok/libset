@@ -41,20 +41,62 @@
 #define jstypedarrayinlines_h
 
 #include "jsapi.h"
-#include "jsvalue.h"
 #include "jsobj.h"
 
-namespace js {
-inline JSUint32
-ArrayBuffer::getByteLength(JSObject *obj)
+inline uint32_t
+JSObject::arrayBufferByteLength()
 {
-    return *((JSUint32*) obj->slots);
+    JS_ASSERT(isArrayBuffer());
+    return getElementsHeader()->length;
 }
 
-inline uint8 *
-ArrayBuffer::getDataOffset(JSObject *obj) {
-    uint64 *base = ((uint64*)obj->slots) + 1;
-    return (uint8*) base;
+inline uint8_t *
+JSObject::arrayBufferDataOffset()
+{
+    return (uint8_t *) elements;
 }
+
+namespace js {
+
+static inline int32_t
+ClampIntForUint8Array(int32_t x)
+{
+    if (x < 0)
+        return 0;
+    if (x > 255)
+        return 255;
+    return x;
+}
+
+inline uint32_t
+TypedArray::getLength(JSObject *obj) {
+    return obj->getFixedSlot(FIELD_LENGTH).toInt32();
+}
+
+inline uint32_t
+TypedArray::getByteOffset(JSObject *obj) {
+    return obj->getFixedSlot(FIELD_BYTEOFFSET).toInt32();
+}
+
+inline uint32_t
+TypedArray::getByteLength(JSObject *obj) {
+    return obj->getFixedSlot(FIELD_BYTELENGTH).toInt32();
+}
+
+inline uint32_t
+TypedArray::getType(JSObject *obj) {
+    return obj->getFixedSlot(FIELD_TYPE).toInt32();
+}
+
+inline JSObject *
+TypedArray::getBuffer(JSObject *obj) {
+    return &obj->getFixedSlot(FIELD_BUFFER).toObject();
+}
+
+inline void *
+TypedArray::getDataOffset(JSObject *obj) {
+    return (void *)obj->getPrivate(NUM_FIXED_SLOTS);
+}
+
 }
 #endif /* jstypedarrayinlines_h */

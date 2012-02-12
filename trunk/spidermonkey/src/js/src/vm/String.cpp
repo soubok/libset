@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  * vim: set ts=4 sw=4 et tw=79 ft=cpp:
  *
  * ***** BEGIN LICENSE BLOCK *****
@@ -38,15 +38,22 @@
  *
  * ***** END LICENSE BLOCK ***** */
 
+#include "mozilla/RangedPtr.h"
+
+#include "jsgcmark.h"
+
 #include "String.h"
 #include "String-inl.h"
 
+#include "jsobjinlines.h"
+
+using namespace mozilla;
 using namespace js;
 
 bool
 JSString::isShort() const
 {
-    bool is_short = arenaHeader()->getThingKind() == gc::FINALIZE_SHORT_STRING;
+    bool is_short = (getAllocKind() == gc::FINALIZE_SHORT_STRING);
     JS_ASSERT_IF(is_short, isFlat());
     return is_short;
 }
@@ -66,21 +73,13 @@ JSString::isInline() const
 bool
 JSString::isExternal() const
 {
-    bool is_external = arenaHeader()->getThingKind() == gc::FINALIZE_EXTERNAL_STRING;
+    bool is_external = (getAllocKind() == gc::FINALIZE_EXTERNAL_STRING);
     JS_ASSERT_IF(is_external, isFixed());
     return is_external;
 }
 
-void
-JSLinearString::mark(JSTracer *)
-{
-    JSLinearString *str = this;
-    while (!str->isStaticAtom() && str->markIfUnmarked() && str->isDependent())
-        str = str->asDependent().base();
-}
-
 size_t
-JSString::charsHeapSize()
+JSString::sizeOfExcludingThis(JSMallocSizeOfFun mallocSizeOf)
 {
     /* JSRope: do nothing, we'll count all children chars when we hit the leaf strings. */
     if (isRope())
@@ -95,8 +94,10 @@ JSString::charsHeapSize()
     JS_ASSERT(isFlat());
 
     /* JSExtensibleString: count the full capacity, not just the used space. */
-    if (isExtensible())
-        return asExtensible().capacity() * sizeof(jschar);
+    if (isExtensible()) {
+        JSExtensibleString &extensible = asExtensible();
+        return mallocSizeOf(extensible.chars());
+    }
 
     JS_ASSERT(isFixed());
 
@@ -108,42 +109,75 @@ JSString::charsHeapSize()
     if (isInline())
         return 0;
 
-    /* JSStaticAtom: the chars are static and so not part of the heap. */
-    if (isStaticAtom())
-        return 0;
-
-    /* JSAtom, JSFixedString: count the chars. */
-    return length() * sizeof(jschar);
+    /* JSAtom, JSFixedString: count the chars. +1 for the null char. */
+    JSFixedString &fixed = asFixed();
+    return mallocSizeOf(fixed.chars());
 }
 
-static JS_ALWAYS_INLINE size_t
-RopeCapacityFor(size_t length)
+#ifdef DEBUG
+void
+JSString::dump()
 {
-    static const size_t ROPE_DOUBLING_MAX = 1024 * 1024;
+    if (const jschar *chars = getChars(NULL)) {
+        fprintf(stderr, "JSString* (%p) = jschar * (%p) = ",
+                (void *) this, (void *) chars);
+
+        extern void DumpChars(const jschar *s, size_t n);
+        DumpChars(chars, length());
+    } else {
+        fprintf(stderr, "(oom in JSString::dump)");
+    }
+    fputc('\n', stderr);
+}
+
+bool
+JSString::equals(const char *s)
+{
+    const jschar *c = getChars(NULL);
+    if (!c) {
+        fprintf(stderr, "OOM in JSString::equals!\n");
+        return false;
+    }
+    while (*c && *s) {
+        if (*c != *s)
+            return false;
+        c++;
+        s++;
+    }
+    return *c == *s;
+}
+#endif /* DEBUG */
+
+static JS_ALWAYS_INLINE bool
+AllocChars(JSContext *maybecx, size_t length, jschar **chars, size_t *capacity)
+{
+    /*
+     * String length doesn't include the null char, so include it here before
+     * doubling. Adding the null char after doubling would interact poorly with
+     * round-up malloc schemes.
+     */
+    size_t numChars = length + 1;
 
     /*
      * Grow by 12.5% if the buffer is very large. Otherwise, round up to the
      * next power of 2. This is similar to what we do with arrays; see
      * JSObject::ensureDenseArrayElements.
      */
-    if (length > ROPE_DOUBLING_MAX)
-        return length + (length / 8);
-    return RoundUpPow2(length);
-}
+    static const size_t DOUBLING_MAX = 1024 * 1024;
+    numChars = numChars > DOUBLING_MAX ? numChars + (numChars / 8) : RoundUpPow2(numChars);
 
-static JS_ALWAYS_INLINE jschar *
-AllocChars(JSContext *maybecx, size_t wholeCapacity)
-{
-    /* +1 for the null char at the end. */
+    /* Like length, capacity does not include the null char, so take it out. */
+    *capacity = numChars - 1;
+
     JS_STATIC_ASSERT(JSString::MAX_LENGTH * sizeof(jschar) < UINT32_MAX);
-    size_t bytes = (wholeCapacity + 1) * sizeof(jschar);
-    if (maybecx)
-        return (jschar *)maybecx->malloc_(bytes);
-    return (jschar *)OffTheBooks::malloc_(bytes);
+    size_t bytes = numChars * sizeof(jschar);
+    *chars = (jschar *)(maybecx ? maybecx->malloc_(bytes) : OffTheBooks::malloc_(bytes));
+    return *chars != NULL;
 }
 
+template<JSRope::UsingBarrier b>
 JSFlatString *
-JSRope::flatten(JSContext *maybecx)
+JSRope::flattenInternal(JSContext *maybecx)
 {
     /*
      * Perform a depth-first dag traversal, splatting each node's characters
@@ -187,23 +221,32 @@ JSRope::flatten(JSContext *maybecx)
         JSExtensibleString &left = this->leftChild()->asExtensible();
         size_t capacity = left.capacity();
         if (capacity >= wholeLength) {
+            if (b == WithIncrementalBarrier) {
+                JSString::writeBarrierPre(d.u1.left);
+                JSString::writeBarrierPre(d.s.u2.right);
+            }
+
             wholeCapacity = capacity;
             wholeChars = const_cast<jschar *>(left.chars());
             size_t bits = left.d.lengthAndFlags;
             pos = wholeChars + (bits >> LENGTH_SHIFT);
             left.d.lengthAndFlags = bits ^ (EXTENSIBLE_FLAGS | DEPENDENT_BIT);
             left.d.s.u2.base = (JSLinearString *)this;  /* will be true on exit */
+            JSString::writeBarrierPost(left.d.s.u2.base, &left.d.s.u2.base);
             goto visit_right_child;
         }
     }
 
-    wholeCapacity = RopeCapacityFor(wholeLength);
-    wholeChars = AllocChars(maybecx, wholeCapacity);
-    if (!wholeChars)
+    if (!AllocChars(maybecx, wholeLength, &wholeChars, &wholeCapacity))
         return NULL;
 
     pos = wholeChars;
     first_visit_node: {
+        if (b == WithIncrementalBarrier) {
+            JSString::writeBarrierPre(str->d.u1.left);
+            JSString::writeBarrierPre(str->d.s.u2.right);
+        }
+
         JSString &left = *str->d.u1.left;
         str->d.u1.chars = pos;
         if (left.isRope()) {
@@ -240,12 +283,26 @@ JSRope::flatten(JSContext *maybecx)
         size_t progress = str->d.lengthAndFlags;
         str->d.lengthAndFlags = buildLengthAndFlags(pos - str->d.u1.chars, DEPENDENT_BIT);
         str->d.s.u2.base = (JSLinearString *)this;       /* will be true on exit */
+        JSString::writeBarrierPost(str->d.s.u2.base, &str->d.s.u2.base);
         str = str->d.s.u3.parent;
         if (progress == 0x200)
             goto visit_right_child;
         JS_ASSERT(progress == 0x300);
         goto finish_node;
     }
+}
+
+JSFlatString *
+JSRope::flatten(JSContext *maybecx)
+{
+#if JSGC_INCREMENTAL
+    if (compartment()->needsBarrier())
+        return flattenInternal<WithIncrementalBarrier>(maybecx);
+    else
+        return flattenInternal<NoBarrier>(maybecx);
+#else
+    return flattenInternal<NoBarrier>(maybecx);
+#endif
 }
 
 JSString * JS_FASTCALL
@@ -263,6 +320,8 @@ js_ConcatStrings(JSContext *cx, JSString *left, JSString *right)
         return left;
 
     size_t wholeLength = leftLen + rightLen;
+    if (!JSString::validateLength(cx, wholeLength))
+        return NULL;
 
     if (JSShortString::lengthFits(wholeLength)) {
         JSShortString *str = js_NewGCShortString(cx);
@@ -282,23 +341,20 @@ js_ConcatStrings(JSContext *cx, JSString *left, JSString *right)
         return str;
     }
 
-    if (wholeLength > JSString::MAX_LENGTH) {
-        if (JS_ON_TRACE(cx)) {
-            if (!CanLeaveTrace(cx))
-                return NULL;
-            LeaveTrace(cx);
-        }
-        js_ReportAllocationOverflow(cx);
-        return NULL;
-    }
-
     return JSRope::new_(cx, left, right, wholeLength);
 }
 
 JSFixedString *
 JSDependentString::undepend(JSContext *cx)
 {
-    JS_ASSERT(isDependent());
+    JS_ASSERT(JSString::isDependent());
+
+    /*
+     * We destroy the base() pointer in undepend, so we need a pre-barrier. We
+     * don't need a post-barrier because there aren't any outgoing pointers
+     * afterwards.
+     */
+    JSString::writeBarrierPre(base());
 
     size_t n = length();
     size_t size = (n + 1) * sizeof(jschar);
@@ -315,6 +371,179 @@ JSDependentString::undepend(JSContext *cx)
     return &this->asFixed();
 }
 
-JSStringFinalizeOp JSExternalString::str_finalizers[JSExternalString::TYPE_LIMIT] = {
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-};
+bool
+JSFlatString::isIndex(uint32_t *indexp) const
+{
+    const jschar *s = charsZ();
+    jschar ch = *s;
+
+    if (!JS7_ISDEC(ch))
+        return false;
+
+    size_t n = length();
+    if (n > UINT32_CHAR_BUFFER_LENGTH)
+        return false;
+
+    /*
+     * Make sure to account for the '\0' at the end of characters, dereferenced
+     * in the loop below.
+     */
+    RangedPtr<const jschar> cp(s, n + 1);
+    const RangedPtr<const jschar> end(s + n, s, n + 1);
+
+    uint32_t index = JS7_UNDEC(*cp++);
+    uint32_t oldIndex = 0;
+    uint32_t c = 0;
+
+    if (index != 0) {
+        while (JS7_ISDEC(*cp)) {
+            oldIndex = index;
+            c = JS7_UNDEC(*cp);
+            index = 10 * index + c;
+            cp++;
+        }
+    }
+
+    /* It's not an element if there are characters after the number. */
+    if (cp != end)
+        return false;
+
+    /*
+     * Look out for "4294967296" and larger-number strings that fit in
+     * UINT32_CHAR_BUFFER_LENGTH: only unsigned 32-bit integers shall pass.
+     */
+    if (oldIndex < UINT32_MAX / 10 || (oldIndex == UINT32_MAX / 10 && c <= (UINT32_MAX % 10))) {
+        *indexp = index;
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * Set up some tools to make it easier to generate large tables. After constant
+ * folding, for each n, Rn(0) is the comma-separated list R(0), R(1), ..., R(2^n-1).
+ * Similary, Rn(k) (for any k and n) generates the list R(k), R(k+1), ..., R(k+2^n-1).
+ * To use this, define R appropriately, then use Rn(0) (for some value of n), then
+ * undefine R.
+ */
+#define R2(n) R(n),  R((n) + (1 << 0)),  R((n) + (2 << 0)),  R((n) + (3 << 0))
+#define R4(n) R2(n), R2((n) + (1 << 2)), R2((n) + (2 << 2)), R2((n) + (3 << 2))
+#define R6(n) R4(n), R4((n) + (1 << 4)), R4((n) + (2 << 4)), R4((n) + (3 << 4))
+#define R7(n) R6(n), R6((n) + (1 << 6))
+
+/*
+ * This is used when we generate our table of short strings, so the compiler is
+ * happier if we use |c| as few times as possible.
+ */
+#define FROM_SMALL_CHAR(c) ((c) + ((c) < 10 ? '0' :      \
+                                   (c) < 36 ? 'a' - 10 : \
+                                   'A' - 36))
+
+/*
+ * Declare length-2 strings. We only store strings where both characters are
+ * alphanumeric. The lower 10 short chars are the numerals, the next 26 are
+ * the lowercase letters, and the next 26 are the uppercase letters.
+ */
+#define TO_SMALL_CHAR(c) ((c) >= '0' && (c) <= '9' ? (c) - '0' :              \
+                          (c) >= 'a' && (c) <= 'z' ? (c) - 'a' + 10 :         \
+                          (c) >= 'A' && (c) <= 'Z' ? (c) - 'A' + 36 :         \
+                          StaticStrings::INVALID_SMALL_CHAR)
+
+#define R TO_SMALL_CHAR
+const StaticStrings::SmallChar StaticStrings::toSmallChar[] = { R7(0) };
+#undef R
+
+bool
+StaticStrings::init(JSContext *cx)
+{
+    SwitchToCompartment sc(cx, cx->runtime->atomsCompartment);
+
+    for (uint32_t i = 0; i < UNIT_STATIC_LIMIT; i++) {
+        jschar buffer[] = { i, 0x00 };
+        JSFixedString *s = js_NewStringCopyN(cx, buffer, 1);
+        if (!s)
+            return false;
+        unitStaticTable[i] = s->morphAtomizedStringIntoAtom();
+    }
+
+    for (uint32_t i = 0; i < NUM_SMALL_CHARS * NUM_SMALL_CHARS; i++) {
+        jschar buffer[] = { FROM_SMALL_CHAR(i >> 6), FROM_SMALL_CHAR(i & 0x3F), 0x00 };
+        JSFixedString *s = js_NewStringCopyN(cx, buffer, 2);
+        if (!s)
+            return false;
+        length2StaticTable[i] = s->morphAtomizedStringIntoAtom();
+    }
+
+    for (uint32_t i = 0; i < INT_STATIC_LIMIT; i++) {
+        if (i < 10) {
+            intStaticTable[i] = unitStaticTable[i + '0'];
+        } else if (i < 100) {
+            size_t index = ((size_t)TO_SMALL_CHAR((i / 10) + '0') << 6) +
+                TO_SMALL_CHAR((i % 10) + '0');
+            intStaticTable[i] = length2StaticTable[index];
+        } else {
+            jschar buffer[] = { (i / 100) + '0', ((i / 10) % 10) + '0', (i % 10) + '0', 0x00 };
+            JSFixedString *s = js_NewStringCopyN(cx, buffer, 3);
+            if (!s)
+                return false;
+            intStaticTable[i] = s->morphAtomizedStringIntoAtom();
+        }
+    }
+
+    initialized = true;
+    return true;
+}
+
+void
+StaticStrings::trace(JSTracer *trc)
+{
+    if (!initialized)
+        return;
+
+    /* These strings never change, so barriers are not needed. */
+
+    for (uint32_t i = 0; i < UNIT_STATIC_LIMIT; i++)
+        MarkStringUnbarriered(trc, unitStaticTable[i], "unit-static-string");
+
+    for (uint32_t i = 0; i < NUM_SMALL_CHARS * NUM_SMALL_CHARS; i++)
+        MarkStringUnbarriered(trc, length2StaticTable[i], "length2-static-string");
+
+    /* This may mark some strings more than once, but so be it. */
+    for (uint32_t i = 0; i < INT_STATIC_LIMIT; i++)
+        MarkStringUnbarriered(trc, intStaticTable[i], "int-static-string");
+}
+
+bool
+StaticStrings::isStatic(JSAtom *atom)
+{
+    const jschar *chars = atom->chars();
+    switch (atom->length()) {
+      case 1:
+        return (chars[0] < UNIT_STATIC_LIMIT);
+      case 2:
+        return (fitsInSmallChar(chars[0]) && fitsInSmallChar(chars[1]));
+      case 3:
+        if ('1' <= chars[0] && chars[0] <= '9' &&
+            '0' <= chars[1] && chars[1] <= '9' &&
+            '0' <= chars[2] && chars[2] <= '9') {
+            jsint i = (chars[0] - '0') * 100 +
+                      (chars[1] - '0') * 10 +
+                      (chars[2] - '0');
+
+            return (jsuint(i) < INT_STATIC_LIMIT);
+        }
+        return false;
+      default:
+        return false;
+    }
+}
+
+#ifdef DEBUG
+void
+JSAtom::dump()
+{
+    fprintf(stderr, "JSAtom* (%p) = ", (void *) this);
+    this->JSString::dump();
+}
+#endif /* DEBUG */

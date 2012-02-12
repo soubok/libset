@@ -1,4 +1,4 @@
-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
  *
  * ***** BEGIN LICENSE BLOCK *****
  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -43,92 +43,92 @@
 #include "jsgc.h"
 #include "jscntxt.h"
 #include "jscompartment.h"
-
 #include "jslock.h"
-#include "jstl.h"
+
+#include "gc/Barrier.h"
+#include "js/TemplateLib.h"
 
 namespace js {
 namespace gc {
 
-template<typename T>
-void Mark(JSTracer *trc, T *thing);
+void
+MarkObjectUnbarriered(JSTracer *trc, JSObject *obj, const char *name);
 
 void
-MarkString(JSTracer *trc, JSString *str);
+MarkObject(JSTracer *trc, const MarkablePtr<JSObject> &obj, const char *name);
 
 void
-MarkString(JSTracer *trc, JSString *str, const char *name);
+MarkStringUnbarriered(JSTracer *trc, JSString *str, const char *name);
 
 void
-MarkObject(JSTracer *trc, JSObject &obj, const char *name);
+MarkString(JSTracer *trc, const MarkablePtr<JSString> &str, const char *name);
 
 void
-MarkObjectWithPrinter(JSTracer *trc, JSObject &obj, JSTraceNamePrinter printer,
-		      const void *arg, size_t index);
+MarkScriptUnbarriered(JSTracer *trc, JSScript *script, const char *name);
 
 void
-MarkShape(JSTracer *trc, const Shape *shape, const char *name);
+MarkScript(JSTracer *trc, const MarkablePtr<JSScript> &script, const char *name);
 
 void
-MarkXML(JSTracer *trc, JSXML *xml, const char *name);
+MarkShapeUnbarriered(JSTracer *trc, const Shape *shape, const char *name);
 
 void
-MarkAtomRange(JSTracer *trc, size_t len, JSAtom **vec, const char *name);
+MarkShape(JSTracer *trc, const MarkablePtr<const Shape> &shape, const char *name);
 
 void
-MarkObjectRange(JSTracer *trc, size_t len, JSObject **vec, const char *name);
+MarkBaseShapeUnbarriered(JSTracer *trc, BaseShape *shape, const char *name);
 
 void
-MarkXMLRange(JSTracer *trc, size_t len, JSXML **vec, const char *name);
+MarkTypeObjectUnbarriered(JSTracer *trc, types::TypeObject *type, const char *name);
 
 void
-MarkId(JSTracer *trc, jsid id);
+MarkTypeObject(JSTracer *trc, const MarkablePtr<types::TypeObject> &type, const char *name);
 
 void
-MarkId(JSTracer *trc, jsid id, const char *name);
+MarkXMLUnbarriered(JSTracer *trc, JSXML *xml, const char *name);
 
 void
-MarkIdRange(JSTracer *trc, jsid *beg, jsid *end, const char *name);
+MarkXML(JSTracer *trc, const MarkablePtr<JSXML> &xml, const char *name);
 
 void
-MarkIdRange(JSTracer *trc, size_t len, jsid *vec, const char *name);
+MarkObjectRange(JSTracer *trc, size_t len, HeapPtr<JSObject> *vec, const char *name);
 
 void
-MarkKind(JSTracer *trc, void *thing, uint32 kind);
+MarkXMLRange(JSTracer *trc, size_t len, HeapPtr<JSXML> *vec, const char *name);
 
 void
-MarkValueRaw(JSTracer *trc, const js::Value &v);
+MarkId(JSTracer *trc, const HeapId &id, const char *name);
 
 void
-MarkValue(JSTracer *trc, const js::Value &v, const char *name);
+MarkIdRange(JSTracer *trc, js::HeapId *beg, js::HeapId *end, const char *name);
 
 void
-MarkValueRange(JSTracer *trc, Value *beg, Value *end, const char *name);
+MarkIdRangeUnbarriered(JSTracer *trc, size_t len, jsid *vec, const char *name);
 
 void
-MarkValueRange(JSTracer *trc, size_t len, Value *vec, const char *name);
+MarkIdRangeUnbarriered(JSTracer *trc, jsid *beg, jsid *end, const char *name);
 
 void
-MarkShapeRange(JSTracer *trc, const Shape **beg, const Shape **end, const char *name);
+MarkKind(JSTracer *trc, void *thing, JSGCTraceKind kind);
 
 void
-MarkShapeRange(JSTracer *trc, size_t len, const Shape **vec, const char *name);
-
-/* N.B. Assumes JS_SET_TRACING_NAME/INDEX has already been called. */
-void
-MarkGCThing(JSTracer *trc, void *thing, uint32 kind);
+MarkValueUnbarriered(JSTracer *trc, const js::Value &v, const char *name);
 
 void
-MarkGCThing(JSTracer *trc, void *thing);
+MarkValue(JSTracer *trc, const js::HeapValue &v, const char *name);
+
+/*
+ * Mark a value that may be in a different compartment from the compartment
+ * being GC'd. (Although it won't be marked if it's in the wrong compartment.)
+ */
+void
+MarkCrossCompartmentValue(JSTracer *trc, const js::HeapValue &v, const char *name);
 
 void
-MarkGCThing(JSTracer *trc, void *thing, const char *name);
+MarkValueRange(JSTracer *trc, const HeapValue *beg, const HeapValue *end, const char *name);
 
 void
-MarkGCThing(JSTracer *trc, void *thing, const char *name, size_t index);
-
-void
-Mark(JSTracer *trc, void *thing, uint32 kind, const char *name);
+MarkValueRange(JSTracer *trc, size_t len, const HeapValue *vec, const char *name);
 
 void
 MarkRoot(JSTracer *trc, JSObject *thing, const char *name);
@@ -137,10 +137,43 @@ void
 MarkRoot(JSTracer *trc, JSString *thing, const char *name);
 
 void
+MarkRoot(JSTracer *trc, JSScript *thing, const char *name);
+
+void
 MarkRoot(JSTracer *trc, const Shape *thing, const char *name);
 
 void
+MarkRoot(JSTracer *trc, types::TypeObject *thing, const char *name);
+
+void
 MarkRoot(JSTracer *trc, JSXML *thing, const char *name);
+
+void
+MarkRoot(JSTracer *trc, const Value &v, const char *name);
+
+void
+MarkRoot(JSTracer *trc, jsid id, const char *name);
+
+void
+MarkRootGCThing(JSTracer *trc, void *thing, const char *name);
+
+void
+MarkRootRange(JSTracer *trc, size_t len, const Shape **vec, const char *name);
+
+void
+MarkRootRange(JSTracer *trc, size_t len, JSObject **vec, const char *name);
+
+void
+MarkRootRange(JSTracer *trc, const Value *beg, const Value *end, const char *name);
+
+void
+MarkRootRange(JSTracer *trc, size_t len, const Value *vec, const char *name);
+
+void
+MarkRootRange(JSTracer *trc, jsid *beg, jsid *end, const char *name);
+
+void
+MarkRootRange(JSTracer *trc, size_t len, jsid *vec, const char *name);
 
 void
 MarkChildren(JSTracer *trc, JSObject *obj);
@@ -152,9 +185,69 @@ void
 MarkChildren(JSTracer *trc, const Shape *shape);
 
 void
+MarkChildren(JSTracer *trc, JSScript *script);
+
+void
 MarkChildren(JSTracer *trc, JSXML *xml);
 
+/*
+ * Trace through the shape and any shapes it contains to mark
+ * non-shape children.
+ */
+void
+MarkCycleCollectorChildren(JSTracer *trc, const Shape *shape);
+
+/*
+ * Use function overloading to decide which function should be called based on
+ * the type of the object. The static type is used at compile time to link to
+ * the corresponding Mark/IsMarked function.
+ */
+inline void
+Mark(JSTracer *trc, const js::HeapValue &v, const char *name)
+{
+    MarkValue(trc, v, name);
 }
+
+inline void
+Mark(JSTracer *trc, const MarkablePtr<JSObject> &o, const char *name)
+{
+    MarkObject(trc, o, name);
 }
+
+inline void
+Mark(JSTracer *trc, const MarkablePtr<JSXML> &xml, const char *name)
+{
+    MarkXML(trc, xml, name);
+}
+
+inline bool
+IsMarked(const js::Value &v)
+{
+    if (v.isMarkable())
+        return !IsAboutToBeFinalized(v);
+    return true;
+}
+
+inline bool
+IsMarked(JSObject *o)
+{
+    return !IsAboutToBeFinalized(o);
+}
+
+inline bool
+IsMarked(Cell *cell)
+{
+    return !IsAboutToBeFinalized(cell);
+}
+
+} /* namespace gc */
+
+void
+TraceChildren(JSTracer *trc, void *thing, JSGCTraceKind kind);
+
+void
+CallTracer(JSTracer *trc, void *thing, JSGCTraceKind kind);
+
+} /* namespace js */
 
 #endif
