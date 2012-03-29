@@ -42,7 +42,10 @@
 
 #include "jstypedarrayinlines.h"
 
+#include "vm/BooleanObject-inl.h"
+#include "vm/NumberObject-inl.h"
 #include "vm/RegExpObject-inl.h"
+#include "vm/StringObject-inl.h"
 
 using namespace js;
 
@@ -192,11 +195,11 @@ CanonicalizeNan(double d)
 }
 
 bool
-SCInput::readDouble(jsdouble *p)
+SCInput::readDouble(double *p)
 {
     union {
         uint64_t u;
-        jsdouble d;
+        double d;
     } pun;
     if (!read(&pun.u))
         return false;
@@ -262,7 +265,7 @@ SCOutput::writePair(uint32_t tag, uint32_t data)
 {
     /*
      * As it happens, the tag word appears after the data word in the output.
-     * This is because exponents occupy the last 2 bytes of jsdoubles on the
+     * This is because exponents occupy the last 2 bytes of doubles on the
      * little-endian platforms we care most about.
      *
      * For example, JSVAL_TRUE is written using writePair(SCTAG_BOOLEAN, 1).
@@ -273,35 +276,35 @@ SCOutput::writePair(uint32_t tag, uint32_t data)
 }
 
 static inline uint64_t
-ReinterpretDoubleAsUInt64(jsdouble d)
+ReinterpretDoubleAsUInt64(double d)
 {
     union {
-        jsdouble d;
+        double d;
         uint64_t u;
     } pun;
     pun.d = d;
     return pun.u;
 }
 
-static inline jsdouble
+static inline double
 ReinterpretUInt64AsDouble(uint64_t u)
 {
     union {
         uint64_t u;
-        jsdouble d;
+        double d;
     } pun;
     pun.u = u;
     return pun.d;
 }
 
-static inline jsdouble
+static inline double
 ReinterpretPairAsDouble(uint32_t tag, uint32_t data)
 {
     return ReinterpretUInt64AsDouble(PairToUInt64(tag, data));
 }
 
 bool
-SCOutput::writeDouble(jsdouble d)
+SCOutput::writeDouble(double d)
 {
     return write(ReinterpretDoubleAsUInt64(CanonicalizeNan(d)));
 }
@@ -510,6 +513,8 @@ JSStructuredCloneWriter::startObject(JSObject *obj)
 bool
 JSStructuredCloneWriter::startWrite(const js::Value &v)
 {
+    assertSameCompartment(context(), v);
+
     if (v.isString()) {
         return writeString(SCTAG_STRING, v.toString());
     } else if (v.isNumber()) {
@@ -522,12 +527,25 @@ JSStructuredCloneWriter::startWrite(const js::Value &v)
         return out.writePair(SCTAG_UNDEFINED, 0);
     } else if (v.isObject()) {
         JSObject *obj = &v.toObject();
+
+        // The object might be a security wrapper. See if we can clone what's
+        // behind it. If we can, unwrap the object.
+        obj = UnwrapObjectChecked(context(), obj);
+        if (!obj)
+            return false;
+
+        // If we unwrapped above, we'll need to enter the underlying compartment.
+        // Let the AutoEnterCompartment do the right thing for us.
+        JSAutoEnterCompartment ac;
+        if (!ac.enter(context(), obj))
+            return false;
+
         if (obj->isRegExp()) {
             RegExpObject &reobj = obj->asRegExp();
             return out.writePair(SCTAG_REGEXP_OBJECT, reobj.getFlags()) &&
                    writeString(SCTAG_STRING, reobj.getSource());
         } else if (obj->isDate()) {
-            jsdouble d = js_DateGetMsecSinceEpoch(context(), obj);
+            double d = js_DateGetMsecSinceEpoch(context(), obj);
             return out.writePair(SCTAG_DATE_OBJECT, 0) && out.writeDouble(d);
         } else if (obj->isObject() || obj->isArray()) {
             return startObject(obj);
@@ -536,12 +554,12 @@ JSStructuredCloneWriter::startWrite(const js::Value &v)
         } else if (js_IsArrayBuffer(obj)) {
             return writeArrayBuffer(obj);
         } else if (obj->isBoolean()) {
-            return out.writePair(SCTAG_BOOLEAN_OBJECT, obj->getPrimitiveThis().toBoolean());
+            return out.writePair(SCTAG_BOOLEAN_OBJECT, obj->asBoolean().unbox());
         } else if (obj->isNumber()) {
             return out.writePair(SCTAG_NUMBER_OBJECT, 0) &&
-                   out.writeDouble(obj->getPrimitiveThis().toNumber());
+                   out.writeDouble(obj->asNumber().unbox());
         } else if (obj->isString()) {
-            return writeString(SCTAG_STRING_OBJECT, obj->getPrimitiveThis().toString());
+            return writeString(SCTAG_STRING_OBJECT, obj->asString().unbox());
         }
 
         if (callbacks && callbacks->write)
@@ -561,6 +579,12 @@ JSStructuredCloneWriter::write(const Value &v)
 
     while (!counts.empty()) {
         JSObject *obj = &objs.back().toObject();
+
+        // The objects in |obj| can live in other compartments.
+        JSAutoEnterCompartment ac;
+        if (!ac.enter(context(), obj))
+            return false;
+
         if (counts.back()) {
             counts.back()--;
             jsid id = ids.back();
@@ -600,7 +624,7 @@ JSStructuredCloneWriter::write(const Value &v)
 }
 
 bool
-JSStructuredCloneReader::checkDouble(jsdouble d)
+JSStructuredCloneReader::checkDouble(double d)
 {
     jsval_layout l;
     l.asDouble = d;
@@ -728,7 +752,7 @@ JSStructuredCloneReader::startRead(Value *vp)
       }
 
       case SCTAG_NUMBER_OBJECT: {
-        jsdouble d;
+        double d;
         if (!in.readDouble(&d) || !checkDouble(d))
             return false;
         vp->setDouble(d);
@@ -738,7 +762,7 @@ JSStructuredCloneReader::startRead(Value *vp)
       }
 
       case SCTAG_DATE_OBJECT: {
-        jsdouble d;
+        double d;
         if (!in.readDouble(&d) || !checkDouble(d))
             return false;
         if (d == d && d != TIMECLIP(d)) {
@@ -805,7 +829,7 @@ JSStructuredCloneReader::startRead(Value *vp)
 
       default: {
         if (tag <= SCTAG_FLOAT_MAX) {
-            jsdouble d = ReinterpretPairAsDouble(tag, data);
+            double d = ReinterpretPairAsDouble(tag, data);
             if (!checkDouble(d))
                 return false;
             vp->setNumber(d);

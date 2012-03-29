@@ -55,8 +55,8 @@ namespace Library
 {
   static void Finalize(JSContext* cx, JSObject* obj);
 
-  static JSBool Close(JSContext* cx, uintN argc, jsval* vp);
-  static JSBool Declare(JSContext* cx, uintN argc, jsval* vp);
+  static JSBool Close(JSContext* cx, unsigned argc, jsval* vp);
+  static JSBool Declare(JSContext* cx, unsigned argc, jsval* vp);
 }
 
 /*******************************************************************************
@@ -67,8 +67,7 @@ static JSClass sLibraryClass = {
   "Library",
   JSCLASS_HAS_RESERVED_SLOTS(LIBRARY_SLOTS),
   JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_StrictPropertyStub,
-  JS_EnumerateStub,JS_ResolveStub, JS_ConvertStub, Library::Finalize,
-  JSCLASS_NO_OPTIONAL_MEMBERS
+  JS_EnumerateStub,JS_ResolveStub, JS_ConvertStub, Library::Finalize
 };
 
 #define CTYPESFN_FLAGS \
@@ -81,7 +80,7 @@ static JSFunctionSpec sLibraryFunctions[] = {
 };
 
 JSBool
-Library::Name(JSContext* cx, uintN argc, jsval *vp)
+Library::Name(JSContext* cx, unsigned argc, jsval *vp)
 {
   if (argc != 1) {
     JS_ReportError(cx, "libraryName takes one argument");
@@ -216,7 +215,7 @@ Library::Finalize(JSContext* cx, JSObject* obj)
 }
 
 JSBool
-Library::Open(JSContext* cx, uintN argc, jsval *vp)
+Library::Open(JSContext* cx, unsigned argc, jsval *vp)
 {
   JSObject* ctypesObj = JS_THIS_OBJECT(cx, vp);
   if (!ctypesObj || !IsCTypesGlobal(ctypesObj)) {
@@ -238,7 +237,7 @@ Library::Open(JSContext* cx, uintN argc, jsval *vp)
 }
 
 JSBool
-Library::Close(JSContext* cx, uintN argc, jsval* vp)
+Library::Close(JSContext* cx, unsigned argc, jsval* vp)
 {
   JSObject* obj = JS_THIS_OBJECT(cx, vp);
   if (!obj || !IsLibrary(obj)) {
@@ -260,7 +259,7 @@ Library::Close(JSContext* cx, uintN argc, jsval* vp)
 }
 
 JSBool
-Library::Declare(JSContext* cx, uintN argc, jsval* vp)
+Library::Declare(JSContext* cx, unsigned argc, jsval* vp)
 {
   JSObject* obj = JS_THIS_OBJECT(cx, vp);
   if (!obj || !IsLibrary(obj)) {

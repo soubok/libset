@@ -273,6 +273,15 @@ PodEqual(T *one, T *two, size_t len)
     return !memcmp(one, two, len * sizeof(T));
 }
 
+template <class T>
+JS_ALWAYS_INLINE static void
+Swap(T &t, T &u)
+{
+    T tmp(Move(t));
+    t = Move(u);
+    u = Move(tmp);
+}
+
 JS_ALWAYS_INLINE static size_t
 UnsignedPtrDiff(const void *bigger, const void *smaller)
 {
@@ -287,6 +296,66 @@ UnsignedPtrDiff(const void *bigger, const void *smaller)
  * MaybeReportError.
  */
 enum MaybeReportError { REPORT_ERROR = true, DONT_REPORT_ERROR = false };
+
+/*****************************************************************************/
+
+/* A bit array is an array of bits represented by an array of words (size_t). */
+
+static inline unsigned
+NumWordsForBitArrayOfLength(size_t length)
+{
+    return (length + (JS_BITS_PER_WORD - 1)) / JS_BITS_PER_WORD;
+}
+
+static inline unsigned
+BitArrayIndexToWordIndex(size_t length, size_t bitIndex)
+{
+    unsigned wordIndex = bitIndex / JS_BITS_PER_WORD;
+    JS_ASSERT(wordIndex < length);
+    return wordIndex;
+}
+
+static inline size_t
+BitArrayIndexToWordMask(size_t i)
+{
+    return size_t(1) << (i % JS_BITS_PER_WORD);
+}
+
+static inline bool
+IsBitArrayElementSet(size_t *array, size_t length, size_t i)
+{
+    return array[BitArrayIndexToWordIndex(length, i)] & BitArrayIndexToWordMask(i);
+}
+
+static inline bool
+IsAnyBitArrayElementSet(size_t *array, size_t length)
+{
+    unsigned numWords = NumWordsForBitArrayOfLength(length);
+    for (unsigned i = 0; i < numWords; ++i) {
+        if (array[i])
+            return true;
+    }
+    return false;
+}
+
+static inline void
+SetBitArrayElement(size_t *array, size_t length, size_t i)
+{
+    array[BitArrayIndexToWordIndex(length, i)] |= BitArrayIndexToWordMask(i);
+}
+
+static inline void
+ClearBitArrayElement(size_t *array, size_t length, size_t i)
+{
+    array[BitArrayIndexToWordIndex(length, i)] &= ~BitArrayIndexToWordMask(i);
+}
+
+static inline void
+ClearAllBitArrayElements(size_t *array, size_t length)
+{
+    for (unsigned i = 0; i < length; ++i)
+        array[i] = 0;
+}
 
 }  /* namespace js */
 #endif  /* __cplusplus */
@@ -331,9 +400,9 @@ inline __attribute__ ((unused)) void MUST_FLOW_THROUGH(const char *label) {}
 #ifdef JS_CRASH_DIAGNOSTICS
 # define JS_POISON(p, val, size) memset((p), (val), (size))
 # define JS_OPT_ASSERT(expr)                                                  \
-    ((expr) ? (void)0 : JS_Assert(#expr, __FILE__, __LINE__))
+    ((expr) ? (void)0 : MOZ_Assert(#expr, __FILE__, __LINE__))
 # define JS_OPT_ASSERT_IF(cond, expr)                                         \
-    ((!(cond) || (expr)) ? (void)0 : JS_Assert(#expr, __FILE__, __LINE__))
+    ((!(cond) || (expr)) ? (void)0 : MOZ_Assert(#expr, __FILE__, __LINE__))
 #else
 # define JS_POISON(p, val, size) ((void) 0)
 # define JS_OPT_ASSERT(expr) ((void) 0)
