@@ -305,18 +305,17 @@ class JSAPITest
         static JSClass c = {
             "global", JSCLASS_GLOBAL_FLAGS,
             JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_StrictPropertyStub,
-            JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub,
-            JSCLASS_NO_OPTIONAL_MEMBERS
+            JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub
         };
         return &c;
     }
 
   protected:
     static JSBool
-    print(JSContext *cx, uintN argc, jsval *vp)
+    print(JSContext *cx, unsigned argc, jsval *vp)
     {
         jsval *argv = JS_ARGV(cx, vp);
-        for (uintN i = 0; i < argc; i++) {
+        for (unsigned i = 0; i < argc; i++) {
             JSString *str = JS_ValueToString(cx, argv[i]);
             if (!str)
                 return JS_FALSE;

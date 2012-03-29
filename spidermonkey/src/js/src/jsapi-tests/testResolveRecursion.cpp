@@ -21,9 +21,7 @@ BEGIN_TEST(testResolveRecursion)
         JS_StrictPropertyStub, // set
         JS_EnumerateStub,
         (JSResolveOp) my_resolve,
-        JS_ConvertStub,
-        JS_FinalizeStub,
-        JSCLASS_NO_OPTIONAL_MEMBERS
+        JS_ConvertStub
     };
     
     obj1 = JS_NewObject(cx, &my_resolve_class, NULL, NULL);
@@ -67,7 +65,7 @@ struct AutoIncrCounters {
 };
 
 bool
-doResolve(JSObject *obj, jsid id, uintN flags, JSObject **objp)
+doResolve(JSObject *obj, jsid id, unsigned flags, JSObject **objp)
 {
     CHECK_EQUAL(resolveExitCount, 0);
     AutoIncrCounters incr(this);
@@ -125,7 +123,7 @@ doResolve(JSObject *obj, jsid id, uintN flags, JSObject **objp)
 }
 
 static JSBool
-my_resolve(JSContext *cx, JSObject *obj, jsid id, uintN flags, JSObject **objp)
+my_resolve(JSContext *cx, JSObject *obj, jsid id, unsigned flags, JSObject **objp)
 {
     return static_cast<cls_testResolveRecursion *>(JS_GetPrivate(obj))->
            doResolve(obj, id, flags, objp);

@@ -61,21 +61,6 @@
 
 namespace js {
 
-class AutoPreserveEnumerators {
-    JSContext *cx;
-    JSObject *enumerators;
-
-  public:
-    AutoPreserveEnumerators(JSContext *cx) : cx(cx), enumerators(cx->enumerators)
-    {
-    }
-
-    ~AutoPreserveEnumerators()
-    {
-        cx->enumerators = enumerators;
-    }
-};
-
 /*
  * Compute the implicit |this| parameter for a call expression where the callee
  * funval was resolved from an unqualified name reference to a property on obj
@@ -173,7 +158,7 @@ ValuePropertyBearer(JSContext *cx, StackFrame *fp, const Value &v, int spindex)
 }
 
 inline bool
-NativeGet(JSContext *cx, JSObject *obj, JSObject *pobj, const Shape *shape, uintN getHow, Value *vp)
+NativeGet(JSContext *cx, JSObject *obj, JSObject *pobj, const Shape *shape, unsigned getHow, Value *vp)
 {
     if (shape->isDataDescriptor() && shape->hasDefaultGetter()) {
         /* Fast path for Object instance properties. */
@@ -225,14 +210,14 @@ GetPropertyOperation(JSContext *cx, jsbytecode *pc, const Value &lval, Value *vp
             *vp = Int32Value(lval.toString()->length());
             return true;
         }
-        if (lval.isMagic(JS_LAZY_ARGUMENTS)) {
+        if (lval.isMagic(JS_OPTIMIZED_ARGUMENTS)) {
             *vp = Int32Value(cx->fp()->numActualArgs());
             return true;
         }
         if (lval.isObject()) {
             JSObject *obj = &lval.toObject();
             if (obj->isArray()) {
-                jsuint length = obj->getArrayLength();
+                uint32_t length = obj->getArrayLength();
                 *vp = NumberValue(length);
                 return true;
             }
@@ -255,13 +240,9 @@ GetPropertyOperation(JSContext *cx, jsbytecode *pc, const Value &lval, Value *vp
         }
     }
 
-    JSObject *obj = ValueToObjectOrPrototype(cx, lval);
+    JSObject *obj = ValueToObject(cx, lval);
     if (!obj)
         return false;
-
-    uintN flags = (op == JSOP_CALLPROP)
-                  ? JSGET_CACHE_RESULT | JSGET_NO_METHOD_BARRIER
-                  : JSGET_CACHE_RESULT | JSGET_METHOD_BARRIER;
 
     PropertyCacheEntry *entry;
     JSObject *obj2;
@@ -269,7 +250,7 @@ GetPropertyOperation(JSContext *cx, jsbytecode *pc, const Value &lval, Value *vp
     JS_PROPERTY_CACHE(cx).test(cx, pc, obj, obj2, entry, name);
     if (!name) {
         AssertValidPropertyCacheHit(cx, obj, obj2, entry);
-        if (!NativeGet(cx, obj, obj2, entry->prop, flags, vp))
+        if (!NativeGet(cx, obj, obj2, entry->prop, JSGET_CACHE_RESULT, vp))
             return false;
         return true;
     }
@@ -280,7 +261,7 @@ GetPropertyOperation(JSContext *cx, jsbytecode *pc, const Value &lval, Value *vp
         if (!GetPropertyGenericMaybeCallXML(cx, op, obj, id, vp))
             return false;
     } else {
-        if (!GetPropertyHelper(cx, obj, id, flags, vp))
+        if (!GetPropertyHelper(cx, obj, id, JSGET_CACHE_RESULT, vp))
             return false;
     }
 
@@ -304,7 +285,6 @@ SetPropertyOperation(JSContext *cx, jsbytecode *pc, const Value &lval, const Val
     if (!obj)
         return false;
 
-    JS_ASSERT_IF(*pc == JSOP_SETMETHOD, IsFunctionObject(rval));
     JS_ASSERT_IF(*pc == JSOP_SETNAME || *pc == JSOP_SETGNAME, lval.isObject());
     JS_ASSERT_IF(*pc == JSOP_SETGNAME, obj == &cx->fp()->scopeChain().global());
 
@@ -337,7 +317,7 @@ SetPropertyOperation(JSContext *cx, jsbytecode *pc, const Value &lval, const Val
             }
 #endif
 
-            if (shape->hasDefaultSetter() && shape->hasSlot() && !shape->isMethod()) {
+            if (shape->hasDefaultSetter() && shape->hasSlot()) {
                 /* Fast path for, e.g., plain Object instance properties. */
                 obj->nativeSetSlotWithType(cx, shape, rval);
             } else {
@@ -359,13 +339,9 @@ SetPropertyOperation(JSContext *cx, jsbytecode *pc, const Value &lval, const Val
 
     jsid id = ATOM_TO_JSID(name);
     if (JS_LIKELY(!obj->getOps()->setProperty)) {
-        uintN defineHow;
-        if (op == JSOP_SETMETHOD)
-            defineHow = DNP_CACHE_RESULT | DNP_SET_METHOD;
-        else if (op == JSOP_SETNAME)
-            defineHow = DNP_CACHE_RESULT | DNP_UNQUALIFIED;
-        else
-            defineHow = DNP_CACHE_RESULT;
+        unsigned defineHow = (op == JSOP_SETNAME)
+                             ? DNP_CACHE_RESULT | DNP_UNQUALIFIED
+                             : DNP_CACHE_RESULT;
         if (!js_SetPropertyHelper(cx, obj, id, defineHow, &rref, strict))
             return false;
     } else {
@@ -399,7 +375,7 @@ NameOperation(JSContext *cx, jsbytecode *pc, Value *vp)
     JS_PROPERTY_CACHE(cx).test(cx, pc, obj, obj2, entry, name);
     if (!name) {
         AssertValidPropertyCacheHit(cx, obj, obj2, entry);
-        if (!NativeGet(cx, obj, obj2, entry->prop, JSGET_METHOD_BARRIER, vp))
+        if (!NativeGet(cx, obj, obj2, entry->prop, 0, vp))
             return false;
         return true;
     }
@@ -431,7 +407,7 @@ NameOperation(JSContext *cx, jsbytecode *pc, Value *vp)
         JSObject *normalized = obj;
         if (normalized->getClass() == &WithClass && !shape->hasDefaultGetter())
             normalized = &normalized->asWith().object();
-        if (!NativeGet(cx, normalized, obj2, shape, JSGET_METHOD_BARRIER, vp))
+        if (!NativeGet(cx, normalized, obj2, shape, 0, vp))
             return false;
     }
 
@@ -439,27 +415,19 @@ NameOperation(JSContext *cx, jsbytecode *pc, Value *vp)
 }
 
 inline bool
-DefVarOrConstOperation(JSContext *cx, JSOp op, PropertyName *dn, StackFrame *fp)
+DefVarOrConstOperation(JSContext *cx, JSObject &varobj, PropertyName *dn, unsigned attrs)
 {
-    /* ES5 10.5 step 8 (with subsequent errata). */
-    uintN attrs = JSPROP_ENUMERATE;
-    if (!fp->isEvalFrame())
-        attrs |= JSPROP_PERMANENT;
-    if (op == JSOP_DEFCONST)
-        attrs |= JSPROP_READONLY;
-
-    /* Step 8b. */
-    JSObject &obj = fp->varObj();
-    JS_ASSERT(!obj.getOps()->defineProperty);
+    JS_ASSERT(varobj.isVarObj());
+    JS_ASSERT(!varobj.getOps()->defineProperty);
 
     JSProperty *prop;
     JSObject *obj2;
-    if (!obj.lookupProperty(cx, dn, &obj2, &prop))
+    if (!varobj.lookupProperty(cx, dn, &obj2, &prop))
         return false;
 
     /* Steps 8c, 8d. */
-    if (!prop || (obj2 != &obj && obj.isGlobal())) {
-        if (!DefineNativeProperty(cx, &obj, dn, UndefinedValue(),
+    if (!prop || (obj2 != &varobj && varobj.isGlobal())) {
+        if (!DefineNativeProperty(cx, &varobj, dn, UndefinedValue(),
                                   JS_PropertyStub, JS_StrictPropertyStub, attrs, 0, 0))
         {
             return false;
@@ -469,8 +437,8 @@ DefVarOrConstOperation(JSContext *cx, JSOp op, PropertyName *dn, StackFrame *fp)
          * Extension: ordinarily we'd be done here -- but for |const|.  If we
          * see a redeclaration that's |const|, we consider it a conflict.
          */
-        uintN oldAttrs;
-        if (!obj.getPropertyAttributes(cx, dn, &oldAttrs))
+        unsigned oldAttrs;
+        if (!varobj.getPropertyAttributes(cx, dn, &oldAttrs))
             return false;
         if (attrs & JSPROP_READONLY) {
             JSAutoByteString bytes;
@@ -704,11 +672,37 @@ FetchElementId(JSContext *cx, JSObject *obj, const Value &idval, jsid &id, Value
 }
 
 static JS_ALWAYS_INLINE bool
-GetObjectElementOperation(JSContext *cx, JSObject *obj, const Value &rref, Value *res)
+ToIdOperation(JSContext *cx, const Value &objval, const Value &idval, Value *res)
 {
-    JSScript *script;
-    jsbytecode *pc;
-    types::TypeScript::GetPcScript(cx, &script, &pc);
+    if (idval.isInt32()) {
+        *res = idval;
+        return true;
+    }
+
+    JSObject *obj = ValueToObject(cx, objval);
+    if (!obj)
+        return false;
+
+    jsid dummy;
+    if (!js_InternNonIntElementId(cx, obj, idval, &dummy, res))
+        return false;
+
+    if (!res->isInt32())
+        types::TypeScript::MonitorUnknown(cx);
+    return true;
+}
+
+static JS_ALWAYS_INLINE bool
+GetObjectElementOperation(JSContext *cx, JSOp op, JSObject *obj, const Value &rref, Value *res)
+{
+#if JS_HAS_XML_SUPPORT
+    if (op == JSOP_CALLELEM && JS_UNLIKELY(obj->isXML())) {
+        jsid id;
+        if (!FetchElementId(cx, obj, rref, id, res))
+            return false;
+        return js_GetXMLMethod(cx, obj, id, res);
+    }
+#endif
 
     uint32_t index;
     if (IsDefinitelyIndex(rref, &index)) {
@@ -727,6 +721,10 @@ GetObjectElementOperation(JSContext *cx, JSObject *obj, const Value &rref, Value
                 return false;
         } while(0);
     } else {
+        JSScript *script;
+        jsbytecode *pc;
+        types::TypeScript::GetPcScript(cx, &script, &pc);
+
         if (script->hasAnalysis())
             script->analysis()->getCode(pc).getStringElement = true;
 
@@ -751,13 +749,14 @@ GetObjectElementOperation(JSContext *cx, JSObject *obj, const Value &rref, Value
     }
 
     assertSameCompartment(cx, *res);
-    types::TypeScript::Monitor(cx, script, pc, *res);
     return true;
 }
 
 static JS_ALWAYS_INLINE bool
-GetElementOperation(JSContext *cx, const Value &lref, const Value &rref, Value *res)
+GetElementOperation(JSContext *cx, JSOp op, const Value &lref, const Value &rref, Value *res)
 {
+    JS_ASSERT(op == JSOP_GETELEM || op == JSOP_CALLELEM);
+
     if (lref.isString() && rref.isInt32()) {
         JSString *str = lref.toString();
         int32_t i = rref.toInt32();
@@ -766,49 +765,52 @@ GetElementOperation(JSContext *cx, const Value &lref, const Value &rref, Value *
             if (!str)
                 return false;
             res->setString(str);
-            types::TypeScript::Monitor(cx, *res);
             return true;
         }
     }
 
-    if (lref.isMagic(JS_LAZY_ARGUMENTS)) {
-        if (rref.isInt32() && size_t(rref.toInt32()) < cx->regs().fp()->numActualArgs()) {
-            *res = cx->regs().fp()->canonicalActualArg(rref.toInt32());
-            types::TypeScript::Monitor(cx, *res);
-            return true;
-        }
-        types::MarkArgumentsCreated(cx, cx->fp()->script());
-        JS_ASSERT(!lref.isMagic(JS_LAZY_ARGUMENTS));
-    }
+    if (lref.isMagic(JS_OPTIMIZED_ARGUMENTS))
+        return NormalArgumentsObject::optimizedGetElem(cx, cx->fp(), rref, res);
 
+    bool isObject = lref.isObject();
     JSObject *obj = ValueToObject(cx, lref);
     if (!obj)
         return false;
-    return GetObjectElementOperation(cx, obj, rref, res);
+    if (!GetObjectElementOperation(cx, op, obj, rref, res))
+        return false;
+
+#if JS_HAS_NO_SUCH_METHOD
+    if (op == JSOP_CALLELEM && JS_UNLIKELY(res->isPrimitive()) && isObject) {
+        if (!OnUnknownMethod(cx, obj, rref, res))
+            return false;
+    }
+#endif
+    return true;
 }
 
 static JS_ALWAYS_INLINE bool
-SetObjectElementOperation(JSContext *cx, JSObject *obj, jsid id, const Value &value)
+SetObjectElementOperation(JSContext *cx, JSObject *obj, jsid id, const Value &value, bool strict)
 {
-    JSScript *script;
-    jsbytecode *pc;
-    types::TypeScript::GetPcScript(cx, &script, &pc);
-    types::TypeScript::MonitorAssign(cx, script, pc, obj, id, value);
+    types::TypeScript::MonitorAssign(cx, obj, id);
 
     do {
         if (obj->isDenseArray() && JSID_IS_INT(id)) {
-            jsuint length = obj->getDenseArrayInitializedLength();
-            jsint i = JSID_TO_INT(id);
-            if ((jsuint)i < length) {
+            uint32_t length = obj->getDenseArrayInitializedLength();
+            int32_t i = JSID_TO_INT(id);
+            if ((uint32_t)i < length) {
                 if (obj->getDenseArrayElement(i).isMagic(JS_ARRAY_HOLE)) {
                     if (js_PrototypeHasIndexedProperties(cx, obj))
                         break;
-                    if ((jsuint)i >= obj->getArrayLength())
+                    if ((uint32_t)i >= obj->getArrayLength())
                         obj->setArrayLength(cx, i + 1);
                 }
                 obj->setDenseArrayElementWithType(cx, i, value);
                 return true;
             } else {
+                JSScript *script;
+                jsbytecode *pc;
+                types::TypeScript::GetPcScript(cx, &script, &pc);
+
                 if (script->hasAnalysis())
                     script->analysis()->getCode(pc).arrayWriteHole = true;
             }
@@ -816,7 +818,7 @@ SetObjectElementOperation(JSContext *cx, JSObject *obj, jsid id, const Value &va
     } while (0);
 
     Value tmp = value;
-    return obj->setGeneric(cx, id, &tmp, script->strictModeCode);
+    return obj->setGeneric(cx, id, &tmp, strict);
 }
 
 #define RELATIONAL_OP(OP)                                                     \
